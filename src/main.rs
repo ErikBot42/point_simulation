@@ -82,7 +82,6 @@ struct State {
 
     point_texture_views: (wgpu::TextureView, wgpu::TextureView),
 
-    swap_active: bool,
 
     last_print: Instant,
     frame: usize,
@@ -656,7 +655,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             num_vertices,
             bind_groups,
             point_texture_views,
-            swap_active: false,
             last_print: Instant::now(),
             frame: 0,
         }
