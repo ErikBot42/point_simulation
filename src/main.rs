@@ -7,7 +7,9 @@ use winit::{
     window::WindowBuilder,
 };
 
-const NUM_POINTS: u32 = 1024;
+use std::time::Instant;
+
+const NUM_POINTS: u32 = 1024 * 2;
 
 use std::mem::size_of;
 
@@ -81,6 +83,9 @@ struct State {
     point_texture_views: (wgpu::TextureView, wgpu::TextureView),
 
     swap_active: bool,
+
+    last_print: Instant,
+    frame: usize,
 }
 impl State {
     async fn new(window: Window) -> Self {
@@ -161,7 +166,8 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            //present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::Immediate,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -237,7 +243,8 @@ impl State {
                 }],
             }),
         );
-
+        
+        const INDEX_OFFSET: usize = 16;
         let shader_source: String = format!("
 @group(0) @binding(0) 
 var compute_texture: texture_2d<f32>;
@@ -271,15 +278,54 @@ fn fs_fill(
     
     let num_points = {NUM_POINTS};
     let c: f32 = in.pos.x;
-    return vec4<f32>(c, sin(c * (f32(num_points) + 0.3498)), cos(c*2338.23894), sin(c*2783.7893));
+    return vec4<f32>(c, sin(c * (f32(num_points) + 1.9008)), cos(c*2338.23894), sin(c*2783.7893));
 }}
 
 @fragment
 fn fs_update(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
+    //var a = textureLoad(compute_texture, vec2<u32>(u32(in.pos.x * {NUM_POINTS}.0 + 0.5), 0u), 0);
+    
+    var avg_p = vec2<f32>(0.0);
+    for (var i: i32 = 0; i < 10; i++) {{
+        // TODO: let hardware do the wrapping?
+        // TODO: rearrange to make sampling cheaper
+        var a = textureLoad(compute_texture, vec2<u32>(u32(i32(in.clip_position.x) + i * {INDEX_OFFSET}) % {NUM_POINTS}u, 0u), 0);
+        
+        avg_p += a.xy * 0.1;
+    }}
 
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+
+    var a = textureLoad(compute_texture, vec2<u32>(u32(in.clip_position.x), 0u), 0);
+    
+    let dt = 0.001;
+    var p = a.xy;
+    var v = a.zw;
+
+    
+    //v += -(p-avg_p) * dt;
+    v += 0.1 *  -(smoothstep(0.0, 0.3, length(p-avg_p)) - 0.5) * normalize(p-avg_p) * dt * 0.9;
+    v += 0.01 *  -(smoothstep(0.0, 1.9, length(p)) - 0.5) * normalize(p) * dt * 2.0;
+
+
+    
+    // reflection
+    if p.x > 1.0 {{
+        v.x = -abs(v.x);
+    }} else if p.x < -1.0 {{
+        v.x = abs(v.x);
+    }}
+    if p.y > 1.0 {{
+        v.y = -abs(v.y);
+    }} else if p.y < -1.0 {{
+        v.y = abs(v.y);
+    }}
+
+    v *= pow(0.5, dt);
+
+    p += v * dt;
+    return vec4<f32>(p, v);
 }}
 
 struct VertexInput {{
@@ -317,7 +363,7 @@ fn vs_main(
     }}
     offset *= 0.01;
     
-    let a = textureLoad(compute_texture, vec2<u32>(group * 10u, 0u), 0);
+    let a = textureLoad(compute_texture, vec2<u32>(group * 1u, 0u), 0);
 
     offset += a.xy;
 
@@ -329,8 +375,9 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
-    let a = textureLoad(compute_texture, vec2<u32>(in.group * 10u, 0u), 0);
-    return vec4<f32>(1.0, a.x, 0.0, 1.0);
+    let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
+    let q = fract(f32(in.group) / {INDEX_OFFSET}.0);
+    return vec4<f32>(1.0-q, q, 0.0, 1.0);
 }}
 
 ");
@@ -389,7 +436,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })];
-        let buffers = &[Vertex::desc()]; 
+        let buffers = &[Vertex::desc()];
         let fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Fill Pipeline"),
             layout,
@@ -426,6 +473,35 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             multisample,
             multiview: None,
         });
+
+        let mut encoder: wgpu::CommandEncoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Fill Encoder"),
+            });
+        let mut fill_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Fill Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &point_texture_views.0,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.01,
+                        g: 0.01,
+                        b: 0.01,
+                        a: 1.0,
+                    }),
+                    store: true,
+                },
+            })],
+            depth_stencil_attachment: None,
+        });
+        fill_pass.set_pipeline(&fill_pipeline);
+        fill_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        fill_pass.set_bind_group(0, &bind_groups.1, &[]);
+        fill_pass.draw(0..num_vertices, 0..1);
+        drop(fill_pass);
+        queue.submit(Some(encoder.finish()));
+
         Self {
             surface,
             device,
@@ -441,10 +517,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             bind_groups,
             point_texture_views,
             swap_active: false,
+            last_print: Instant::now(),
+            frame: 0,
         }
     }
 
     fn render(&mut self) -> Result<(), SurfaceError> {
+        self.frame += 1;
+        let max_frame = 240;
+        if self.frame == max_frame {
+            self.frame = 0;
+            let dt = std::mem::replace(&mut self.last_print, Instant::now()).elapsed();
+            let fps = max_frame as f64 / dt.as_secs_f64();
+            println!("fps: {fps:?}, dt: {dt:50?}");
+        }
+
         let output: wgpu::SurfaceTexture = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -453,11 +540,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
         let mut encoder: wgpu::CommandEncoder =
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Fill Encoder"),
+                    label: Some("Update Encoder"),
                 });
-        {
-            let mut fill_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Fill Pass"),
+        for _ in 0..50 {
+            let mut update_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Update Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.point_texture_views.1,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.01,
+                            g: 0.01,
+                            b: 0.01,
+                            a: 1.0,
+                        }),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+            update_pass.set_pipeline(&self.update_pipeline);
+            update_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            update_pass.set_bind_group(0, &self.bind_groups.0, &[]);
+            update_pass.draw(0..self.num_vertices, 0..1);
+            drop(update_pass);
+
+            let mut update_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Update Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.point_texture_views.0,
                     resolve_target: None,
@@ -473,40 +583,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 })],
                 depth_stencil_attachment: None,
             });
-            fill_pass.set_pipeline(&self.fill_pipeline);
-            fill_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            fill_pass.set_bind_group(0, &self.bind_groups.1, &[]);
-            fill_pass.draw(0..self.num_vertices, 0..1);
+            update_pass.set_pipeline(&self.update_pipeline);
+            update_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            update_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+            update_pass.draw(0..self.num_vertices, 0..1);
+            drop(update_pass);
         }
-        self.queue.submit(Some(encoder.finish()));
 
-        let mut encoder: wgpu::CommandEncoder =
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Render Encoder"),
-                });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.01,
-                            g: 0.01,
-                            b: 0.01,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.bind_groups.0, &[]);
-            render_pass.draw(0..NUM_POINTS, 0..1);
-        }
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.01,
+                        g: 0.01,
+                        b: 0.01,
+                        a: 1.0,
+                    }),
+                    store: true,
+                },
+            })],
+            depth_stencil_attachment: None,
+        });
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+        render_pass.draw(0..(3 * NUM_POINTS), 0..1);
+        drop(render_pass);
 
         self.queue.submit(Some(encoder.finish()));
         output.present();
