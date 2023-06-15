@@ -9,7 +9,7 @@ use winit::{
 
 use std::time::Instant;
 
-const NUM_POINTS: u32 = 1024 * 2;
+const NUM_POINTS: u32 = 512;
 
 use std::mem::size_of;
 
@@ -285,28 +285,168 @@ fn fs_fill(
 fn fs_update(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
-    //var a = textureLoad(compute_texture, vec2<u32>(u32(in.pos.x * {NUM_POINTS}.0 + 0.5), 0u), 0);
     
-    var avg_p = vec2<f32>(0.0);
-    for (var i: i32 = 0; i < 10; i++) {{
-        // TODO: let hardware do the wrapping?
-        // TODO: rearrange to make sampling cheaper
-        var a = textureLoad(compute_texture, vec2<u32>(u32(i32(in.clip_position.x) + i * {INDEX_OFFSET}) % {NUM_POINTS}u, 0u), 0);
-        
-        avg_p += a.xy * 0.1;
-    }}
+
+
 
 
     var a = textureLoad(compute_texture, vec2<u32>(u32(in.clip_position.x), 0u), 0);
-    
-    let dt = 0.001;
+    //let dt = 0.04;
+    let dt = 0.004;
     var p = a.xy;
     var v = a.zw;
 
+
+    //var a = textureLoad(compute_texture, vec2<u32>(u32(in.pos.x * {NUM_POINTS}.0 + 0.5), 0u), 0);
     
-    //v += -(p-avg_p) * dt;
-    v += 0.1 *  -(smoothstep(0.0, 0.3, length(p-avg_p)) - 0.5) * normalize(p-avg_p) * dt * 0.9;
-    v += 0.01 *  -(smoothstep(0.0, 1.9, length(p)) - 0.5) * normalize(p) * dt * 2.0;
+    var attract_p = vec2<f32>(0.0);
+    var repell_p = vec2<f32>(0.0);
+    for (var i: i32 = 0; i < {NUM_POINTS}; i++) {{
+        let my_id = u32(in.clip_position.x);
+        var f: f32 = 0.0;
+        switch(my_id % 7u) {{
+            case 0u: {{ 
+                switch (u32(i % 7)) {{
+                    case 0u: {{ f = -0.9754196802233119; }}
+                    case 1u: {{ f = 0.8749759205556629; }}
+                    case 2u: {{ f = -0.32970000065553795; }}
+                    case 3u: {{ f = -0.5206510756977798; }}
+                    case 4u: {{ f = 0.6376401564518979; }}
+                    case 5u: {{ f = -0.6083062473168999; }}
+                    case 6u: {{ f = -0.27903002956423073; }}
+                    default: {{ f = 0.0; }}
+                }}
+            }}
+            case 1u: {{
+                switch (u32(i % 7)) {{
+                    case 0u: {{ f = 0.9778881484752089; }}
+                    case 1u: {{ f = 0.649413257898205; }}
+                    case 2u: {{ f = 0.17558277573203918; }}
+                    case 3u: {{ f = 0.727256798783394; }}
+                    case 4u: {{ f = 0.12817386742495174; }}
+                    case 5u: {{ f = -0.6812167941122906; }}
+                    case 6u: {{ f = -0.40886325239861354; }}
+                    default: {{ f = 0.0; }}
+                }}
+            }}
+            case 2u: {{
+                switch (u32(i % 7)) {{
+                    case 0u: {{ f = -0.6286519291003476; }}
+                    case 1u: {{ f = 0.822062236958949; }}
+                    case 2u: {{ f = -0.8371226217691972; }}
+                    case 3u: {{ f = 0.4368971281321796; }}
+                    case 4u: {{ f = -0.7509632917170683; }}
+                    case 5u: {{ f = -0.6142576128932369; }}
+                    case 6u: {{ f = -0.9361177593141474; }}
+                    default: {{ f = 0.0; }}
+                }}
+            }}
+            case 3u: {{
+                switch (u32(i % 7)) {{
+                    case 0u: {{ f = -0.504991369048782; }}
+                    case 1u: {{ f = 0.8672848328013054; }}
+                    case 2u: {{ f = -0.35082800680361115; }}
+                    case 3u: {{ f = 0.7514574353943266; }}
+                    case 4u: {{ f = -0.19706051563746407; }}
+                    case 5u: {{ f = -0.11736513162143702; }}
+                    case 6u: {{ f = 0.8032107450780448; }}
+                    default: {{ f = 0.0; }}
+                }}
+            }}
+            case 4u: {{
+                switch (u32(i % 7)) {{
+                    case 0u: {{ f = -0.07457054601772439; }}
+                    case 1u: {{ f = -0.4872470355575358; }}
+                    case 2u: {{ f = 0.5276985248539052; }}
+                    case 3u: {{ f = -0.36851241475518015; }}
+                    case 4u: {{ f = 0.7713418014525202; }}
+                    case 5u: {{ f = 0.14443692700941058; }}
+                    case 6u: {{ f = -0.15613729001780752; }}
+                    default: {{ f = 0.0; }}
+                }}
+            }}
+            case 5u: {{
+                switch (u32(i % 7)) {{
+                    case 0u: {{ f = -0.5892377301220046; }}
+                    case 1u: {{ f = 0.5351996056533119; }}
+                    case 2u: {{ f = -0.4012452739961294; }}
+                    case 3u: {{ f = -0.4830133446690492; }}
+                    case 4u: {{ f = -0.9124036949915313; }}
+                    case 5u: {{ f = 0.12376897004590304; }}
+                    case 6u: {{ f = -0.7530831515583702; }}
+                    default: {{ f = 0.0; }}
+                }}
+            }}
+            case 6u: {{
+                switch (u32(i % 7)) {{
+                    case 0u: {{ f = -0.2707709796782187; }}
+                    case 1u: {{ f = 0.618195490989037; }}
+                    case 2u: {{ f = -0.407641487578563; }}
+                    case 3u: {{ f = 0.7306004972634732; }}
+                    case 4u: {{ f = -0.7042080904077299; }}
+                    case 5u: {{ f = 0.3478501083148249; }}
+                    case 6u: {{ f = 0.9912197039589776; }}
+                    default:  {{ f = 0.0; }}
+                }}
+            }}
+            default: {{ f = 0.0; }}
+        }}
+
+        var other = textureLoad(compute_texture, vec2<u32>(u32(i), 0u), 0);
+
+        // TODO: let hardware do the wrapping?
+        // TODO: rearrange to make sampling cheaper
+        //
+        if u32(i) != my_id {{
+            let diff = (p.xy - other.xy);
+            let l = length(diff);
+
+            let r_inner = 0.02;
+
+            let r_outer = r_inner * 4.0;
+
+            //if l < r_inner {{
+            //    f = 1.0 / l - 1.0 / r_inner;
+            //}} else if todo {{
+            //    
+            //}} else {{
+            //    f = 0.0;
+            //}}
+
+            let a = 2.0 * f / (r_outer - r_inner);
+            let q = (l - r_inner) * a;
+            let u = (-l + r_outer) * a;
+
+            let w = 32.0;
+
+            //let z = (1.0 / l) - (1.0 / r_inner);
+            let z = w - (l / r_inner) * w;
+            f = max(
+                max(
+                    0.0,
+                    min(q * sign(a), u * sign(a))
+                ) * sign(a),
+                z
+            );
+
+            
+            
+
+            //if l > 0.01 {{
+            //    f = 0.0;
+            //}}
+            v += 0.1 * f * normalize(diff) * dt;
+        }}
+        
+        
+
+    }}
+    
+
+    //v += 0.04 * -(smoothstep(0.0, 0.3, length(p-attract_p)) - 0.5) * normalize(p-attract_p) * dt * 0.9;
+    //v += 0.03 *  (smoothstep(0.0, 0.3, length(p-repell_p)) - 0.5) * normalize(p-repell_p) * dt * 0.9;
+    //v += 0.03 *  -(smoothstep(0.0, 1.0, length(p)) - 0.5) * normalize(p) * dt * 2.0;
+    v -= p * dot(p, p) * dt * 0.1;
 
 
     
@@ -322,7 +462,7 @@ fn fs_update(
         v.y = abs(v.y);
     }}
 
-    v *= pow(0.5, dt);
+    v *= pow(0.3, dt);
 
     p += v * dt;
     return vec4<f32>(p, v);
@@ -376,7 +516,7 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
     let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
-    let q = fract(f32(in.group) / {INDEX_OFFSET}.0);
+    let q = fract(f32(in.group) / 7.0);
     return vec4<f32>(1.0-q, q, 0.0, 1.0);
 }}
 
@@ -542,7 +682,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Update Encoder"),
                 });
-        for _ in 0..50 {
+        for _ in 0..10 {
             let mut update_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Update Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
