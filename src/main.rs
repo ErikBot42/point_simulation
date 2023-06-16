@@ -7,9 +7,10 @@ use winit::{
     window::WindowBuilder,
 };
 
+use std::ops::Range;
 use std::time::Instant;
 
-const NUM_POINTS: u32 = 768;
+const NUM_POINTS: u32 = 2048;
 
 use std::mem::size_of;
 
@@ -17,6 +18,96 @@ fn main() {
     std::env::set_var("RUST_BACKTRACE", "1");
     pollster::block_on(run());
 }
+
+struct Prng(u64);
+
+impl Prng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn f32(&mut self, r: Range<f32>) -> f32 {
+        ((self.next() as u32) as f32 / u32::MAX as f32) * (r.end - r.start) + r.start
+    }
+}
+
+#[derive(Debug)]
+struct SimParams {
+    dt: f32,
+    r_inner: f32,
+    r_outer: f32,
+    w: f32,
+    kinds: u32,
+    _0: u32,
+    _1: u32,
+    _2: u32,
+    forces: Vec<Relation>,
+}
+#[derive(Debug)]
+struct Relation {
+    force: f32,
+    r: f32,
+    r_inner: f32,
+    r_outer: f32,
+}
+
+impl SimParams {
+    fn as_buffer(&self) -> impl Iterator<Item = u8> + '_ {
+        [self.dt, self.r_inner, self.r_outer, self.w]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .chain(
+                [self.kinds, self._0, self._1, self._2]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes),
+            )
+            .chain(
+                self.forces
+                    .iter()
+                    .flat_map(|r| [r.force, r.r, r.r_inner, r.r_outer].into_iter())
+                    .flat_map(f32::to_le_bytes),
+            )
+    }
+
+    fn new() -> SimParams {
+        let dt = 0.01;
+        let kinds = 7;
+        let r_inner = 0.02;
+        let r_outer = 0.06;
+        let w = 16.0;
+
+        let mut rng = Prng(2);
+
+        dbg!(SimParams {
+            dt,
+            r_inner,
+            r_outer,
+            w,
+            kinds,
+            _0: 0,
+            _1: 0,
+            _2: 0,
+            forces: (0..kinds * kinds)
+                .map(|_| {
+                    let force = rng.f32(-1.0..1.0);
+                    let r = r_inner;
+                    let r_inner = r_inner;
+                    let r_outer = r_outer;
+
+                    Relation {
+                        force,
+                        r,
+                        r_inner,
+                        r_outer,
+                    }
+                })
+                .collect(),
+        })
+    }
+}
+
 async fn run() {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -84,7 +175,10 @@ struct State {
 
     last_print: Instant,
     frame: usize,
+
+    sim_params: SimParams,
 }
+
 impl State {
     async fn new(window: Window) -> Self {
         // apply:     pos, vel -> pos, _
@@ -199,6 +293,16 @@ impl State {
 
         let point_textures = (make_point_texture(), make_point_texture());
 
+        let sim_params = SimParams::new();
+
+        let sim_params_data: Vec<u8> = sim_params.as_buffer().collect();
+
+        let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sim params buffer"),
+            contents: &sim_params_data,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
         let point_texture_views: (wgpu::TextureView, wgpu::TextureView) = (
             point_textures
                 .0
@@ -211,34 +315,58 @@ impl State {
         let bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Bind group layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let bind_groups: (wgpu::BindGroup, wgpu::BindGroup) = (
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Bind group"),
                 layout: &bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&point_texture_views.0),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views.0),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                ],
             }),
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Bind group"),
                 layout: &bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&point_texture_views.1),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views.1),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                ],
             }),
         );
 
@@ -246,6 +374,29 @@ impl State {
         let shader_source: String = format!("
 @group(0) @binding(0) 
 var compute_texture: texture_2d<f32>;
+
+
+@group(0) @binding(1)
+var<uniform> params: SimParams;
+
+struct SimParams {{
+    dt: f32,
+    r_inner: f32,
+    r_outer: f32,
+    w: f32,
+    kinds: u32,
+    _0: u32,
+    _1: u32,
+    _2: u32,
+    forces: array<Relation, 49>,
+}}
+
+struct Relation {{
+    force: f32,
+    r: f32,
+    r_inner: f32,
+    r_outer: f32,
+}}
 
 
 struct FillVertexInput {{
@@ -270,13 +421,8 @@ fn vs_fill(
 fn fs_fill(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
-
-    //let a = textureLoad(compute_texture, vec2<u32>(group * 10u, 0u), 0);
-
-    
-    let num_points = {NUM_POINTS};
     let c: f32 = in.pos.x;
-    return vec4<f32>(c, sin(c * (f32(num_points) + 1.9008)), cos(c*2338.23894), sin(c*2783.7893));
+    return vec4<f32>(c, sin(c * ({NUM_POINTS}.0 + 1.9008)), cos(c*2338.23894), sin(c*2783.7893));
 }}
 
 @fragment
@@ -289,8 +435,8 @@ fn fs_update(
 
 
     var a = textureLoad(compute_texture, vec2<u32>(u32(in.clip_position.x), 0u), 0);
-    //let dt = 0.04;
-    let dt = 0.004;
+    let dt = params.dt;
+    //let dt = 0.004;
     var p = a.xy;
     var v = a.zw;
 
@@ -301,94 +447,10 @@ fn fs_update(
     var repell_p = vec2<f32>(0.0);
     for (var i: i32 = 0; i < {NUM_POINTS}; i++) {{
         let my_id = u32(in.clip_position.x);
-        var f: f32 = 0.0;
-        switch(my_id % 7u) {{
-            case 0u: {{ 
-                switch (u32(i % 7)) {{
-                    case 0u: {{ f = -0.55; }}
-                    case 1u: {{ f = 0.8749759205556629; }}
-                    case 2u: {{ f = -0.32970000065553795; }}
-                    case 3u: {{ f = -0.5206510756977798; }}
-                    case 4u: {{ f = 0.6376401564518979; }}
-                    case 5u: {{ f = -0.6083062473168999; }}
-                    case 6u: {{ f = -0.27903002956423073; }}
-                    default: {{ f = 0.0; }}
-                }}
-            }}
-            case 1u: {{
-                switch (u32(i % 7)) {{
-                    case 0u: {{ f = 0.9778881484752089; }}
-                    case 1u: {{ f = 0.649413257898205; }}
-                    case 2u: {{ f = 0.17558277573203918; }}
-                    case 3u: {{ f = 0.727256798783394; }}
-                    case 4u: {{ f = 0.12817386742495174; }}
-                    case 5u: {{ f = -0.6812167941122906; }}
-                    case 6u: {{ f = -0.40886325239861354; }}
-                    default: {{ f = 0.0; }}
-                }}
-            }}
-            case 2u: {{
-                switch (u32(i % 7)) {{
-                    case 0u: {{ f = -0.6286519291003476; }}
-                    case 1u: {{ f = 0.822062236958949; }}
-                    case 2u: {{ f = -0.8371226217691972; }}
-                    case 3u: {{ f = 0.4368971281321796; }}
-                    case 4u: {{ f = -0.7509632917170683; }}
-                    case 5u: {{ f = -0.6142576128932369; }}
-                    case 6u: {{ f = -0.9361177593141474; }}
-                    default: {{ f = 0.0; }}
-                }}
-            }}
-            case 3u: {{
-                switch (u32(i % 7)) {{
-                    case 0u: {{ f = -0.504991369048782; }}
-                    case 1u: {{ f = 0.8672848328013054; }}
-                    case 2u: {{ f = -0.35082800680361115; }}
-                    case 3u: {{ f = 0.7514574353943266; }}
-                    case 4u: {{ f = -0.19706051563746407; }}
-                    case 5u: {{ f = -0.11736513162143702; }}
-                    case 6u: {{ f = 0.8032107450780448; }}
-                    default: {{ f = 0.0; }}
-                }}
-            }}
-            case 4u: {{
-                switch (u32(i % 7)) {{
-                    case 0u: {{ f = -0.07457054601772439; }}
-                    case 1u: {{ f = -0.4872470355575358; }}
-                    case 2u: {{ f = 0.5276985248539052; }}
-                    case 3u: {{ f = -0.36851241475518015; }}
-                    case 4u: {{ f = 0.7713418014525202; }}
-                    case 5u: {{ f = 0.14443692700941058; }}
-                    case 6u: {{ f = -0.15613729001780752; }}
-                    default: {{ f = 0.0; }}
-                }}
-            }}
-            case 5u: {{
-                switch (u32(i % 7)) {{
-                    case 0u: {{ f = -0.5892377301220046; }}
-                    case 1u: {{ f = 0.5351996056533119; }}
-                    case 2u: {{ f = -0.4012452739961294; }}
-                    case 3u: {{ f = -0.4830133446690492; }}
-                    case 4u: {{ f = -0.9124036949915313; }}
-                    case 5u: {{ f = 0.12376897004590304; }}
-                    case 6u: {{ f = -0.7530831515583702; }}
-                    default: {{ f = 0.0; }}
-                }}
-            }}
-            case 6u: {{
-                switch (u32(i % 7)) {{
-                    case 0u: {{ f = -0.2707709796782187; }}
-                    case 1u: {{ f = 0.618195490989037; }}
-                    case 2u: {{ f = -0.407641487578563; }}
-                    case 3u: {{ f = 0.7306004972634732; }}
-                    case 4u: {{ f = -0.7042080904077299; }}
-                    case 5u: {{ f = 0.3478501083148249; }}
-                    case 6u: {{ f = 0.9912197039589776; }}
-                    default:  {{ f = 0.0; }}
-                }}
-            }}
-            default: {{ f = 0.0; }}
-        }}
+
+
+        let relation = params.forces[my_id % 7u + (u32(i) % 7u) * 7u];
+        var f = relation.force;
 
         var other = textureLoad(compute_texture, vec2<u32>(u32(i), 0u), 0);
 
@@ -399,23 +461,15 @@ fn fs_update(
             let diff = (p.xy - other.xy);
             let l = length(diff);
 
-            let r_inner = 0.04;
+            let r_inner = 0.02;
 
-            let r_outer = r_inner * 4.0;
-
-            //if l < r_inner {{
-            //    f = 1.0 / l - 1.0 / r_inner;
-            //}} else if todo {{
-            //    
-            //}} else {{
-            //    f = 0.0;
-            //}}
+            let r_outer = r_inner * 3.0;
 
             let a = 2.0 * f / (r_outer - r_inner);
             let q = (l - r_inner) * a;
             let u = (-l + r_outer) * a;
 
-            let w = 0.5*32.0;
+            let w = 32.0;
 
             //let z = (1.0 / l) - (1.0 / r_inner);
             let z = w - (l / r_inner) * w;
@@ -439,28 +493,24 @@ fn fs_update(
         
 
     }}
+
+    v -= 0.05 * p * dot(p, p) * dt;
     
-
-    //v += 0.04 * -(smoothstep(0.0, 0.3, length(p-attract_p)) - 0.5) * normalize(p-attract_p) * dt * 0.9;
-    //v += 0.03 *  (smoothstep(0.0, 0.3, length(p-repell_p)) - 0.5) * normalize(p-repell_p) * dt * 0.9;
-    //v += 0.03 *  -(smoothstep(0.0, 1.0, length(p)) - 0.5) * normalize(p) * dt * 2.0;
-
-    let p2 = dot(p, p);
-    let p4 = p2 * p2;
-    let p8 = p4 * p4;
-    v -= p * p8 * dt * 100.0;
-
 
     
     // reflection
     if p.x > 1.0 {{
+        p.x = 1.0;
         v.x = -abs(v.x);
     }} else if p.x < -1.0 {{
+        p.x = -1.0;
         v.x = abs(v.x);
     }}
     if p.y > 1.0 {{
+        p.y = 1.0;
         v.y = -abs(v.y);
     }} else if p.y < -1.0 {{
+        p.y = -1.0;
         v.y = abs(v.y);
     }}
 
@@ -507,8 +557,11 @@ fn vs_main(
     
     let a = textureLoad(compute_texture, vec2<u32>(group * 1u, 0u), 0);
 
+    offset *= max( - abs(a.zw) * 10.0 + vec2<f32>(1.0, 1.0), vec2<f32>(0.5, 0.5));
+
     offset += a.xy;
 
+    
     //out.clip_position = vec4<f32>(offset.x + f32(group) * 0.01 - 1.0, offset.y + sin(f32(group)) * 0.5, 0.0, 1.0);
     out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
     out.group = group;
@@ -579,7 +632,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
             depth_stencil: None,
             multisample,
             multiview: None,
@@ -655,36 +716,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
         drop(fill_pass);
         queue.submit(Some(encoder.finish()));
 
-        {
-            //let mut encoder: wgpu::CommandEncoder =
-            //    device
-            //        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            //            label: Some("Update Encoder"),
-            //        });
-            for _ in 0..10 {
-                for (view, bind_group) in [
-                    (&point_texture_views.1, &bind_groups.0),
-                    (&point_texture_views.0, &bind_groups.1),
-                ] {
-                    let mut encoder: wgpu::RenderBundleEncoder<'_> = device
-                        .create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
-                            label: Some("Update Bundle Encoder"),
-                            color_formats: &[Some(wgpu::TextureFormat::Rgba32Float)],
-                            depth_stencil: None,
-                            sample_count: 1,
-                            multiview: None,
-                        });
-                    encoder.set_pipeline(&update_pipeline);
-                    encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
-                    encoder.set_bind_group(0, bind_group, &[]);
-                    encoder.draw(0..num_vertices, 0..1);
-                    drop(encoder.finish(&wgpu::RenderBundleDescriptor {
-                        label: Some("Render bundle"),
-                    }));
-                }
-            }
-        }
-
         Self {
             surface,
             device,
@@ -701,6 +732,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             point_texture_views,
             last_print: Instant::now(),
             frame: 0,
+            sim_params,
         }
     }
 
@@ -724,7 +756,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Update Encoder"),
                 });
-        for _ in 0..10 {
+        for _ in 0..1 {
             for (view, bind_group) in [
                 (&self.point_texture_views.1, &self.bind_groups.0),
                 (&self.point_texture_views.0, &self.bind_groups.1),
