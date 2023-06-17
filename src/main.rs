@@ -80,26 +80,28 @@ struct Relation {
 }
 
 impl SimParams {
-    fn as_buffer(&self) -> impl Iterator<Item = u8> + '_ {
-        [self.dt, self.r_inner, self.r_outer, self.w]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .chain(
-                [self.kinds, self._0, self._1, self._2]
-                    .into_iter()
-                    .flat_map(u32::to_le_bytes),
-            )
+    #[inline(never)]
+    fn as_buffer(&self) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        buffer.extend(
+            [self.dt, self.r_inner, self.r_outer, self.w]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+        );
 
+        buffer.extend(
+            [self.kinds, self._0, self._1, self._2]
+                .into_iter()
+                .flat_map(u32::to_le_bytes),
+        );
 
-
-
-            //.chain(DISTINCT_COLORS.into_iter().flat_map(u32::to_le_bytes))
-            .chain(
-                self.forces
-                    .iter()
-                    .flat_map(|r| [r.force, r.r, r.r_inner, r.r_outer].into_iter())
-                    .flat_map(f32::to_le_bytes),
-            )
+        buffer.extend(
+            self.forces
+                .iter()
+                .flat_map(|r| [r.force, r.r, r.r_inner, r.r_outer].into_iter())
+                .flat_map(f32::to_le_bytes),
+        );
+        buffer
     }
 
     fn new() -> SimParams {
@@ -332,7 +334,7 @@ impl State {
 
         let sim_params = SimParams::new();
 
-        let sim_params_data: Vec<u8> = sim_params.as_buffer().collect();
+        let sim_params_data: Vec<u8> = sim_params.as_buffer();
 
         let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sim params buffer"),
