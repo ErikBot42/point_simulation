@@ -11,6 +11,32 @@ use std::ops::Range;
 use std::time::Instant;
 
 const NUM_POINTS: u32 = 2048;
+const NUM_KINDS: usize = 30;
+const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
+
+const DISTINCT_COLORS: [u32; 20] = [
+    0xFFB30000, 
+    0x803E7500, 
+    0xFF680000, 
+    0xA6BDD700, 
+    0xC1002000, 
+    0xCEA26200, 
+    0x81706600, 
+
+    0x007D3400, 
+    0xF6768E00, 
+    0x00538A00, 
+    0xFF7A5C00, 
+    0x53377A00, 
+    0xFF8E0000, 
+    0xB3285100, 
+    0xF4C80000, 
+    0x7F180D00, 
+    0x93AA0000, 
+    0x59331500, 
+    0xF13A1300, 
+    0x232C1600, 
+    ];
 
 use std::mem::size_of;
 
@@ -63,6 +89,11 @@ impl SimParams {
                     .into_iter()
                     .flat_map(u32::to_le_bytes),
             )
+
+
+
+
+            //.chain(DISTINCT_COLORS.into_iter().flat_map(u32::to_le_bytes))
             .chain(
                 self.forces
                     .iter()
@@ -73,12 +104,18 @@ impl SimParams {
 
     fn new() -> SimParams {
         let dt = 0.01;
-        let kinds = 7;
+        let kinds = NUM_KINDS as _;
         let r_inner = 0.02;
         let r_outer = 0.06;
         let w = 16.0;
 
-        let mut rng = Prng(2);
+        let mut rng = Prng(
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64,
+        );
+        println!("seed: {}", rng.0);
 
         dbg!(SimParams {
             dt,
@@ -93,8 +130,10 @@ impl SimParams {
                 .map(|_| {
                     let force = rng.f32(-1.0..1.0);
                     let r = r_inner;
-                    let r_inner = r_inner;
-                    let r_outer = r_outer;
+                    let r_inner = rng.f32(0.02..0.04);
+                    let r_outer = rng.f32((r_inner + 0.01)..0.1);
+                    //let r_inner = r_inner;
+                    //let r_outer = r_outer;
 
                     Relation {
                         force,
@@ -271,8 +310,6 @@ impl State {
         });
         let num_vertices = VERTICES.len() as u32;
 
-        // rgba32float
-
         let make_point_texture = || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
@@ -388,7 +425,7 @@ struct SimParams {{
     _0: u32,
     _1: u32,
     _2: u32,
-    forces: array<Relation, 49>,
+    forces: array<Relation, {NUM_KINDS2}>,
 }}
 
 struct Relation {{
@@ -449,7 +486,7 @@ fn fs_update(
         let my_id = u32(in.clip_position.x);
 
 
-        let relation = params.forces[my_id % 7u + (u32(i) % 7u) * 7u];
+        let relation = params.forces[my_id % {NUM_KINDS}u + (u32(i) % {NUM_KINDS}u) * {NUM_KINDS}u];
         var f = relation.force;
 
         var other = textureLoad(compute_texture, vec2<u32>(u32(i), 0u), 0);
@@ -461,9 +498,11 @@ fn fs_update(
             let diff = (p.xy - other.xy);
             let l = length(diff);
 
-            let r_inner = 0.02;
-
-            let r_outer = r_inner * 3.0;
+            //let r_inner = 0.02;
+            //let r_outer = r_inner * 3.0;
+            let r_inner = relation.r_inner;
+            let r_outer = relation.r_outer;
+            let r_inner_c = 0.02;
 
             let a = 2.0 * f / (r_outer - r_inner);
             let q = (l - r_inner) * a;
@@ -472,7 +511,7 @@ fn fs_update(
             let w = 32.0;
 
             //let z = (1.0 / l) - (1.0 / r_inner);
-            let z = w - (l / r_inner) * w;
+            var z = w - (l / r_inner_c) * w;
             f = max(
                 max(
                     0.0,
@@ -500,18 +539,18 @@ fn fs_update(
     
     // reflection
     if p.x > 1.0 {{
-        p.x = 1.0;
-        v.x = -abs(v.x);
-    }} else if p.x < -1.0 {{
         p.x = -1.0;
-        v.x = abs(v.x);
+        //v.x = -abs(v.x);
+    }} else if p.x < -1.0 {{
+        p.x = 1.0;
+        //v.x = abs(v.x);
     }}
     if p.y > 1.0 {{
-        p.y = 1.0;
-        v.y = -abs(v.y);
-    }} else if p.y < -1.0 {{
         p.y = -1.0;
-        v.y = abs(v.y);
+        //v.y = -abs(v.y);
+    }} else if p.y < -1.0 {{
+        p.y = 1.0;
+        //v.y = abs(v.y);
     }}
 
     v *= pow(0.3, dt);
@@ -571,7 +610,7 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
     let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
-    let q = fract(f32(in.group) / 7.0);
+    let q = fract(f32(in.group) / {NUM_KINDS}.0);
     
     let u = q * 2.0 * 3.141592;
 
@@ -699,9 +738,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.01,
-                        g: 0.01,
-                        b: 0.01,
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
                         a: 1.0,
                     }),
                     store: true,
@@ -756,7 +795,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Update Encoder"),
                 });
-        for _ in 0..1 {
+        for _ in 0..2 {
             for (view, bind_group) in [
                 (&self.point_texture_views.1, &self.bind_groups.0),
                 (&self.point_texture_views.0, &self.bind_groups.1),
@@ -768,9 +807,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.01,
-                                g: 0.01,
-                                b: 0.01,
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
                                 a: 1.0,
                             }),
                             store: true,
@@ -784,29 +823,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 update_pass.draw(0..self.num_vertices, 0..1);
                 drop(update_pass);
             }
-
-            //let mut update_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            //    label: Some("Update Pass"),
-            //    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            //        view: &self.point_texture_views.0,
-            //        resolve_target: None,
-            //        ops: wgpu::Operations {
-            //            load: wgpu::LoadOp::Clear(wgpu::Color {
-            //                r: 0.01,
-            //                g: 0.01,
-            //                b: 0.01,
-            //                a: 1.0,
-            //            }),
-            //            store: true,
-            //        },
-            //    })],
-            //    depth_stencil_attachment: None,
-            //});
-            //update_pass.set_pipeline(&self.update_pipeline);
-            //update_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            //update_pass.set_bind_group(0, &self.bind_groups.1, &[]);
-            //update_pass.draw(0..self.num_vertices, 0..1);
-            //drop(update_pass);
         }
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -816,9 +832,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.01,
-                        g: 0.01,
-                        b: 0.01,
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
                         a: 1.0,
                     }),
                     store: true,
@@ -828,6 +844,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
         });
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+        //render_pass.draw(0..(3 * NUM_POINTS), 0..1);
         render_pass.draw(0..(3 * NUM_POINTS), 0..1);
         drop(render_pass);
 
