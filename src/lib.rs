@@ -19,6 +19,8 @@ mod vertex;
 const NUM_POINTS: u32 = 2048;
 const NUM_KINDS: usize = 7;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
+
+const HASH_TEXTURE_SIZE: u32 = 256;
 const DISTINCT_COLORS: [u32; 20] = [
     0xFFB30000, 0x803E7500, 0xFF680000, 0xA6BDD700, 0xC1002000, 0xCEA26200, 0x81706600, 0x007D3400,
     0xF6768E00, 0x00538A00, 0xFF7A5C00, 0x53377A00, 0xFF8E0000, 0xB3285100, 0xF4C80000, 0x7F180D00,
@@ -78,13 +80,11 @@ impl SimParams {
                 .into_iter()
                 .flat_map(f32::to_le_bytes),
         );
-
         buffer.extend(
             [self.kinds, self._0, self._1, self._2]
                 .into_iter()
                 .flat_map(u32::to_le_bytes),
         );
-
         buffer.extend(
             self.forces
                 .iter()
@@ -174,7 +174,7 @@ pub async fn run() {
         web_sys::window()
             .and_then(|win| win.document())
             .and_then(|doc| {
-                let dst = doc.get_element_by_id("wasm-example")?; // TODO change this
+                let dst = doc.get_element_by_id("id-thingy")?;
                 let canvas = web_sys::Element::from(window.canvas());
                 dst.append_child(&canvas).ok()?;
                 Some(())
@@ -229,13 +229,16 @@ struct State {
 
     render_pipeline: wgpu::RenderPipeline,
     update_pipeline: wgpu::RenderPipeline,
+    hash_pipeline: wgpu::RenderPipeline,
+
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
 
     bind_groups: (wgpu::BindGroup, wgpu::BindGroup),
 
     point_texture_views: (wgpu::TextureView, wgpu::TextureView),
-    
+    hash_texture_views: (wgpu::TextureView, wgpu::TextureView),
+
     #[cfg(not(target_arch = "wasm32"))]
     last_print: Instant,
     frame: usize,
@@ -335,36 +338,26 @@ impl State {
         });
         let num_vertices = VERTICES.len() as u32;
 
-        let make_point_texture = || {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width: NUM_POINTS,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba32Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[wgpu::TextureFormat::Rgba32Float],
-            })
+        let point_textures = {
+            let make_point_texture = || {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Point Texture"),
+                    size: wgpu::Extent3d {
+                        width: NUM_POINTS,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[wgpu::TextureFormat::Rgba32Float],
+                })
+            };
+            (make_point_texture(), make_point_texture())
         };
-
-        let point_textures = (make_point_texture(), make_point_texture());
-
-        let sim_params = SimParams::new();
-
-        let sim_params_data: Vec<u8> = sim_params.as_buffer();
-
-        let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Sim params buffer"),
-            contents: &sim_params_data,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
         let point_texture_views: (wgpu::TextureView, wgpu::TextureView) = (
             point_textures
                 .0
@@ -373,6 +366,43 @@ impl State {
                 .1
                 .create_view(&wgpu::TextureViewDescriptor::default()),
         );
+
+        // x, y, kind, undef
+        let hash_textures = {
+            let make_hash_texture = || {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Hash Texture"),
+                    size: wgpu::Extent3d {
+                        width: HASH_TEXTURE_SIZE,
+                        height: HASH_TEXTURE_SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[wgpu::TextureFormat::Rgba32Float],
+                })
+            };
+            (make_hash_texture(), make_hash_texture())
+        };
+        let hash_texture_views: (wgpu::TextureView, wgpu::TextureView) = (
+            hash_textures
+                .0
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+            hash_textures
+                .1
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+        );
+
+        let sim_params = SimParams::new();
+        let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sim params buffer"),
+            contents: &sim_params.as_buffer(),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
         let bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -398,6 +428,16 @@ impl State {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -414,6 +454,10 @@ impl State {
                         binding: 1,
                         resource: sim_params_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.0),
+                    },
                 ],
             }),
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -428,6 +472,10 @@ impl State {
                         binding: 1,
                         resource: sim_params_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.1),
+                    },
                 ],
             }),
         );
@@ -436,9 +484,11 @@ impl State {
 @group(0) @binding(0) 
 var compute_texture: texture_2d<f32>;
 
-
 @group(0) @binding(1)
 var<uniform> params: SimParams;
+
+@group(0) @binding(0) 
+var hash_texture: texture_2d<f32>;
 
 struct SimParams {{
     dt: f32,
@@ -467,6 +517,35 @@ struct FillVertexOuput {{
     @builtin(position) clip_position: vec4<f32>,
     @location(0) pos: vec4<f32>,
 }}
+@vertex
+fn vs_hash(
+    in: VertexInput
+) -> VertexOutput {{
+    var out: VertexOutput;
+    let group = in.vertex_index;
+    let pos = textureLoad(compute_texture, vec2<u32>(group, 0u), 0).xy;
+    out.clip_position = vec4<f32>(pos.x, pos.y, 0.0, 1.0);
+    out.group = group;
+    return out;   
+}}
+@fragment
+fn fs_hash(in: VertexOutput) -> @location(0) vec4<f32> {{
+    //let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
+    let q = fract(f32(in.group) / {NUM_KINDS}.0);
+    
+    let u = q * 2.0 * 3.141592;
+
+    let w = (1.0 / 3.0) * 2.0 * 3.241592;
+
+    return vec4<f32>(
+    pow(sin(u + 0.0 * w), 4.0),
+    pow(sin(u + 1.0 * w), 4.0),
+    pow(sin(u + 2.0 * w), 4.0),
+            1.0
+    );
+    //return vec4<f32>(1.0-q, q, 0.0, 1.0);
+}}
+
 
 @vertex
 fn vs_fill(
@@ -487,14 +566,17 @@ fn fs_fill(
 }}
 
 @fragment
+fn fs_debug_hash(
+    in: FillVertexOuput,
+) -> @location(0) vec4<f32> {{
+    let pos = vec2<f32>(in.pos.xy);
+    return vec4<f32>(1.0, pos.x, pos.y, 1.0);
+}}
+
+@fragment
 fn fs_update(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
-    
-
-
-
-
     var a = textureLoad(compute_texture, vec2<u32>(u32(in.clip_position.x), 0u), 0);
     let dt = params.dt;
     //let dt = 0.004;
@@ -543,39 +625,12 @@ fn fs_update(
                 ) * sign(a),
                 z
             );
-
-            
-            
-
-            //if l > 0.01 {{
-            //    f = 0.0;
-            //}}
             v += 0.1 * f * normalize(diff) * dt;
         }}
-        
-        
-
     }}
-
     v -= 0.05 * p * dot(p, p) * dt;
-    
-
-    
-    // reflection
-    if p.x > 1.0 {{
-        p.x = -1.0;
-        //v.x = -abs(v.x);
-    }} else if p.x < -1.0 {{
-        p.x = 1.0;
-        //v.x = abs(v.x);
-    }}
-    if p.y > 1.0 {{
-        p.y = -1.0;
-        //v.y = -abs(v.y);
-    }} else if p.y < -1.0 {{
-        p.y = 1.0;
-        //v.y = abs(v.y);
-    }}
+    if p.x > 1.0 {{ p.x = -1.0; }} else if p.x < -1.0 {{ p.x = 1.0; }}
+    if p.y > 1.0 {{ p.y = -1.0; }} else if p.y < -1.0 {{ p.y = 1.0; }}
 
     v *= pow(0.3, dt);
 
@@ -618,7 +673,7 @@ fn vs_main(
     }}
     offset *= 0.01;
     
-    let a = textureLoad(compute_texture, vec2<u32>(group * 1u, 0u), 0);
+    let a = textureLoad(compute_texture, vec2<u32>(group, 0u), 0);
 
     offset *= max( - abs(a.zw) * 10.0 + vec2<f32>(1.0, 1.0), vec2<f32>(0.5, 0.5));
 
@@ -633,7 +688,7 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
-    let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
+    //let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
     let q = fract(f32(in.group) / {NUM_KINDS}.0);
     
     let u = q * 2.0 * 3.141592;
@@ -650,38 +705,88 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
 }}
 
 ");
-
         let fragment_vertex_shader: wgpu::ShaderModule =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Fragment and vertex shader"),
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
-        let pipeline_layout: wgpu::PipelineLayout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            });
-        let layout = Some(&pipeline_layout);
-        let primitive: wgpu::PrimitiveState = wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        };
-        let multisample: wgpu::MultisampleState = wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        };
 
         let render_pipeline;
         let update_pipeline;
         let fill_pipeline;
+        let hash_pipeline;
+        let debug_hash_pipeline;
         {
+            let pipeline_layout: wgpu::PipelineLayout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Render Pipeline Layout"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+            let layout = Some(&pipeline_layout);
+            let make_primitive = |topology| wgpu::PrimitiveState {
+                topology,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            };
+            let multisample: wgpu::MultisampleState = wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            };
+            let vertex_fill = wgpu::VertexState {
+                module: &fragment_vertex_shader,
+                entry_point: "vs_fill",
+                buffers: &[Vertex::desc()],
+            };
+            //: wgpu::TextureFormat::Rgba32Float,
+
+            debug_hash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Debug Hash Pipeline"),
+                layout,
+                vertex: vertex_fill.clone(),
+                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
+                depth_stencil: None,
+                multisample,
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_vertex_shader,
+                    entry_point: "fs_debug_hash",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            });
+
+            hash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Hash Pipeline"),
+                layout,
+                vertex: wgpu::VertexState {
+                    module: &fragment_vertex_shader,
+                    entry_point: "vs_hash",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_vertex_shader,
+                    entry_point: "fs_hash",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: make_primitive(wgpu::PrimitiveTopology::PointList),
+                depth_stencil: None,
+                multisample,
+                multiview: None,
+            });
+
             render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Render Pipeline"),
                 layout,
@@ -699,15 +804,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
+                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
                 depth_stencil: None,
                 multisample,
                 multiview: None,
@@ -715,11 +812,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Fill Pipeline"),
                 layout,
-                vertex: wgpu::VertexState {
-                    module: &fragment_vertex_shader,
-                    entry_point: "vs_fill",
-                    buffers: &[Vertex::desc()],
-                },
+                vertex: vertex_fill.clone(),
                 fragment: Some(wgpu::FragmentState {
                     module: &fragment_vertex_shader,
                     entry_point: "fs_fill",
@@ -729,7 +822,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
-                primitive,
+                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
                 depth_stencil: None,
                 multisample,
                 multiview: None,
@@ -737,11 +830,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             update_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Update Pipeline"),
                 layout,
-                vertex: wgpu::VertexState {
-                    module: &fragment_vertex_shader,
-                    entry_point: "vs_fill",
-                    buffers: &[Vertex::desc()],
-                },
+                vertex: vertex_fill.clone(),
                 fragment: Some(wgpu::FragmentState {
                     module: &fragment_vertex_shader,
                     entry_point: "fs_update",
@@ -751,7 +840,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
-                primitive,
+                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
                 depth_stencil: None,
                 multisample,
                 multiview: None,
@@ -798,10 +887,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             window,
             render_pipeline,
             update_pipeline,
+            hash_pipeline,
             vertex_buffer,
             num_vertices,
             bind_groups,
             point_texture_views,
+            hash_texture_views,
             #[cfg(not(target_arch = "wasm32"))]
             last_print: Instant::now(),
             frame: 0,
@@ -828,8 +919,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
         let mut encoder: wgpu::CommandEncoder =
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Update Encoder"),
+                    label: Some("Encoder"),
                 });
+
+        {
+            let mut hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Hash Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.hash_texture_views.1,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+            hash_pass.set_pipeline(&self.hash_pipeline);
+            hash_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            hash_pass.set_bind_group(0, &self.bind_groups.0, &[]);
+            hash_pass.draw(0..NUM_POINTS, 0..1);
+        }
+
         for _ in 0..2 {
             for (view, bind_group) in [
                 (&self.point_texture_views.1, &self.bind_groups.0),
