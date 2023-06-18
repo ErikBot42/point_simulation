@@ -230,6 +230,7 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     update_pipeline: wgpu::RenderPipeline,
     hash_pipeline: wgpu::RenderPipeline,
+    debug_hash_pipeline: wgpu::RenderPipeline,
 
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
@@ -487,7 +488,7 @@ var compute_texture: texture_2d<f32>;
 @group(0) @binding(1)
 var<uniform> params: SimParams;
 
-@group(0) @binding(0) 
+@group(0) @binding(2) 
 var hash_texture: texture_2d<f32>;
 
 struct SimParams {{
@@ -524,13 +525,25 @@ fn vs_hash(
     var out: VertexOutput;
     let group = in.vertex_index;
     let pos = textureLoad(compute_texture, vec2<u32>(group, 0u), 0).xy;
-    out.clip_position = vec4<f32>(pos.x, pos.y, 0.0, 1.0);
+    out.clip_position = vec4<f32>(pos.x, -pos.y, 0.0, 1.0);
     out.group = group;
     return out;   
 }}
 @fragment
 fn fs_hash(in: VertexOutput) -> @location(0) vec4<f32> {{
     //let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
+    //let q = fract(f32(in.group) / {NUM_KINDS}.0);
+    //
+    //let u = q * 2.0 * 3.141592;
+
+    //let w = (1.0 / 3.0) * 2.0 * 3.241592;
+
+    //return vec4<f32>(
+    //pow(sin(u + 0.0 * w), 4.0),
+    //pow(sin(u + 1.0 * w), 4.0),
+    //pow(sin(u + 2.0 * w), 4.0),
+    //        1.0
+    //);
     let q = fract(f32(in.group) / {NUM_KINDS}.0);
     
     let u = q * 2.0 * 3.141592;
@@ -538,12 +551,16 @@ fn fs_hash(in: VertexOutput) -> @location(0) vec4<f32> {{
     let w = (1.0 / 3.0) * 2.0 * 3.241592;
 
     return vec4<f32>(
-    pow(sin(u + 0.0 * w), 4.0),
-    pow(sin(u + 1.0 * w), 4.0),
-    pow(sin(u + 2.0 * w), 4.0),
+    0.2 * pow(sin(u + 0.0 * w), 4.0),
+    0.2 * pow(sin(u + 1.0 * w), 4.0),
+    0.2 * pow(sin(u + 2.0 * w), 4.0),
             1.0
     );
-    //return vec4<f32>(1.0-q, q, 0.0, 1.0);
+
+
+
+    //return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    ////return vec4<f32>(1.0-q, q, 0.0, 1.0);
 }}
 
 
@@ -569,8 +586,14 @@ fn fs_fill(
 fn fs_debug_hash(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
-    let pos = vec2<f32>(in.pos.xy);
-    return vec4<f32>(1.0, pos.x, pos.y, 1.0);
+    let pos = (vec2<f32>(in.pos.xy) + 1.0) * 0.5;
+
+    let a = textureLoad(hash_texture, vec2<u32>(pos * {HASH_TEXTURE_SIZE}.0), 0);
+
+
+    return a;
+    //return vec4<f32>(1.0, pos.x, pos.y, 1.0);
+    //return vec4<f32>(a.x, a.y, a.z, 1.0);
 }}
 
 @fragment
@@ -603,28 +626,50 @@ fn fs_update(
         if u32(i) != my_id {{
             let diff = (p.xy - other.xy);
             let l = length(diff);
+            
+            //{{
+            //    let r_inner = relation.r_inner;
+            //    let r_outer = relation.r_outer;
+            //    let r_inner_c = 0.02;
 
-            //let r_inner = 0.02;
-            //let r_outer = r_inner * 3.0;
-            let r_inner = relation.r_inner;
-            let r_outer = relation.r_outer;
-            let r_inner_c = 0.02;
+            //    let a = 2.0 * f / (r_outer - r_inner);
+            //    let q = (l - r_inner) * a;
+            //    let u = (-l + r_outer) * a;
 
-            let a = 2.0 * f / (r_outer - r_inner);
-            let q = (l - r_inner) * a;
-            let u = (-l + r_outer) * a;
+            //    let w = 64.0;
+            //    var z = w - (l / r_inner_c) * w;
+            //    f = max(
+            //        max(
+            //            0.0,
+            //            min(q * sign(a), u * sign(a))
+            //        ) * sign(a),
+            //        z
+            //    );
+            //}}
+            {{
+                let x = l;
+                let c = 0.01;
+                let a = c * 2.0; 
 
-            let w = 64.0;
+                let d = a;
+                let g = a * 2.0;
+                let h = (g + d) / 2.0;
+                let k_1 = f / (h - d); // dyn (f)
+                let k_2 = 1.0 / (a - c);
 
-            //let z = (1.0 / l) - (1.0 / r_inner);
-            var z = w - (l / r_inner_c) * w;
-            f = max(
-                max(
-                    0.0,
-                    min(q * sign(a), u * sign(a))
-                ) * sign(a),
-                z
-            );
+                
+                if x < c {{
+                    f = 100.0;
+                }} else if x < a {{
+                    f = min(100.0, 0.04 * (1.0 / (x - c) - k_2));
+                }} else if x < h {{
+                    f = (x - d) * k_1;
+                }} else if x < g {{
+                    f = ( - x + g) * k_1;
+                }} else {{
+                    f = 0.0;
+                }}
+            }}
             v += 0.1 * f * normalize(diff) * dt;
         }}
     }}
@@ -756,7 +801,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                     module: &fragment_vertex_shader,
                     entry_point: "fs_debug_hash",
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba32Float,
+                        format: config.format,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -888,6 +933,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             render_pipeline,
             update_pipeline,
             hash_pipeline,
+            debug_hash_pipeline,
             vertex_buffer,
             num_vertices,
             bind_groups,
@@ -922,11 +968,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                     label: Some("Encoder"),
                 });
 
-        {
+        for (view, bind_group) in [
+            (&self.hash_texture_views.1, &self.bind_groups.0),
+            (&self.hash_texture_views.0, &self.bind_groups.1),
+        ] {
             let mut hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Hash Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.hash_texture_views.1,
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -941,8 +990,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                 depth_stencil_attachment: None,
             });
             hash_pass.set_pipeline(&self.hash_pipeline);
-            hash_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            hash_pass.set_bind_group(0, &self.bind_groups.0, &[]);
+            //hash_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            hash_pass.set_bind_group(0, bind_group, &[]);
             hash_pass.draw(0..NUM_POINTS, 0..1);
         }
 
@@ -976,29 +1025,55 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             }
         }
 
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
-                    store: true,
-                },
-            })],
-            depth_stencil_attachment: None,
-        });
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.bind_groups.1, &[]);
-        //render_pass.draw(0..(3 * NUM_POINTS), 0..1);
-        render_pass.draw(0..(3 * NUM_POINTS), 0..1);
-        drop(render_pass);
+        {
+            let mut debug_hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Debug Hash Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+            debug_hash_pass.set_pipeline(&self.debug_hash_pipeline);
+            debug_hash_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+            debug_hash_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            debug_hash_pass.draw(0..self.num_vertices, 0..1);
+            drop(debug_hash_pass);
+        }
 
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        //load: wgpu::LoadOp::Clear(wgpu::Color {
+                        //    r: 0.0,
+                        //    g: 0.0,
+                        //    b: 0.0,
+                        //    a: 1.0,
+                        //}),
+                        load: wgpu::LoadOp::Load,
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+            render_pass.draw(0..(3 * NUM_POINTS), 0..1);
+            drop(render_pass);
+        }
         self.queue.submit(Some(encoder.finish()));
         output.present();
 
