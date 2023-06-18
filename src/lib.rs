@@ -20,7 +20,7 @@ const NUM_POINTS: u32 = 2048;
 const NUM_KINDS: usize = 7;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
-const HASH_TEXTURE_SIZE: u32 = 256;
+const HASH_TEXTURE_SIZE: u32 = 256 * 2;
 const DISTINCT_COLORS: [u32; 20] = [
     0xFFB30000, 0x803E7500, 0xFF680000, 0xA6BDD700, 0xC1002000, 0xCEA26200, 0x81706600, 0x007D3400,
     0xF6768E00, 0x00538A00, 0xFF7A5C00, 0x53377A00, 0xFF8E0000, 0xB3285100, 0xF4C80000, 0x7F180D00,
@@ -95,7 +95,7 @@ impl SimParams {
     }
 
     fn new() -> SimParams {
-        let dt = 0.01;
+        let dt = 0.01;//0.01;
         let kinds = NUM_KINDS as _;
         let r_inner = 0.02;
         let r_outer = 0.06;
@@ -648,11 +648,11 @@ fn fs_update(
             //}}
             {{
                 let x = l;
-                let c = 0.01;
+                let c = 4.0/{HASH_TEXTURE_SIZE}.0;
                 let a = c * 2.0; 
 
                 let d = a;
-                let g = a * 2.0;
+                let g = a * 4.0; // <- tweak me
                 let h = (g + d) / 2.0;
                 let k_1 = f / (h - d); // dyn (f)
                 let k_2 = 1.0 / (a - c);
@@ -673,7 +673,7 @@ fn fs_update(
             v += 0.1 * f * normalize(diff) * dt;
         }}
     }}
-    v -= 0.05 * p * dot(p, p) * dt;
+    v -= 0.01 * p * dt;
     if p.x > 1.0 {{ p.x = -1.0; }} else if p.x < -1.0 {{ p.x = 1.0; }}
     if p.y > 1.0 {{ p.y = -1.0; }} else if p.y < -1.0 {{ p.y = 1.0; }}
 
@@ -1050,7 +1050,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             drop(debug_hash_pass);
         }
 
-        {
+        if false {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
