@@ -16,12 +16,22 @@ use vertex::{Vertex, VERTICES};
 mod prng;
 mod vertex;
 
-//const NUM_POINTS: u32 = 2048; //128;
-const NUM_POINTS: u32 = 4 * 4096; //128;
+const NUM_POINTS: u32 = 2048; //128;
+//const NUM_POINTS: u32 = 4 * 4096; //128;
 const NUM_KINDS: usize = 16;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
 const HASH_TEXTURE_SIZE: u32 = 512; //512;//128;
+
+const RANGE_INDEX: u32 = 16;
+const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
+
+const BETA: f64 = 0.4;
+
+const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
+
+
+
 const DISTINCT_COLORS: [u32; 20] = [
     0xFFB30000, 0x803E7500, 0xFF680000, 0xA6BDD700, 0xC1002000, 0xCEA26200, 0x81706600, 0x007D3400,
     0xF6768E00, 0x00538A00, 0xFF7A5C00, 0x53377A00, 0xFF8E0000, 0xB3285100, 0xF4C80000, 0x7F180D00,
@@ -108,7 +118,7 @@ impl SimParams {
     }
 
     fn new() -> SimParams {
-        let dt = 0.01;
+        let dt = 0.005; // 0.01
         let kinds = NUM_KINDS as _;
         let r_inner = 0.02;
         let r_outer = 0.06;
@@ -319,8 +329,8 @@ impl State {
             .unwrap();
         dbgc!(adapter.features());
         dbgc!(adapter.limits());
-        let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
-        limits.max_texture_dimension_2d = 16384;
+        let limits = wgpu::Limits::downlevel_webgl2_defaults();
+        //limits.max_texture_dimension_2d = 16384;
 
         let (device, queue) = adapter
             .request_device(
@@ -346,7 +356,7 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Immediate,
+            present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -609,7 +619,8 @@ fn fs_fill(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
     let c: f32 = in.pos.x;
-    return vec4<f32>(c, sin(c * ({NUM_POINTS}.0 + 1.9008)), cos(c*2338.23894), sin(c*2783.7893));
+    //return vec4<f32>(c, sin(c * ({NUM_POINTS}.0 + 1.9008)), cos(c*2338.23894), sin(c*2783.7893));
+    return vec4<f32>(c, sin(c * ({NUM_POINTS}.0 + 1.9008)), 0.0, 0.0);
 }}
 
 @fragment
@@ -636,7 +647,7 @@ fn fs_update(
 
     let my_origin = vec2<i32>(((p + 1.0) * 0.5) * {HASH_TEXTURE_SIZE}.0 + 0.5);
 
-    let range: i32 = 6;
+    let range: i32 = {RANGE_INDEX};
     
     var v_i = vec2<f32>(0.0, 0.0);
     for (var i: i32 = -range; i < range; i++) {{
@@ -687,9 +698,9 @@ fn fs_update(
             */
             
             
-                let beta = 0.3; // const
+                let beta = {BETA}; // const
                 let alpha = 5.0; // const
-                let g = 0.03; // const
+                let g = {RADIUS_CLIP_SPACE}; // const
 
                 let k1 = (2.0 / ((1.0 - beta) * alpha)); // const
                 let k2 = - 1.0 / beta; // const
@@ -721,7 +732,7 @@ fn fs_update(
     if p.x > 1.0 {{ p.x = -1.0; }} else if p.x < -1.0 {{ p.x = 1.0; }}
     if p.y > 1.0 {{ p.y = -1.0; }} else if p.y < -1.0 {{ p.y = 1.0; }}
 
-    v *= pow(0.3, dt);
+    v *= pow(0.1, dt);
 
     p += v * dt;// / {HASH_TEXTURE_SIZE}.0 * 512.0;
     return vec4<f32>(p, v);
@@ -765,7 +776,7 @@ fn vs_main(
             offset = vec2<f32>(-sqrt(3.0) / 2.0, -0.5);
         }}
     }}
-    offset *= 4.0/{HASH_TEXTURE_SIZE}.0;
+    offset *= 0.8 * {INNER_RADIUS_CLIP_SPACE};//3.0/{HASH_TEXTURE_SIZE}.0;
 
     let a = textureLoad(compute_texture, vec2<u32>(group, 0u), 0);
 
@@ -793,6 +804,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
 
 ");
         dbgc!(&shader_source);
+        dbgc!(RADIUS_CLIP_SPACE);
         //        {
         //            let module: naga::Module = naga::front::wgsl::parse_str(&shader_source).unwrap();
         //
@@ -1033,7 +1045,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                     label: Some("Encoder"),
                 });
 
-        for _ in 0..4 {
+        for _ in 0..1 {
             for (hash_view, hash_bind_group, view, bind_group) in [
                 (
                     &self.hash_texture_views.0,
