@@ -18,10 +18,10 @@ mod vertex;
 
 //const NUM_POINTS: u32 = 2048; //128;
 const NUM_POINTS: u32 = 4 * 4096; //128;
-const NUM_KINDS: usize = 7;
+const NUM_KINDS: usize = 16;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
-const HASH_TEXTURE_SIZE: u32 = 1*1024; //512;//128;
+const HASH_TEXTURE_SIZE: u32 = 512; //512;//128;
 const DISTINCT_COLORS: [u32; 20] = [
     0xFFB30000, 0x803E7500, 0xFF680000, 0xA6BDD700, 0xC1002000, 0xCEA26200, 0x81706600, 0x007D3400,
     0xF6768E00, 0x00538A00, 0xFF7A5C00, 0x53377A00, 0xFF8E0000, 0xB3285100, 0xF4C80000, 0x7F180D00,
@@ -636,7 +636,7 @@ fn fs_update(
 
     let my_origin = vec2<i32>(((p + 1.0) * 0.5) * {HASH_TEXTURE_SIZE}.0 + 0.5);
 
-    let range: i32 = 8;
+    let range: i32 = 6;
     
     var v_i = vec2<f32>(0.0, 0.0);
     for (var i: i32 = -range; i < range; i++) {{
@@ -654,39 +654,65 @@ fn fs_update(
             let relation = params.forces[my_id % {NUM_KINDS}u + (other_id % {NUM_KINDS}u) * {NUM_KINDS}u];
             var f = relation.force;
 
-
             let diff = (p - other_pos);
             let l = length(diff);
 
             let x = l;
-            let c = 4.0/{HASH_TEXTURE_SIZE}.0;
-            //let c = 2.5/{HASH_TEXTURE_SIZE}.0;
-            let a = c * 2.0; 
+            /* 
+                let c = 4.0/{HASH_TEXTURE_SIZE}.0;
+                //let c = 2.5/{HASH_TEXTURE_SIZE}.0;
+                let a = c * 2.0; 
 
-            let d = a;
-            let g = a * 2.0; // <- tweak me
-            let h = (g + d) / 2.0;
-            let k_1 = f / (h - d); // dyn (f)
-            let k_2 = 1.0 / (a - c);
+                let d = a;
+                let g = a * 2.0; // <- tweak me
+                let h = (g + d) / 2.0;
+                let k_1 = f / (h - d); // dyn (f)
+                let k_2 = 1.0 / (a - c);
 
-            let i_s = 20.0;
+                let i_s = 20.0;
+                
+                //if x < c {{
+                //    f = 10.0;
+                //}} else if x < a {{
+                //    f = min(10.0, 0.04 * (1.0 / (x - c) - k_2));
+                if x < a {{
+                    f = max(- i_s * x / (a * 0.8) + i_s, 0.0);
+                }} else if x < h {{
+                    f = (x - d) * k_1;
+                }} else if x < g {{
+                    f = ( - x + g) * k_1;
+                }} else {{
+                    f = 0.0;
+                }}
+            */
             
-            //if x < c {{
-            //    f = 10.0;
-            //}} else if x < a {{
-            //    f = min(10.0, 0.04 * (1.0 / (x - c) - k_2));
-            if x < a {{
-                f = - i_s * x / a + i_s;
-            }} else if x < h {{
-                f = (x - d) * k_1;
-            }} else if x < g {{
-                f = ( - x + g) * k_1;
-            }} else {{
-                f = 0.0;
-            }}
+            
+                let beta = 0.3; // const
+                let alpha = 5.0; // const
+                let g = 0.03; // const
+
+                let k1 = (2.0 / ((1.0 - beta) * alpha)); // const
+                let k2 = - 1.0 / beta; // const
+                let k3 = 1.0 / g; // const
+                
+                let x_g = x * k3;
+                f = max(
+                    fma(x_g, k2, 1.0), 
+                    f * k1 * 
+                        max(
+                            0.0, 
+                            min(
+                                x_g - beta, 
+                                1.0 - x_g
+                            )
+                        )
+                ) * alpha;
+            
+
+
 
             //v += 0.1 * f * normalize(diff) * dt;
-            v_i += f * normalize(diff);
+            v_i += f * diff / l;
         }}
     }}
     }}
@@ -766,25 +792,26 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
 }}
 
 ");
-//        {
-//            let module: naga::Module = naga::front::wgsl::parse_str(&shader_source).unwrap();
-//
-//            let mut validator = naga::valid::Validator::new(
-//                naga::valid::ValidationFlags::all(),
-//                naga::valid::Capabilities::all(),
-//            );
-//            let module_info = validator.validate(&module).unwrap();
-//
-//            let options = naga::back::spv::Options {
-//    lang_version: (1, 6),
-//    pub flags: naga::back::spv::WriterFlags::DEBUG,
-//    pub binding_map: BindingMap,
-//    pub capabilities: Option<FastHashSet<Capability>>,
-//    pub bounds_check_policies: BoundsCheckPolicies,
-//    pub zero_initialize_workgroup_memory: ZeroInitializeWorkgroupMemoryMode,
-//
-//            };
-//        }
+        dbgc!(&shader_source);
+        //        {
+        //            let module: naga::Module = naga::front::wgsl::parse_str(&shader_source).unwrap();
+        //
+        //            let mut validator = naga::valid::Validator::new(
+        //                naga::valid::ValidationFlags::all(),
+        //                naga::valid::Capabilities::all(),
+        //            );
+        //            let module_info = validator.validate(&module).unwrap();
+        //
+        //            let options = naga::back::spv::Options {
+        //    lang_version: (1, 6),
+        //    pub flags: naga::back::spv::WriterFlags::DEBUG,
+        //    pub binding_map: BindingMap,
+        //    pub capabilities: Option<FastHashSet<Capability>>,
+        //    pub bounds_check_policies: BoundsCheckPolicies,
+        //    pub zero_initialize_workgroup_memory: ZeroInitializeWorkgroupMemoryMode,
+        //
+        //            };
+        //        }
 
         let fragment_vertex_shader: wgpu::ShaderModule =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
