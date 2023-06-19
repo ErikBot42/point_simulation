@@ -16,11 +16,12 @@ use vertex::{Vertex, VERTICES};
 mod prng;
 mod vertex;
 
-const NUM_POINTS: u32 = 2048; //128;
+//const NUM_POINTS: u32 = 2048; //128;
+const NUM_POINTS: u32 = 4 * 4096; //128;
 const NUM_KINDS: usize = 7;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
-const HASH_TEXTURE_SIZE: u32 = 256; //512;//128;
+const HASH_TEXTURE_SIZE: u32 = 1*1024; //512;//128;
 const DISTINCT_COLORS: [u32; 20] = [
     0xFFB30000, 0x803E7500, 0xFF680000, 0xA6BDD700, 0xC1002000, 0xCEA26200, 0x81706600, 0x007D3400,
     0xF6768E00, 0x00538A00, 0xFF7A5C00, 0x53377A00, 0xFF8E0000, 0xB3285100, 0xF4C80000, 0x7F180D00,
@@ -42,12 +43,24 @@ macro_rules! printlnc {
         }
     };
 }
-
 macro_rules! dbgc {
     ($aa:expr) => {{
-        let a = $aa;
-        printlnc!("{:#?}", &a);
-        a
+        match $aa {
+            tmp => {
+                eprintln!(
+                    "[{}:{}] {} = {:#?}",
+                    file!(),
+                    line!(),
+                    stringify!($aa),
+                    &tmp
+                );
+                tmp
+            }
+        }
+
+        //let a = $aa;
+        //printlnc!("{:#?}", &a);
+        //a
     }};
 }
 
@@ -243,6 +256,7 @@ struct State {
     num_vertices: u32,
 
     bind_groups: (wgpu::BindGroup, wgpu::BindGroup),
+    hash_bind_groups: (wgpu::BindGroup, wgpu::BindGroup),
 
     point_texture_views: (wgpu::TextureView, wgpu::TextureView),
     hash_texture_views: (wgpu::TextureView, wgpu::TextureView),
@@ -304,7 +318,10 @@ impl State {
             .find(|adapter| adapter.is_surface_supported(&surface))
             .unwrap();
         dbgc!(adapter.features());
-        let limits = wgpu::Limits::downlevel_webgl2_defaults();
+        dbgc!(adapter.limits());
+        let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
+        limits.max_texture_dimension_2d = 16384;
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -329,7 +346,7 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::Immediate,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -482,44 +499,44 @@ impl State {
             }),
         );
 
-        //let hash_bind_groups: (wgpu::BindGroup, wgpu::BindGroup) = (
-        //    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        //        label: Some("Bind group"),
-        //        layout: &bind_group_layout,
-        //        entries: &[
-        //            wgpu::BindGroupEntry {
-        //                binding: 0,
-        //                resource: wgpu::BindingResource::TextureView(&point_texture_views.0),
-        //            },
-        //            wgpu::BindGroupEntry {
-        //                binding: 1,
-        //                resource: sim_params_buffer.as_entire_binding(),
-        //            },
-        //            wgpu::BindGroupEntry {
-        //                binding: 2,
-        //                resource: wgpu::BindingResource::TextureView(&hash_texture_views.1),
-        //            },
-        //        ],
-        //    }),
-        //    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        //        label: Some("Bind group"),
-        //        layout: &bind_group_layout,
-        //        entries: &[
-        //            wgpu::BindGroupEntry {
-        //                binding: 0,
-        //                resource: wgpu::BindingResource::TextureView(&point_texture_views.1),
-        //            },
-        //            wgpu::BindGroupEntry {
-        //                binding: 1,
-        //                resource: sim_params_buffer.as_entire_binding(),
-        //            },
-        //            wgpu::BindGroupEntry {
-        //                binding: 2,
-        //                resource: wgpu::BindingResource::TextureView(&hash_texture_views.0),
-        //            },
-        //        ],
-        //    }),
-        //);
+        let hash_bind_groups: (wgpu::BindGroup, wgpu::BindGroup) = (
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Bind group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views.0),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.1),
+                    },
+                ],
+            }),
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Bind group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views.1),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.0),
+                    },
+                ],
+            }),
+        );
 
         let shader_source: String = format!("
 @group(0) @binding(0) 
@@ -611,7 +628,7 @@ fn fs_update(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
     var a = textureLoad(compute_texture, vec2<u32>(u32(in.clip_position.x), 0u), 0);
-    let dt = params.dt * 0.1;
+    let dt = params.dt;
     var p = a.xy;
     var v = a.zw;
 
@@ -620,7 +637,8 @@ fn fs_update(
     let my_origin = vec2<i32>(((p + 1.0) * 0.5) * {HASH_TEXTURE_SIZE}.0 + 0.5);
 
     let range: i32 = 8;
-
+    
+    var v_i = vec2<f32>(0.0, 0.0);
     for (var i: i32 = -range; i < range; i++) {{
     for (var j: i32 = -range; j < range; j++) {{
         
@@ -642,18 +660,23 @@ fn fs_update(
 
             let x = l;
             let c = 4.0/{HASH_TEXTURE_SIZE}.0;
+            //let c = 2.5/{HASH_TEXTURE_SIZE}.0;
             let a = c * 2.0; 
 
             let d = a;
-            let g = a * 4.0; // <- tweak me
+            let g = a * 2.0; // <- tweak me
             let h = (g + d) / 2.0;
             let k_1 = f / (h - d); // dyn (f)
             let k_2 = 1.0 / (a - c);
+
+            let i_s = 20.0;
             
-            if x < c {{
-                f = 100.0;
-            }} else if x < a {{
-                f = min(100.0, 0.04 * (1.0 / (x - c) - k_2));
+            //if x < c {{
+            //    f = 10.0;
+            //}} else if x < a {{
+            //    f = min(10.0, 0.04 * (1.0 / (x - c) - k_2));
+            if x < a {{
+                f = - i_s * x / a + i_s;
             }} else if x < h {{
                 f = (x - d) * k_1;
             }} else if x < g {{
@@ -662,17 +685,19 @@ fn fs_update(
                 f = 0.0;
             }}
 
-            v += 0.1 * f * normalize(diff) * dt;
+            //v += 0.1 * f * normalize(diff) * dt;
+            v_i += f * normalize(diff);
         }}
     }}
     }}
-    v -= 0.01 * p * dt;
+    v += v_i * 0.1 * dt;
+    //v -= 0.01 * p * dt;
     if p.x > 1.0 {{ p.x = -1.0; }} else if p.x < -1.0 {{ p.x = 1.0; }}
     if p.y > 1.0 {{ p.y = -1.0; }} else if p.y < -1.0 {{ p.y = 1.0; }}
 
     v *= pow(0.3, dt);
 
-    p += v * dt;
+    p += v * dt;// / {HASH_TEXTURE_SIZE}.0 * 512.0;
     return vec4<f32>(p, v);
 }}
 
@@ -687,11 +712,16 @@ struct VertexOutput {{
     @location(0) group: u32,
 }};
 
+struct VertexOutputMain {{
+    @builtin(position) clip_position: vec4<f32>,
+    @location(1) color: vec4<f32>,
+}};
+
 @vertex
 fn vs_main(
     in: VertexInput,
-) -> VertexOutput {{
-    var out: VertexOutput;
+) -> VertexOutputMain {{
+    var out: VertexOutputMain;
 
     let group = in.vertex_index / 3u;
     let member = in.vertex_index % 3u;
@@ -709,42 +739,53 @@ fn vs_main(
             offset = vec2<f32>(-sqrt(3.0) / 2.0, -0.5);
         }}
     }}
-    offset *= 0.01;
-    
-    let a = textureLoad(compute_texture, vec2<u32>(group, 0u), 0);
+    offset *= 4.0/{HASH_TEXTURE_SIZE}.0;
 
-    offset *= max( - abs(a.zw) * 10.0 + vec2<f32>(1.0, 1.0), vec2<f32>(0.5, 0.5));
+    let a = textureLoad(compute_texture, vec2<u32>(group, 0u), 0);
 
     offset += a.xy;
 
-    
-    //out.clip_position = vec4<f32>(offset.x + f32(group) * 0.01 - 1.0, offset.y + sin(f32(group)) * 0.5, 0.0, 1.0);
+    let q = fract(f32(group) / {NUM_KINDS}.0);
+    let u = q * 2.0 * 3.141592;
+    let w = (1.0 / 3.0) * 2.0 * 3.241592;
+    let color = vec4<f32>(
+        pow(sin(u + 0.0 * w), 4.0),
+        pow(sin(u + 1.0 * w), 4.0),
+        pow(sin(u + 2.0 * w), 4.0),
+        1.0
+    );
+    out.color = color;
+
     out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
-    out.group = group;
     return out;   
 }}
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
-    //let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
-    let q = fract(f32(in.group) / {NUM_KINDS}.0);
-    
-    let u = q * 2.0 * 3.141592;
-
-    let w = (1.0 / 3.0) * 2.0 * 3.241592;
-    
-    let a = textureLoad(compute_texture, vec2<u32>(in.group, 0u), 0);
-
-    return vec4<f32>(
-    pow(sin(u + 0.0 * w), 4.0),
-    pow(sin(u + 1.0 * w), 4.0),
-    pow(sin(u + 2.0 * w), 4.0),
-            1.0
-    );
-    //return vec4<f32>(1.0-q, q, 0.0, 1.0);
+fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
+    return in.color;
 }}
 
 ");
+//        {
+//            let module: naga::Module = naga::front::wgsl::parse_str(&shader_source).unwrap();
+//
+//            let mut validator = naga::valid::Validator::new(
+//                naga::valid::ValidationFlags::all(),
+//                naga::valid::Capabilities::all(),
+//            );
+//            let module_info = validator.validate(&module).unwrap();
+//
+//            let options = naga::back::spv::Options {
+//    lang_version: (1, 6),
+//    pub flags: naga::back::spv::WriterFlags::DEBUG,
+//    pub binding_map: BindingMap,
+//    pub capabilities: Option<FastHashSet<Capability>>,
+//    pub bounds_check_policies: BoundsCheckPolicies,
+//    pub zero_initialize_workgroup_memory: ZeroInitializeWorkgroupMemoryMode,
+//
+//            };
+//        }
+
         let fragment_vertex_shader: wgpu::ShaderModule =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Fragment and vertex shader"),
@@ -933,6 +974,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             vertex_buffer,
             num_vertices,
             bind_groups,
+            hash_bind_groups,
             point_texture_views,
             hash_texture_views,
             #[cfg(not(target_arch = "wasm32"))]
@@ -964,15 +1006,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                     label: Some("Encoder"),
                 });
 
-        for _ in 0..10 {
-            for (view, bind_group) in [
-                (&self.hash_texture_views.1, &self.bind_groups.0),
-                (&self.hash_texture_views.0, &self.bind_groups.1),
+        for _ in 0..4 {
+            for (hash_view, hash_bind_group, view, bind_group) in [
+                (
+                    &self.hash_texture_views.0,
+                    &self.hash_bind_groups.0,
+                    &self.point_texture_views.1,
+                    &self.bind_groups.0,
+                ),
+                (
+                    &self.hash_texture_views.1,
+                    &self.hash_bind_groups.1,
+                    &self.point_texture_views.0,
+                    &self.bind_groups.1,
+                ),
             ] {
                 let mut hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Hash Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
+                        view: hash_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -987,14 +1039,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
                     depth_stencil_attachment: None,
                 });
                 hash_pass.set_pipeline(&self.hash_pipeline);
-                //hash_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                hash_pass.set_bind_group(0, bind_group, &[]);
+                hash_pass.set_bind_group(0, hash_bind_group, &[]);
                 hash_pass.draw(0..NUM_POINTS, 0..1);
-            }
-            for (view, bind_group) in [
-                (&self.point_texture_views.1, &self.bind_groups.0),
-                (&self.point_texture_views.0, &self.bind_groups.1),
-            ] {
+                drop(hash_pass);
+
                 let mut update_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Update Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1020,7 +1068,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             }
         }
 
-        {
+        if self.render_tris {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+            render_pass.draw(0..(3 * NUM_POINTS), 0..1);
+            drop(render_pass);
+        } else {
             let mut debug_hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Debug Hash Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1045,30 +1115,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
             drop(debug_hash_pass);
         }
 
-        if self.render_tris {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        //load: wgpu::LoadOp::Clear(wgpu::Color {
-                        //    r: 0.0,
-                        //    g: 0.0,
-                        //    b: 0.0,
-                        //    a: 1.0,
-                        //}),
-                        load: wgpu::LoadOp::Load,
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.bind_groups.1, &[]);
-            render_pass.draw(0..(3 * NUM_POINTS), 0..1);
-            drop(render_pass);
-        }
         self.queue.submit(Some(encoder.finish()));
         output.present();
 

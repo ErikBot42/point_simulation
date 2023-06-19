@@ -842,6 +842,7 @@ dependencies = [
  "console_log",
  "env_logger",
  "log",
+ "naga",
  "pollster",
  "wasm-bindgen",
  "wasm-bindgen-futures",
