@@ -67,10 +67,6 @@ macro_rules! dbgc {
                 tmp
             }
         }
-
-        //let a = $aa;
-        //printlnc!("{:#?}", &a);
-        //a
     }};
 }
 
@@ -803,27 +799,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
 }}
 
 ");
-        dbgc!(&shader_source);
         dbgc!(RADIUS_CLIP_SPACE);
-        //        {
-        //            let module: naga::Module = naga::front::wgsl::parse_str(&shader_source).unwrap();
-        //
-        //            let mut validator = naga::valid::Validator::new(
-        //                naga::valid::ValidationFlags::all(),
-        //                naga::valid::Capabilities::all(),
-        //            );
-        //            let module_info = validator.validate(&module).unwrap();
-        //
-        //            let options = naga::back::spv::Options {
-        //    lang_version: (1, 6),
-        //    pub flags: naga::back::spv::WriterFlags::DEBUG,
-        //    pub binding_map: BindingMap,
-        //    pub capabilities: Option<FastHashSet<Capability>>,
-        //    pub bounds_check_policies: BoundsCheckPolicies,
-        //    pub zero_initialize_workgroup_memory: ZeroInitializeWorkgroupMemoryMode,
-        //
-        //            };
-        //        }
 
         let fragment_vertex_shader: wgpu::ShaderModule =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
