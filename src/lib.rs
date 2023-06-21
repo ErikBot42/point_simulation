@@ -16,21 +16,21 @@ use vertex::{Vertex, VERTICES};
 mod prng;
 mod vertex;
 
+const USE_BUNDLE: bool = true;
+
 const NUM_POINTS: u32 = 2048; //128;
-//const NUM_POINTS: u32 = 4 * 4096; //128;
+                              //const NUM_POINTS: u32 = 4 * 4096; //128;
 const NUM_KINDS: usize = 16;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
-const HASH_TEXTURE_SIZE: u32 = 512; //512;//128;
+const HASH_TEXTURE_SIZE: u32 = 256; //512;//128;
 
-const RANGE_INDEX: u32 = 16;
+const RANGE_INDEX: u32 = 8;
 const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
 
 const BETA: f64 = 0.4;
 
 const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
-
-
 
 const DISTINCT_COLORS: [u32; 20] = [
     0xFFB30000, 0x803E7500, 0xFF680000, 0xA6BDD700, 0xC1002000, 0xCEA26200, 0x81706600, 0x007D3400,
@@ -114,7 +114,7 @@ impl SimParams {
     }
 
     fn new() -> SimParams {
-        let dt = 0.005; // 0.01
+        let dt = 0.01; // 0.01
         let kinds = NUM_KINDS as _;
         let r_inner = 0.02;
         let r_outer = 0.06;
@@ -261,11 +261,11 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
 
-    bind_groups: (wgpu::BindGroup, wgpu::BindGroup),
-    hash_bind_groups: (wgpu::BindGroup, wgpu::BindGroup),
+    bind_groups: [wgpu::BindGroup; 2],
+    hash_bind_groups: [wgpu::BindGroup; 2],
 
-    point_texture_views: (wgpu::TextureView, wgpu::TextureView),
-    hash_texture_views: (wgpu::TextureView, wgpu::TextureView),
+    point_texture_views: [wgpu::TextureView; 2],
+    hash_texture_views: [wgpu::TextureView; 2],
 
     #[cfg(not(target_arch = "wasm32"))]
     last_print: Instant,
@@ -382,16 +382,16 @@ impl State {
                     view_formats: &[wgpu::TextureFormat::Rgba32Float],
                 })
             };
-            (make_point_texture(), make_point_texture())
+            [make_point_texture(), make_point_texture()]
         };
-        let point_texture_views: (wgpu::TextureView, wgpu::TextureView) = (
+        let point_texture_views: [wgpu::TextureView; 2] = [
             point_textures
-                .0
+                [0]
                 .create_view(&wgpu::TextureViewDescriptor::default()),
             point_textures
-                .1
+                [1]
                 .create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        ];
 
         let hash_textures = {
             let make_hash_texture = || {
@@ -411,16 +411,16 @@ impl State {
                     view_formats: &[wgpu::TextureFormat::Rgba32Float],
                 })
             };
-            (make_hash_texture(), make_hash_texture())
+            [make_hash_texture(), make_hash_texture()]
         };
-        let hash_texture_views: (wgpu::TextureView, wgpu::TextureView) = (
+        let hash_texture_views: [wgpu::TextureView; 2] = [
             hash_textures
-                .0
+                [0]
                 .create_view(&wgpu::TextureViewDescriptor::default()),
             hash_textures
-                .1
+                [1]
                 .create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        ];
 
         let sim_params = SimParams::new();
         let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -466,14 +466,14 @@ impl State {
                 ],
             });
 
-        let bind_groups: (wgpu::BindGroup, wgpu::BindGroup) = (
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_groups: [wgpu::BindGroup; 2] = 
+            [device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Bind group"),
                 layout: &bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&point_texture_views.0),
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views[0]),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -481,7 +481,7 @@ impl State {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.0),
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views[0]),
                     },
                 ],
             }),
@@ -491,7 +491,7 @@ impl State {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&point_texture_views.1),
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views[1]),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -499,20 +499,20 @@ impl State {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.1),
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views[1]),
                     },
                 ],
             }),
-        );
+        ];
 
-        let hash_bind_groups: (wgpu::BindGroup, wgpu::BindGroup) = (
+        let hash_bind_groups: [wgpu::BindGroup; 2] = [
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Bind group"),
                 layout: &bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&point_texture_views.0),
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views[0]),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -520,7 +520,7 @@ impl State {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.1),
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views[1]),
                     },
                 ],
             }),
@@ -530,7 +530,7 @@ impl State {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&point_texture_views.1),
+                        resource: wgpu::BindingResource::TextureView(&point_texture_views[1]),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -538,11 +538,11 @@ impl State {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&hash_texture_views.0),
+                        resource: wgpu::BindingResource::TextureView(&hash_texture_views[0]),
                     },
                 ],
             }),
-        );
+        ];
 
         let shader_source: String = format!("
 @group(0) @binding(0) 
@@ -943,6 +943,55 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             });
         }
 
+        /*{
+            for hash_bind_group in [&hash_bind_groups.0, &hash_bind_groups.1] {
+
+                let mut hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Hash Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: hash_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: true,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                });
+                hash_pass.set_pipeline(&self.hash_pipeline);
+                hash_pass.set_bind_group(0, hash_bind_group, &[]);
+                hash_pass.draw(0..NUM_POINTS, 0..1);
+                drop(hash_pass);
+
+
+
+
+
+
+
+            }
+            for bind_group in [&bind_groups.0, &bind_groups.1] {
+                let mut render_encoder =
+                    device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+                        label: Some("Update Pass Bundle"),
+                        color_formats: &[Some(wgpu::TextureFormat::Rgba32Float)],
+                        depth_stencil: None,
+                        sample_count: 1,
+                        multiview: None,
+                    });
+                render_encoder.set_pipeline(&update_pipeline);
+                render_encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_encoder.set_bind_group(0, bind_group, &[]);
+                render_encoder.draw(0..num_vertices, 0..1);
+            }
+
+        }*/
+
         // init state
         {
             let mut encoder: wgpu::CommandEncoder =
@@ -952,7 +1001,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             let mut fill_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Fill Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &point_texture_views.0,
+                    view: &point_texture_views[0],
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -968,7 +1017,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             });
             fill_pass.set_pipeline(&fill_pipeline);
             fill_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            fill_pass.set_bind_group(0, &bind_groups.1, &[]);
+            fill_pass.set_bind_group(0, &bind_groups[1], &[]);
             fill_pass.draw(0..num_vertices, 0..1);
             drop(fill_pass);
             queue.submit(Some(encoder.finish()));
@@ -1021,19 +1070,19 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                     label: Some("Encoder"),
                 });
 
-        for _ in 0..1 {
+        for _ in 0..5 {
             for (hash_view, hash_bind_group, view, bind_group) in [
                 (
-                    &self.hash_texture_views.0,
-                    &self.hash_bind_groups.0,
-                    &self.point_texture_views.1,
-                    &self.bind_groups.0,
+                    &self.hash_texture_views[0],
+                    &self.hash_bind_groups[0],
+                    &self.point_texture_views[1],
+                    &self.bind_groups[0],
                 ),
                 (
-                    &self.hash_texture_views.1,
-                    &self.hash_bind_groups.1,
-                    &self.point_texture_views.0,
-                    &self.bind_groups.1,
+                    &self.hash_texture_views[1],
+                    &self.hash_bind_groups[1],
+                    &self.point_texture_views[0],
+                    &self.bind_groups[1],
                 ),
             ] {
                 let mut hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1102,7 +1151,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                 depth_stencil_attachment: None,
             });
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+            render_pass.set_bind_group(0, &self.bind_groups[1], &[]);
             render_pass.draw(0..(3 * NUM_POINTS), 0..1);
             drop(render_pass);
         } else {
@@ -1124,7 +1173,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                 depth_stencil_attachment: None,
             });
             debug_hash_pass.set_pipeline(&self.debug_hash_pipeline);
-            debug_hash_pass.set_bind_group(0, &self.bind_groups.1, &[]);
+            debug_hash_pass.set_bind_group(0, &self.bind_groups[1], &[]);
             debug_hash_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             debug_hash_pass.draw(0..self.num_vertices, 0..1);
             drop(debug_hash_pass);
