@@ -23,7 +23,7 @@ unsafe impl bytemuck::Pod for Point {}
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-static MAX_NUM_ENTRIES_FOUND: AtomicUsize = AtomicUsize::new(0);
+//static MAX_NUM_ENTRIES_FOUND: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -36,9 +36,9 @@ use vertex::{Vertex, VERTICES};
 mod prng;
 mod vertex;
 
-const NUM_POINTS: u32 = 2048; //128;
+const NUM_POINTS: u32 = 4096; //2048; //128;
                               //const NUM_POINTS: u32 = 4 * 4096; //128;
-const NUM_KINDS: usize = 16;
+const NUM_KINDS: usize = 8;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
 const HASH_TEXTURE_SIZE: u32 = 256; //512;//128;
@@ -56,11 +56,18 @@ const DISTINCT_COLORS: [u32; 20] = [
     0x93AA0000, 0x59331500, 0xF13A1300, 0x232C1600,
 ];
 
-macro_rules! assert_ok_f32 {
+macro_rules! debug_assert_ok_f32 {
     ($a:expr) => {{
         let a = $a;
-        assert!(check_ok_f32(a), "{}: {}", stringify!($a), a);
+        debug_assert!(check_ok_f32(a), "{}: {}", stringify!($a), a);
     }};
+}
+fn check_ok_f32(f: f32) -> bool {
+    use std::num::FpCategory::*;
+    match f.classify() {
+        Nan | Infinite => false,
+        Zero | Subnormal | Normal => true,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -380,8 +387,8 @@ impl State {
             .unwrap();
         dbgc!(adapter.features());
         dbgc!(adapter.limits());
-        let limits = wgpu::Limits::downlevel_webgl2_defaults();
-        //limits.max_texture_dimension_2d = 16384;
+        let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
+        limits.max_texture_dimension_2d = 16384;
 
         let (device, queue) = adapter
             .request_device(
@@ -821,7 +828,7 @@ fn vs_main(
     offset += a.xy;
 
     let q = fract(f32(group) / {NUM_KINDS}.0);
-    let u = q * 2.0 * 3.141592;
+    let u = q * 1.0 * 3.141592;
     let w = (1.0 / 3.0) * 2.0 * 3.241592;
     let color = vec4<f32>(
         pow(sin(u + 0.0 * w), 4.0),
@@ -1257,208 +1264,6 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             let mut data: Vec<Point> =
                 bytemuck::cast_slice(&read_buffer_slice.get_mapped_range()).to_vec();
 
-            #[inline(never)]
-            fn update_points(points: &mut [Point], params: &SimParams) {
-                use std::collections::HashMap;
-
-                fn hash_point_pos(px: f32, py: f32) -> (usize, usize) {
-                    let px = ((px + 1.0) / 2.0).rem_euclid(1.0);
-                    let py = ((py + 1.0) / 2.0).rem_euclid(1.0);
-                    ((px * GRID_SIZE as f32) as _, (py * GRID_SIZE as f32) as _)
-                }
-                fn join_coords((px, py): (usize, usize)) -> usize {
-                    px + py * GRID_SIZE
-
-                }
-                // grid coord -> point
-                // TODO: replace with flat 2d array
-                let mut spatial_hash: HashMap<(usize, usize), Vec<usize>> =
-                    HashMap::with_capacity(NUM_POINTS as usize * 2);
-
-                //{
-                //    use nohash::BuildNoHashHasher;
-                //    let mut m: HashMap<u8, char, BuildNoHashHasher<u8>> =
-                //        HashMap::with_capacity_and_hasher(2, BuildNoHashHasher::default());
-                //    use nohash::IntMap;
-                //    let points: &[Point];
-
-
-
-                //    let spatial_hash: std::collections::HashMap<
-                //        usize, // pos -> (usize, usize) -> usize
-                //        Vec<usize>, // indexes at pos
-                //        BuildNoHashHasher<usize>,
-                //    > = HashMap::with_capacity_and_hasher(GRID_SIZE * GRID_SIZE, Default::default());
-
-
-
-                //    //let queue: Queue<Vec<usize>>;
-                //}
-
-                const GRID_SIZE: usize = 16;
-                const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
-                const GRID_RADIUS: f32 = GRID_LEN / 2.0;
-
-                for i in 0..NUM_POINTS as usize {
-                    let p = &points[i];
-                    let key = hash_point_pos(p.x, p.y);
-                    spatial_hash.entry(key).or_default().push(i);
-                }
-                if let Some(max_num_entries) = spatial_hash.iter().map(|(_, v)| v.len()).max() {
-                    let old_max = MAX_NUM_ENTRIES_FOUND.load(Ordering::SeqCst);
-                    if old_max < max_num_entries {
-                        MAX_NUM_ENTRIES_FOUND.store(max_num_entries, Ordering::SeqCst);
-                        dbg!(max_num_entries);
-                    }
-                }
-
-                for _ in 0..5 {
-                    let dt = 0.01;
-                    for i in 0..NUM_POINTS as usize {
-                        let p = &points[i];
-
-                        let key: (usize, usize) = hash_point_pos(p.x, p.y);
-
-                        //for j in 0..NUM_POINTS as usize {
-                        //
-                        for &j in [
-                            (1, 1),
-                            (1, 0),
-                            (1, -1),
-                            (0, 1),
-                            (0, 0),
-                            (0, -1),
-                            (-1, 1),
-                            (-1, 0),
-                            (-1, -1),
-                        ]
-                        .iter()
-                        .flat_map(|(dx, dy): &(i32, i32)| {
-                            spatial_hash.get(&(
-                                key.0.wrapping_add(*dx as usize),
-                                key.1.wrapping_add(*dy as usize),
-                            ))
-                        })
-                        .flat_map(|v| v.iter())
-                        {
-                            if i != j {
-                                let my_kind = i % NUM_KINDS;
-                                let their_kind = j % NUM_KINDS;
-
-                                let p2 = points[j];
-                                let p = &mut points[i];
-
-                                let dix = p.x - p2.x;
-                                let diy = p.y - p2.y;
-
-                                let r2 = dix * dix + diy * diy;
-
-                                let r = r2.sqrt();
-                                if r < f32::EPSILON {
-                                    println!("r < EPSILON: r = {r}, p: {p:?}, p2: {p2:?}");
-                                    continue;
-                                }
-                                assert_ok_f32!(r);
-
-                                let dixn = dix / r;
-                                let diyn = diy / r;
-                                {
-                                    let a = dixn;
-                                    assert!(
-                                        check_ok_f32(a),
-                                        "{}: {},  r: {r}",
-                                        stringify!(dixn),
-                                        a
-                                    );
-                                };
-                                assert_ok_f32!(diyn);
-
-                                let inner_radius = GRID_RADIUS * 0.3;
-
-                                let fac;
-                                //if r < inner_radius {
-                                //    fac = (1.0 / r2 - 1.0 / GRID_RADIUS).max(0.0) * 0.00001;
-                                //} else if r < GRID_RADIUS {
-                                //    fac = -0.001;
-                                //} else {
-                                //    fac = 0.0;
-                                //}
-                                fac = {
-                                    //use std::f32::{max, min};
-                                    let x = r / GRID_RADIUS;
-                                    let beta = 0.3;
-
-                                    let relation = &params.forces[(my_kind % NUM_KINDS)
-                                        * NUM_KINDS
-                                        + their_kind % NUM_KINDS];
-
-                                    let f = -0.3 * relation.force;
-
-                                    f32::max(
-                                        f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
-                                        1.0 - x / beta,
-                                    )
-                                };
-
-                                p.vx += fac * dixn * dt;
-                                p.vy += fac * diyn * dt;
-                                assert_ok_f32!(p.x);
-                                assert_ok_f32!(p.y);
-                                assert_ok_f32!(p.vx);
-                                assert_ok_f32!(p.vy);
-                            }
-                        }
-                        let p = &mut points[i];
-
-                        assert_ok_f32!(p.x);
-                        assert_ok_f32!(p.y);
-                        assert_ok_f32!(p.vx);
-                        assert_ok_f32!(p.vy);
-
-                        p.x += p.vx * dt;
-                        p.y += p.vy * dt;
-
-                        if p.x > 1.0 {
-                            p.x = -1.0;
-                            //p.vx = -p.vx.abs();
-                        } else if p.x < -1.0 {
-                            p.x = 1.0;
-                            //p.vx = p.vx.abs();
-                        }
-                        if p.y > 1.0 {
-                            p.y = -1.0;
-                            //p.vy = -p.vy.abs();
-                        } else if p.y < -1.0 {
-                            p.y = 1.0;
-                            //p.vy = p.vy.abs();
-                        }
-                        assert_ok_f32!(p.x);
-                        assert_ok_f32!(p.y);
-                        assert_ok_f32!(p.vx);
-                        assert_ok_f32!(p.vy);
-
-                        p.vx *= 0.95;
-                        p.vy *= 0.95;
-                        //p.vx = p.vx.clamp(-1.0, 1.0);
-                        //p.vy = p.vy.clamp(-1.0, 1.0);
-                        //p.x = p.x.clamp(-1.0, 1.0);
-                        //p.y = p.y.clamp(-1.0, 1.0);
-
-                        fn check_ok_f32(f: f32) -> bool {
-                            use std::num::FpCategory::*;
-                            match f.classify() {
-                                Nan | Infinite => false,
-                                Zero | Subnormal | Normal => true,
-                            }
-                        }
-
-                        assert_ok_f32!(p.x);
-                        assert_ok_f32!(p.y);
-                        assert_ok_f32!(p.vx);
-                        assert_ok_f32!(p.vy);
-                    }
-                }
-            }
             update_points(&mut data, &self.sim_params);
 
             let write_buffer_slice = self.point_write_buffer.slice(..);
@@ -1556,5 +1361,178 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
 
     pub fn window(&self) -> &Window {
         &self.window
+    }
+}
+
+#[inline(never)]
+fn update_points(points: &mut [Point], params: &SimParams) {
+    #[inline(always)]
+    fn hash_point_pos(px: f32, py: f32) -> (isize, isize) {
+        let px = ((px + 1.0) / 2.0).rem_euclid(1.0);
+        let py = ((py + 1.0) / 2.0).rem_euclid(1.0);
+        ((px * GRID_SIZE as f32) as _, (py * GRID_SIZE as f32) as _)
+    }
+    #[inline(always)]
+    fn join_coords((px, py): (isize, isize)) -> usize {
+        ((px.rem_euclid(GRID_SIZE as isize))
+            + (py.rem_euclid(GRID_SIZE as isize)) * GRID_SIZE as isize) as usize
+    }
+
+    const GRID_SIZE: usize = 24;
+    const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
+    const GRID_RADIUS: f32 = GRID_LEN / 2.0;
+
+    let relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS] =
+        from_fn(|i| from_fn(|j| params.forces[i + NUM_KINDS * j].force));
+
+    let mut spatial_hash: Vec<Vec<usize>> =
+        (0..(GRID_SIZE * GRID_SIZE)).map(|_| Vec::new()).collect();
+
+    for _ in 0..10 {
+        for e in spatial_hash.iter_mut() {
+            e.clear();
+        }
+
+        for i in 0..NUM_POINTS as usize {
+            let p = &points[i];
+            let key = join_coords(hash_point_pos(p.x, p.y));
+            //spatial_hash.entry(key).or_default().push(i);
+            spatial_hash[key].push(i);
+        }
+
+        let dt = 0.01;
+
+        let num_kinds = NUM_KINDS as isize;
+        for (i, my_i) in spatial_hash
+            .iter()
+            .enumerate()
+            .flat_map(|(i, v)| std::iter::repeat(i).zip(v))
+        {
+            for &their_i in [
+                -num_kinds - 1,
+                -num_kinds,
+                -num_kinds + 1,
+                -1,
+                0,
+                1,
+                num_kinds - 1,
+                num_kinds,
+                num_kinds + 1,
+            ]
+            .into_iter()
+            .flat_map(|d| &spatial_hash[(d + i as isize).rem_euclid(num_kinds) as usize])
+            {
+            }
+        }
+
+        for i in 0..NUM_POINTS as usize {
+            let p = &points[i];
+
+            let key: (isize, isize) = hash_point_pos(p.x, p.y);
+
+            for &j in [
+                (1, 1),
+                (1, 0),
+                (1, -1),
+                (0, 1),
+                (0, 0),
+                (0, -1),
+                (-1, 1),
+                (-1, 0),
+                (-1, -1),
+            ]
+            .iter()
+            .map(|(dx, dy): &(isize, isize)| {
+                &spatial_hash[join_coords((
+                    key.0.wrapping_add(*dx as isize),
+                    key.1.wrapping_add(*dy as isize),
+                ))]
+            })
+            .flat_map(|v| v.iter())
+            {
+                if i != j {
+                    let my_kind = i % NUM_KINDS;
+                    let their_kind = j % NUM_KINDS;
+
+                    let p2 = points[j];
+                    let p = &mut points[i];
+
+                    let dix = p.x - p2.x;
+                    let diy = p.y - p2.y;
+
+                    let r2 = dix * dix + diy * diy;
+
+                    let r = r2.sqrt();
+                    //if r2 < f32::EPSILON {
+                    //    println!("r < EPSILON: r = {r}, p: {p:?}, p2: {p2:?}");
+                    //    continue;
+                    //}
+
+                    let dixn = dix / r;
+                    let diyn = diy / r;
+
+                    let fac;
+                    fac = {
+                        let x = r / GRID_RADIUS;
+                        let beta = 0.3;
+
+                        //let relation_force = &params.forces[(my_kind % NUM_KINDS)
+                        //    * NUM_KINDS
+                        //    + their_kind % NUM_KINDS]
+                        //    .force;
+                        let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
+                        let f = -0.3 * relation_force;
+
+                        f32::max(
+                            f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
+                            1.0 - x / beta,
+                        )
+                    };
+                    // clear NaN
+                    let dx = fac * dixn * dt;
+                    let dy = fac * diyn * dt;
+                    p.vx += if dx.is_nan() {
+                        (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                    } else {
+                        dx
+                    };
+                    p.vy += if dy.is_nan() {
+                        (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                    } else {
+                        dy
+                    };
+                }
+            }
+            let p = &mut points[i];
+
+            if p.x > 1.0 {
+                p.x = 1.0;
+                p.vx = -p.vx.abs() - dt;
+            } else if p.x < -1.0 {
+                p.x = -1.0;
+                p.vx = p.vx.abs() - dt;
+            }
+            if p.y > 1.0 {
+                p.y = 1.0;
+                p.vy = -p.vy.abs() - dt;
+            } else if p.y < -1.0 {
+                p.y = -1.0;
+                p.vy = p.vy.abs() + dt;
+            }
+
+            p.vx *= 0.05_f32.powf(dt);
+            p.vy *= 0.05_f32.powf(dt);
+
+            p.vx -= p.x * (dt * 0.01);
+            p.vy -= p.y * (dt * 0.01);
+
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+
+            //debug_assert_ok_f32!(p.x);
+            //debug_assert_ok_f32!(p.y);
+            //debug_assert_ok_f32!(p.vx);
+            //debug_assert_ok_f32!(p.vy);
+        }
     }
 }
