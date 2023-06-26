@@ -252,29 +252,20 @@ pub async fn run() {
                 input:
                     KeyboardInput {
                         state: ElementState::Pressed,
-                        virtual_keycode: Some(VirtualKeyCode::Space),
+                        virtual_keycode: Some(keycode),
                         ..
                     },
                 ..
-            } => state.render_tris = dbgc!(!state.render_tris),
-            WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        state: ElementState::Pressed,
-                        virtual_keycode: Some(VirtualKeyCode::W),
-                        ..
-                    },
-                ..
-            } => state.use_render_bundles = dbgc!(!state.use_render_bundles),
-            WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        state: ElementState::Pressed,
-                        virtual_keycode: Some(VirtualKeyCode::C),
-                        ..
-                    },
-                ..
-            } => state.use_cpu = dbgc!(!state.use_cpu),
+            } => {
+                use VirtualKeyCode::*;
+                match keycode {
+                    Space => state.render_tris = dbgc!(!state.render_tris),
+                    W => state.use_render_bundles = dbgc!(!state.use_render_bundles),
+                    C => state.use_cpu = dbgc!(!state.use_cpu),
+                    S => state.start_sort = dbgc!(state.start_sort),
+                    _ => (),
+                }
+            }
             WindowEvent::Resized(physical_size) => state.resize(*physical_size),
             WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                 state.resize(**new_inner_size)
@@ -328,8 +319,8 @@ struct State {
 
     render_tris: bool,
     use_render_bundles: bool,
-
     use_cpu: bool,
+    start_sort: bool,
 
     update_bundles: [wgpu::RenderBundle; 2],
     hash_bundles: [wgpu::RenderBundle; 2],
@@ -1099,6 +1090,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             point_read_buffer,
             point_write_buffer,
             point_textures,
+            start_sort: false,
         }
     }
 
@@ -1383,7 +1375,7 @@ fn update_points(points: &mut [Point], params: &SimParams) {
     const GRID_RADIUS: f32 = GRID_LEN / 2.0;
 
     let relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS] =
-        from_fn(|i| from_fn(|j| params.forces[i + NUM_KINDS * j].force));
+        from_fn(|i| from_fn(|j| params.forces[i + NUM_KINDS * j].force * -0.1));
 
     let mut spatial_hash: Vec<Vec<usize>> =
         (0..(GRID_SIZE * GRID_SIZE)).map(|_| Vec::new()).collect();
@@ -1402,93 +1394,54 @@ fn update_points(points: &mut [Point], params: &SimParams) {
 
         let dt = 0.01;
 
-        let num_kinds = NUM_KINDS as isize;
-        for (i, my_i) in spatial_hash
-            .iter()
-            .enumerate()
-            .flat_map(|(i, v)| std::iter::repeat(i).zip(v))
-        {
-            for &their_i in [
-                -num_kinds - 1,
-                -num_kinds,
-                -num_kinds + 1,
-                -1,
-                0,
-                1,
-                num_kinds - 1,
-                num_kinds,
-                num_kinds + 1,
-            ]
-            .into_iter()
-            .flat_map(|d| &spatial_hash[(d + i as isize).rem_euclid(num_kinds) as usize])
+        let grid_size = GRID_SIZE as isize;
+        if true {
+            for (hash_index, &i) in spatial_hash
+                .iter()
+                .enumerate()
+                .flat_map(|(i, v)| std::iter::repeat(i).zip(v.iter()))
             {
-            }
-        }
-
-        for i in 0..NUM_POINTS as usize {
-            let p = &points[i];
-
-            let key: (isize, isize) = hash_point_pos(p.x, p.y);
-
-            for &j in [
-                (1, 1),
-                (1, 0),
-                (1, -1),
-                (0, 1),
-                (0, 0),
-                (0, -1),
-                (-1, 1),
-                (-1, 0),
-                (-1, -1),
-            ]
-            .iter()
-            .map(|(dx, dy): &(isize, isize)| {
-                &spatial_hash[join_coords((
-                    key.0.wrapping_add(*dx as isize),
-                    key.1.wrapping_add(*dy as isize),
-                ))]
-            })
-            .flat_map(|v| v.iter())
-            {
-                if i != j {
-                    let my_kind = i % NUM_KINDS;
-                    let their_kind = j % NUM_KINDS;
-
+                for &j in [
+                    -grid_size - 1,
+                    -grid_size,
+                    -grid_size + 1,
+                    -1,
+                    0,
+                    1,
+                    grid_size - 1,
+                    grid_size,
+                    grid_size + 1,
+                ]
+                .into_iter()
+                .flat_map(|d| {
+                    &spatial_hash
+                        [(d + hash_index as isize).rem_euclid(grid_size * grid_size) as usize]
+                }) {
+                    // !0: we know that i != j here and that positions are distinct
+                    // 0: i may equal j, r may equal zero
+                    // TODO: eliminate branch later
+                    if i == j {
+                        continue;
+                    }
                     let p2 = points[j];
                     let p = &mut points[i];
 
-                    let dix = p.x - p2.x;
-                    let diy = p.y - p2.y;
-
+                    let (dix, diy) = (p.x - p2.x, p.y - p2.y);
                     let r2 = dix * dix + diy * diy;
-
                     let r = r2.sqrt();
-                    //if r2 < f32::EPSILON {
-                    //    println!("r < EPSILON: r = {r}, p: {p:?}, p2: {p2:?}");
-                    //    continue;
-                    //}
-
-                    let dixn = dix / r;
-                    let diyn = diy / r;
-
-                    let fac;
-                    fac = {
+                    let (dixn, diyn) = (dix / r, diy / r);
+                    let fac = {
                         let x = r / GRID_RADIUS;
                         let beta = 0.3;
-
-                        //let relation_force = &params.forces[(my_kind % NUM_KINDS)
-                        //    * NUM_KINDS
-                        //    + their_kind % NUM_KINDS]
-                        //    .force;
                         let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
-                        let f = -0.3 * relation_force;
+                        let f = relation_force;
 
                         f32::max(
                             f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
                             1.0 - x / beta,
                         )
                     };
-                    // clear NaN
+
                     let dx = fac * dixn * dt;
                     let dy = fac * diyn * dt;
                     p.vx += if dx.is_nan() {
@@ -1502,37 +1455,140 @@ fn update_points(points: &mut [Point], params: &SimParams) {
                         dy
                     };
                 }
+
+                let p = &mut points[i];
+
+                if p.x > 1.0 {
+                    p.x = 1.0;
+                    p.vx = -p.vx.abs() - dt;
+                } else if p.x < -1.0 {
+                    p.x = -1.0;
+                    p.vx = p.vx.abs() - dt;
+                }
+                if p.y > 1.0 {
+                    p.y = 1.0;
+                    p.vy = -p.vy.abs() - dt;
+                } else if p.y < -1.0 {
+                    p.y = -1.0;
+                    p.vy = p.vy.abs() + dt;
+                }
+
+                p.vx *= 0.05_f32.powf(dt);
+                p.vy *= 0.05_f32.powf(dt);
+
+                p.vx -= p.x * (dt * 0.01);
+                p.vy -= p.y * (dt * 0.01);
+
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
             }
-            let p = &mut points[i];
+        } else {
+            for i in 0..NUM_POINTS as usize {
+                let p = &points[i];
 
-            if p.x > 1.0 {
-                p.x = 1.0;
-                p.vx = -p.vx.abs() - dt;
-            } else if p.x < -1.0 {
-                p.x = -1.0;
-                p.vx = p.vx.abs() - dt;
+                let key: (isize, isize) = hash_point_pos(p.x, p.y);
+
+                for &j in [
+                    (1, 1),
+                    (1, 0),
+                    (1, -1),
+                    (0, 1),
+                    (0, 0),
+                    (0, -1),
+                    (-1, 1),
+                    (-1, 0),
+                    (-1, -1),
+                ]
+                .iter()
+                .map(|(dx, dy): &(isize, isize)| {
+                    &spatial_hash[join_coords((
+                        key.0.wrapping_add(*dx as isize),
+                        key.1.wrapping_add(*dy as isize),
+                    ))]
+                })
+                .flat_map(|v| v.iter())
+                {
+                    if i != j {
+                        let p2 = points[j];
+                        let p = &mut points[i];
+
+                        let dix = p.x - p2.x;
+                        let diy = p.y - p2.y;
+
+                        let r2 = dix * dix + diy * diy;
+
+                        let r = r2.sqrt();
+                        //if r2 < f32::EPSILON {
+                        //    println!("r < EPSILON: r = {r}, p: {p:?}, p2: {p2:?}");
+                        //    continue;
+                        //}
+
+                        let dixn = dix / r;
+                        let diyn = diy / r;
+
+                        let fac;
+                        fac = {
+                            let x = r / GRID_RADIUS;
+                            let beta = 0.3;
+
+                            //let relation_force = &params.forces[(my_kind % NUM_KINDS)
+                            //    * NUM_KINDS
+                            //    + their_kind % NUM_KINDS]
+                            //    .force;
+                            let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
+                            let f = relation_force;
+
+                            f32::max(
+                                f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
+                                1.0 - x / beta,
+                            )
+                        };
+                        // clear NaN
+                        let dx = fac * dixn * dt;
+                        let dy = fac * diyn * dt;
+                        p.vx += if dx.is_nan() {
+                            (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                        } else {
+                            dx
+                        };
+                        p.vy += if dy.is_nan() {
+                            (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                        } else {
+                            dy
+                        };
+                    }
+                }
+                let p = &mut points[i];
+
+                if p.x > 1.0 {
+                    p.x = 1.0;
+                    p.vx = -p.vx.abs() - dt;
+                } else if p.x < -1.0 {
+                    p.x = -1.0;
+                    p.vx = p.vx.abs() - dt;
+                }
+                if p.y > 1.0 {
+                    p.y = 1.0;
+                    p.vy = -p.vy.abs() - dt;
+                } else if p.y < -1.0 {
+                    p.y = -1.0;
+                    p.vy = p.vy.abs() + dt;
+                }
+
+                p.vx *= 0.05_f32.powf(dt);
+                p.vy *= 0.05_f32.powf(dt);
+
+                p.vx -= p.x * (dt * 0.01);
+                p.vy -= p.y * (dt * 0.01);
+
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+
+                //debug_assert_ok_f32!(p.x);
+                //debug_assert_ok_f32!(p.y);
+                //debug_assert_ok_f32!(p.vx);
+                //debug_assert_ok_f32!(p.vy);
             }
-            if p.y > 1.0 {
-                p.y = 1.0;
-                p.vy = -p.vy.abs() - dt;
-            } else if p.y < -1.0 {
-                p.y = -1.0;
-                p.vy = p.vy.abs() + dt;
-            }
-
-            p.vx *= 0.05_f32.powf(dt);
-            p.vy *= 0.05_f32.powf(dt);
-
-            p.vx -= p.x * (dt * 0.01);
-            p.vy -= p.y * (dt * 0.01);
-
-            p.x += p.vx * dt;
-            p.y += p.vy * dt;
-
-            //debug_assert_ok_f32!(p.x);
-            //debug_assert_ok_f32!(p.y);
-            //debug_assert_ok_f32!(p.vx);
-            //debug_assert_ok_f32!(p.vy);
         }
     }
 }
