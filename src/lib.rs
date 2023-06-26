@@ -7,7 +7,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-use std::mem::size_of;
+use std::mem::{replace, size_of};
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -262,7 +262,7 @@ pub async fn run() {
                     Space => state.render_tris = dbgc!(!state.render_tris),
                     W => state.use_render_bundles = dbgc!(!state.use_render_bundles),
                     C => state.use_cpu = dbgc!(!state.use_cpu),
-                    S => state.start_sort = dbgc!(state.start_sort),
+                    S => state.start_sort = dbgc!(!state.start_sort),
                     _ => (),
                 }
             }
@@ -1100,7 +1100,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
         #[cfg(not(target_arch = "wasm32"))]
         if self.frame == max_frame {
             self.frame = 0;
-            let dt = std::mem::replace(&mut self.last_print, Instant::now()).elapsed();
+            let dt = replace(&mut self.last_print, Instant::now()).elapsed();
             let fps = max_frame as f64 / dt.as_secs_f64();
             printlnc!("fps: {fps:?}, dt: {:50?}", dt);
         }
@@ -1256,7 +1256,11 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             let mut data: Vec<Point> =
                 bytemuck::cast_slice(&read_buffer_slice.get_mapped_range()).to_vec();
 
-            update_points(&mut data, &self.sim_params);
+            update_points(
+                &mut data,
+                &self.sim_params,
+                replace(&mut self.start_sort, false),
+            );
 
             let write_buffer_slice = self.point_write_buffer.slice(..);
             write_buffer_slice.map_async(wgpu::MapMode::Write, |_| ());
@@ -1357,7 +1361,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
 }
 
 #[inline(never)]
-fn update_points(points: &mut [Point], params: &SimParams) {
+fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
     #[inline(always)]
     fn hash_point_pos(px: f32, py: f32) -> (isize, isize) {
         let px = ((px + 1.0) / 2.0).rem_euclid(1.0);
@@ -1380,6 +1384,33 @@ fn update_points(points: &mut [Point], params: &SimParams) {
     let mut spatial_hash: Vec<Vec<usize>> =
         (0..(GRID_SIZE * GRID_SIZE)).map(|_| Vec::new()).collect();
 
+    if sort_points {
+        let mut vecs: Vec<_> = (0..NUM_KINDS).map(|_| Vec::new()).collect();
+        for chunk in points.chunks(NUM_KINDS) {
+            for (i, &point) in chunk.into_iter().enumerate() {
+                vecs[i].push(point);
+            }
+        }
+        for v in &mut vecs {
+            v.sort_by_cached_key(|p| join_coords(hash_point_pos(p.x, p.y)));
+        }
+        let mut iters: Vec<_> = vecs.iter().map(|v| v.iter()).collect();
+        let mut reconstructed = Vec::new();
+        loop {
+            let mut found_some = false;
+            for iter in &mut iters {
+                if let Some(&point) = iter.next() {
+                    found_some = true;
+                    reconstructed.push(point);
+                }
+            }
+            if !found_some {
+                break;
+            }
+        }
+        points.copy_from_slice(&reconstructed);
+    }
+
     for _ in 0..10 {
         for e in spatial_hash.iter_mut() {
             e.clear();
@@ -1395,44 +1426,143 @@ fn update_points(points: &mut [Point], params: &SimParams) {
         let dt = 0.01;
 
         let grid_size = GRID_SIZE as isize;
-        if true {
-            for (hash_index, &i) in spatial_hash
-                .iter()
-                .enumerate()
-                .flat_map(|(i, v)| std::iter::repeat(i).zip(v.iter()))
+        for (hash_index, &i) in spatial_hash
+            .iter()
+            .enumerate()
+            .flat_map(|(i, v)| std::iter::repeat(i).zip(v.iter()))
+        {
+            for &j in [
+                -grid_size - 1,
+                -grid_size,
+                -grid_size + 1,
+                -1,
+                0,
+                1,
+                grid_size - 1,
+                grid_size,
+                grid_size + 1,
+            ]
+            .into_iter()
+            .flat_map(|d| {
+                &spatial_hash[(d + hash_index as isize).rem_euclid(grid_size * grid_size) as usize]
+            }) {
+                // !0: we know that i != j here and that positions are distinct
+                // 0: i may equal j, r may equal zero
+                // TODO: eliminate branch later
+                if i == j {
+                    continue;
+                }
+                let p2 = points[j];
+                let p = &mut points[i];
+
+                let (dix, diy) = (p.x - p2.x, p.y - p2.y);
+                let r2 = dix * dix + diy * diy;
+                let r = r2.sqrt();
+                let (dixn, diyn) = (dix / r, diy / r);
+                let fac = {
+                    let x = r / GRID_RADIUS;
+                    let beta = 0.3;
+                    let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
+                    let f = relation_force;
+
+                    f32::max(
+                        f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
+                        1.0 - x / beta,
+                    )
+                };
+
+                let dx = fac * dixn * dt;
+                let dy = fac * diyn * dt;
+                p.vx += if dx.is_nan() {
+                    (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                } else {
+                    dx
+                };
+                p.vy += if dy.is_nan() {
+                    (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                } else {
+                    dy
+                };
+            }
+
+            let p = &mut points[i];
+
+            if p.x > 1.0 {
+                p.x = 1.0;
+                p.vx = -p.vx.abs() - dt;
+            } else if p.x < -1.0 {
+                p.x = -1.0;
+                p.vx = p.vx.abs() - dt;
+            }
+            if p.y > 1.0 {
+                p.y = 1.0;
+                p.vy = -p.vy.abs() - dt;
+            } else if p.y < -1.0 {
+                p.y = -1.0;
+                p.vy = p.vy.abs() + dt;
+            }
+
+            p.vx *= 0.05_f32.powf(dt);
+            p.vy *= 0.05_f32.powf(dt);
+
+            p.vx -= p.x * (dt * 0.01);
+            p.vy -= p.y * (dt * 0.01);
+
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+        }
+        /*for i in 0..NUM_POINTS as usize {
+            let p = &points[i];
+
+            let key: (isize, isize) = hash_point_pos(p.x, p.y);
+
+            for &j in [
+                (1, 1),
+                (1, 0),
+                (1, -1),
+                (0, 1),
+                (0, 0),
+                (0, -1),
+                (-1, 1),
+                (-1, 0),
+                (-1, -1),
+            ]
+            .iter()
+            .map(|(dx, dy): &(isize, isize)| {
+                &spatial_hash[join_coords((
+                    key.0.wrapping_add(*dx as isize),
+                    key.1.wrapping_add(*dy as isize),
+                ))]
+            })
+            .flat_map(|v| v.iter())
             {
-                for &j in [
-                    -grid_size - 1,
-                    -grid_size,
-                    -grid_size + 1,
-                    -1,
-                    0,
-                    1,
-                    grid_size - 1,
-                    grid_size,
-                    grid_size + 1,
-                ]
-                .into_iter()
-                .flat_map(|d| {
-                    &spatial_hash
-                        [(d + hash_index as isize).rem_euclid(grid_size * grid_size) as usize]
-                }) {
-                    // !0: we know that i != j here and that positions are distinct
-                    // 0: i may equal j, r may equal zero
-                    // TODO: eliminate branch later
-                    if i == j {
-                        continue;
-                    }
+                if i != j {
                     let p2 = points[j];
                     let p = &mut points[i];
 
-                    let (dix, diy) = (p.x - p2.x, p.y - p2.y);
+                    let dix = p.x - p2.x;
+                    let diy = p.y - p2.y;
+
                     let r2 = dix * dix + diy * diy;
+
                     let r = r2.sqrt();
-                    let (dixn, diyn) = (dix / r, diy / r);
-                    let fac = {
+                    //if r2 < f32::EPSILON {
+                    //    println!("r < EPSILON: r = {r}, p: {p:?}, p2: {p2:?}");
+                    //    continue;
+                    //}
+
+                    let dixn = dix / r;
+                    let diyn = diy / r;
+
+                    let fac;
+                    fac = {
                         let x = r / GRID_RADIUS;
                         let beta = 0.3;
+
+                        //let relation_force = &params.forces[(my_kind % NUM_KINDS)
+                        //    * NUM_KINDS
+                        //    + their_kind % NUM_KINDS]
+                        //    .force;
                         let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
                         let f = relation_force;
 
@@ -1441,7 +1571,7 @@ fn update_points(points: &mut [Point], params: &SimParams) {
                             1.0 - x / beta,
                         )
                     };
-
+                    // clear NaN
                     let dx = fac * dixn * dt;
                     let dy = fac * diyn * dt;
                     p.vx += if dx.is_nan() {
@@ -1455,140 +1585,37 @@ fn update_points(points: &mut [Point], params: &SimParams) {
                         dy
                     };
                 }
-
-                let p = &mut points[i];
-
-                if p.x > 1.0 {
-                    p.x = 1.0;
-                    p.vx = -p.vx.abs() - dt;
-                } else if p.x < -1.0 {
-                    p.x = -1.0;
-                    p.vx = p.vx.abs() - dt;
-                }
-                if p.y > 1.0 {
-                    p.y = 1.0;
-                    p.vy = -p.vy.abs() - dt;
-                } else if p.y < -1.0 {
-                    p.y = -1.0;
-                    p.vy = p.vy.abs() + dt;
-                }
-
-                p.vx *= 0.05_f32.powf(dt);
-                p.vy *= 0.05_f32.powf(dt);
-
-                p.vx -= p.x * (dt * 0.01);
-                p.vy -= p.y * (dt * 0.01);
-
-                p.x += p.vx * dt;
-                p.y += p.vy * dt;
             }
-        } else {
-            for i in 0..NUM_POINTS as usize {
-                let p = &points[i];
+            let p = &mut points[i];
 
-                let key: (isize, isize) = hash_point_pos(p.x, p.y);
-
-                for &j in [
-                    (1, 1),
-                    (1, 0),
-                    (1, -1),
-                    (0, 1),
-                    (0, 0),
-                    (0, -1),
-                    (-1, 1),
-                    (-1, 0),
-                    (-1, -1),
-                ]
-                .iter()
-                .map(|(dx, dy): &(isize, isize)| {
-                    &spatial_hash[join_coords((
-                        key.0.wrapping_add(*dx as isize),
-                        key.1.wrapping_add(*dy as isize),
-                    ))]
-                })
-                .flat_map(|v| v.iter())
-                {
-                    if i != j {
-                        let p2 = points[j];
-                        let p = &mut points[i];
-
-                        let dix = p.x - p2.x;
-                        let diy = p.y - p2.y;
-
-                        let r2 = dix * dix + diy * diy;
-
-                        let r = r2.sqrt();
-                        //if r2 < f32::EPSILON {
-                        //    println!("r < EPSILON: r = {r}, p: {p:?}, p2: {p2:?}");
-                        //    continue;
-                        //}
-
-                        let dixn = dix / r;
-                        let diyn = diy / r;
-
-                        let fac;
-                        fac = {
-                            let x = r / GRID_RADIUS;
-                            let beta = 0.3;
-
-                            //let relation_force = &params.forces[(my_kind % NUM_KINDS)
-                            //    * NUM_KINDS
-                            //    + their_kind % NUM_KINDS]
-                            //    .force;
-                            let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
-                            let f = relation_force;
-
-                            f32::max(
-                                f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
-                                1.0 - x / beta,
-                            )
-                        };
-                        // clear NaN
-                        let dx = fac * dixn * dt;
-                        let dy = fac * diyn * dt;
-                        p.vx += if dx.is_nan() {
-                            (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                        } else {
-                            dx
-                        };
-                        p.vy += if dy.is_nan() {
-                            (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                        } else {
-                            dy
-                        };
-                    }
-                }
-                let p = &mut points[i];
-
-                if p.x > 1.0 {
-                    p.x = 1.0;
-                    p.vx = -p.vx.abs() - dt;
-                } else if p.x < -1.0 {
-                    p.x = -1.0;
-                    p.vx = p.vx.abs() - dt;
-                }
-                if p.y > 1.0 {
-                    p.y = 1.0;
-                    p.vy = -p.vy.abs() - dt;
-                } else if p.y < -1.0 {
-                    p.y = -1.0;
-                    p.vy = p.vy.abs() + dt;
-                }
-
-                p.vx *= 0.05_f32.powf(dt);
-                p.vy *= 0.05_f32.powf(dt);
-
-                p.vx -= p.x * (dt * 0.01);
-                p.vy -= p.y * (dt * 0.01);
-
-                p.x += p.vx * dt;
-                p.y += p.vy * dt;
-
-                //debug_assert_ok_f32!(p.x);
-                //debug_assert_ok_f32!(p.y);
-                //debug_assert_ok_f32!(p.vx);
-                //debug_assert_ok_f32!(p.vy);
+            if p.x > 1.0 {
+                p.x = 1.0;
+                p.vx = -p.vx.abs() - dt;
+            } else if p.x < -1.0 {
+                p.x = -1.0;
+                p.vx = p.vx.abs() - dt;
             }
-        }
+            if p.y > 1.0 {
+                p.y = 1.0;
+                p.vy = -p.vy.abs() - dt;
+            } else if p.y < -1.0 {
+                p.y = -1.0;
+                p.vy = p.vy.abs() + dt;
+            }
+
+            p.vx *= 0.05_f32.powf(dt);
+            p.vy *= 0.05_f32.powf(dt);
+
+            p.vx -= p.x * (dt * 0.01);
+            p.vy -= p.y * (dt * 0.01);
+
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+
+            //debug_assert_ok_f32!(p.x);
+            //debug_assert_ok_f32!(p.y);
+            //debug_assert_ok_f32!(p.vx);
+            //debug_assert_ok_f32!(p.vy);
+        }*/
     }
 }
