@@ -8,17 +8,18 @@ crate-type = ["cdylib", "rlib"]
 
 
 [dependencies]
-bytemuck = { version = "1.13.1", features = ["derive"], default_features = false }
-pollster = { version = "0.3.0", default_features = false }
+bytemuck = { version = "1.13.1", features = ["derive"], default-features = false }
+pollster = { version = "0.3.0", default-features = false }
 
-wgpu = { version = "0.16.1", features = ["wgsl"], default_features = false }
-winit = { version = "0.28.6", features = ["x11"], default_features = false }
+wgpu = { version = "0.16.1", features = ["wgsl"], default-features = false }
+winit = { version = "0.28.6", features = ["x11"], default-features = false }
 
 env_logger = { version = "0.10.0" }
 
 cfg-if = "1.0.0"
 log = "0.4.19"
 naga = "0.12.2"
+nohash = "0.2.0"
 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
