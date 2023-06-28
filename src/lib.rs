@@ -1360,6 +1360,10 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
     }
 }
 
+const GRID_SIZE: usize = 24;
+const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
+const GRID_RADIUS: f32 = GRID_LEN / 2.0;
+
 #[inline(never)]
 fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
     #[inline(always)]
@@ -1374,14 +1378,10 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
             + (py.rem_euclid(GRID_SIZE as isize)) * GRID_SIZE as isize) as usize
     }
 
-    const GRID_SIZE: usize = 24;
-    const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
-    const GRID_RADIUS: f32 = GRID_LEN / 2.0;
-
     let relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS] =
         from_fn(|i| from_fn(|j| params.forces[i + NUM_KINDS * j].force * -0.1));
 
-    let mut spatial_hash: Vec<Vec<usize>> =
+    let mut spatial_hash: Vec<Vec<u32>> =
         (0..(GRID_SIZE * GRID_SIZE)).map(|_| Vec::new()).collect();
 
     if sort_points {
@@ -1411,6 +1411,8 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
         points.copy_from_slice(&reconstructed);
     }
 
+    let mut outer_group: Vec<u32> = Vec::with_capacity(NUM_POINTS as _);
+
     for _ in 0..10 {
         for e in spatial_hash.iter_mut() {
             e.clear();
@@ -1420,18 +1422,18 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
             let p = &points[i];
             let key = join_coords(hash_point_pos(p.x, p.y));
             //spatial_hash.entry(key).or_default().push(i);
-            spatial_hash[key].push(i);
+            spatial_hash[key].push(i as u32);
         }
 
         let dt = 0.01;
 
         let grid_size = GRID_SIZE as isize;
-        for (hash_index, &i) in spatial_hash
-            .iter()
-            .enumerate()
-            .flat_map(|(i, v)| std::iter::repeat(i).zip(v.iter()))
+        for (hash_index, inner_group) in spatial_hash.iter().enumerate()
+        //.flat_map(|(i, v)| std::iter::repeat(i).zip(v.iter()))
         {
-            for &j in [
+            outer_group.clear();
+
+            for jj in [
                 -grid_size - 1,
                 -grid_size,
                 -grid_size + 1,
@@ -1443,17 +1445,234 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
                 grid_size + 1,
             ]
             .into_iter()
-            .flat_map(|d| {
+            .map(|d| {
                 &spatial_hash[(d + hash_index as isize).rem_euclid(grid_size * grid_size) as usize]
             }) {
-                // !0: we know that i != j here and that positions are distinct
-                // 0: i may equal j, r may equal zero
-                // TODO: eliminate branch later
-                if i == j {
-                    continue;
+                outer_group.extend_from_slice(jj);
+            }
+
+            fun_name(inner_group, &outer_group, points, relation_lookup, dt);
+        }
+    }
+}
+
+fn fun_name(
+    inner_group: &Vec<u32>,
+    outer_group: &Vec<u32>,
+    points: &mut [Point],
+    relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS],
+    dt: f32,
+) {
+    fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
+        assert!(N != 0, "chunk size must be non-zero");
+        let len = this.len() / N;
+        let (remainder, multiple_of_n) = this.split_at(this.len() - len * N);
+        // SAFETY: We already panicked for zero, and ensured by construction
+        // that the length of the subslice is a multiple of N.
+        let array_slice = unsafe { as_chunks_unchecked(multiple_of_n) };
+        (remainder, array_slice)
+    }
+
+    unsafe fn as_chunks_unchecked<T, const N: usize>(s: &[T]) -> &[[T; N]] {
+        let new_len = s.len() / N;
+        unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), new_len) }
+    }
+
+    let (outer_remaining, outer_chunks) = as_rchunks::<_, 8>(outer_group);
+    for &i in inner_group {
+        unsafe {
+            use core::arch::x86_64::*;
+            #[inline(always)]
+            unsafe fn mul(a: __m256, b: __m256) -> __m256 {
+                _mm256_mul_ps(a, b)
+            }
+            #[inline(always)]
+            unsafe fn addi(a: __m256i, b: __m256i) -> __m256i {
+                _mm256_add_epi32(a, b)
+            }
+            #[inline(always)]
+            unsafe fn add(a: __m256, b: __m256) -> __m256 {
+                _mm256_add_ps(a, b)
+            }
+            #[inline(always)]
+            unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
+                _mm256_and_si256(a, b)
+            }
+            #[inline(always)]
+            unsafe fn and(a: __m256, b: __m256) -> __m256 {
+                _mm256_and_ps(a, b)
+            }
+            #[inline(always)]
+            unsafe fn sub(a: __m256, b: __m256) -> __m256 {
+                _mm256_sub_ps(a, b)
+            }
+            #[inline(always)]
+            unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
+                _mm256_fmadd_ps(a, b, c)
+            }
+            #[inline(always)]
+            unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
+                _mm256_fmsub_ps(a, b, c)
+            }
+            #[inline(always)]
+            unsafe fn dot(a: __m256, b: __m256) -> __m256 {
+                fmadd(a, a, mul(b, b))
+            }
+            #[inline(always)]
+            unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
+                _mm256_i32gather_ps::<SCALE>(p, indexes)
+            }
+            #[inline(always)]
+            unsafe fn rsqrt(a: __m256) -> __m256 {
+                _mm256_rsqrt_ps(a)
+            }
+            #[inline(always)]
+            unsafe fn splat(a: f32) -> __m256 {
+                _mm256_set1_ps(a)
+            }
+            #[inline(always)]
+            unsafe fn splati(a: i32) -> __m256i {
+                _mm256_set1_epi32(a)
+            }
+            #[inline(always)]
+            unsafe fn mod8(a: __m256i) -> __m256i {
+                assert_eq!(NUM_KINDS, 8);
+                let avoid_zero = addi(splati(GRID_SIZE as i32 * 2), a);
+                andi(avoid_zero, splati(0b111))
+            }
+            #[inline(always)]
+            unsafe fn max(a: __m256, b: __m256) -> __m256 {
+                _mm256_max_ps(a, b)
+            }
+            #[inline(always)]
+            unsafe fn min(a: __m256, b: __m256) -> __m256 {
+                _mm256_min_ps(a, b)
+            }
+
+            let x1 = splat(points[i as usize].x);
+            let y1 = splat(points[i as usize].y);
+            //let vx1 = splat(points[i as usize].vx);
+            //let vy1 = splat(points[i as usize].vy);
+
+            let kind_i = i.rem_euclid(NUM_KINDS as _);
+
+            let mut simd_sum_dx = splat(0.0);
+            let mut simd_sum_dy = splat(0.0);
+
+            for outer_chunk in outer_chunks {
+                let outer_chunk: __m256i = _mm256_loadu_si256(outer_chunk.as_ptr() as _);
+                let points_pointer: *const f32 = points.as_ptr() as _;
+
+                let x2: __m256 = gather::<4>(points_pointer.offset(0), outer_chunk);
+                let y2: __m256 = gather::<4>(points_pointer.offset(1), outer_chunk);
+                //let vx2: __m256 = gather::<4>(points_pointer.offset(2), outer_chunk);
+                //let vy2: __m256 = gather::<4>(points_pointer.offset(3), outer_chunk);
+
+                let dx: __m256 = sub(x1, x2);
+                let dy: __m256 = sub(y1, y2);
+
+                let r2: __m256 = dot(dx, dy);
+                let r_inv: __m256 = rsqrt(r2);
+                let r: __m256 = mul(r2, r_inv);
+
+                let kind_j: __m256i = mod8(outer_chunk);
+
+                let forces: __m256 = gather::<{ NUM_KINDS as i32 }>(
+                    (relation_lookup.as_ptr() as *const f32).offset(kind_i as _),
+                    _mm256_srli_epi32(kind_j, 3),
+                );
+
+                // TODO: more fusing
+
+                let beta = 0.3;
+
+                let rx = mul(r, splat(1.0 / GRID_RADIUS as f32));
+
+                let fac = max(
+                    mul(
+                        max(min(sub(rx, splat(beta)), sub(splat(1.0), rx)), splat(0.0)),
+                        forces,
+                    ),
+                    sub(splat(1.0), mul(rx, splat(1.0 / beta))),
+                );
+
+                let t = mul(mul(splat(dt), r_inv), fac); // t >= 0.0
+
+                // NaN mask
+                // 12: not equal ordered, non signaling
+
+                // _CMP_EQ_OQ    0x00 /* Equal (ordered, non-signaling)  */
+                // _CMP_LT_OS    0x01 /* Less-than (ordered, signaling)  */
+                // _CMP_LE_OS    0x02 /* Less-than-or-equal (ordered, signaling)  */
+                // _CMP_UNORD_Q  0x03 /* Unordered (non-signaling)  */
+                // _CMP_NEQ_UQ   0x04 /* Not-equal (unordered, non-signaling)  */
+                // _CMP_NLT_US   0x05 /* Not-less-than (unordered, signaling)  */
+                // _CMP_NLE_US   0x06 /* Not-less-than-or-equal (unordered, signaling)  */
+                // _CMP_ORD_Q    0x07 /* Ordered (nonsignaling)   */
+                // _CMP_EQ_UQ    0x08 /* Equal (unordered, non-signaling)  */
+                // _CMP_NGE_US   0x09 /* Not-greater-than-or-equal (unord, signaling)  */
+                // _CMP_NGT_US   0x0a /* Not-greater-than (unordered, signaling)  */
+                // _CMP_FALSE_OQ 0x0b /* False (ordered, non-signaling)  */
+                // _CMP_NEQ_OQ   0x0c /* Not-equal (ordered, non-signaling)  */
+                // _CMP_GE_OS    0x0d /* Greater-than-or-equal (ordered, signaling)  */
+                // _CMP_GT_OS    0x0e /* Greater-than (ordered, signaling)  */
+                // _CMP_TRUE_UQ  0x0f /* True (unordered, non-signaling)  */
+                // _CMP_EQ_OS    0x10 /* Equal (ordered, signaling)  */
+                // _CMP_LT_OQ    0x11 /* Less-than (ordered, non-signaling)  */
+                // _CMP_LE_OQ    0x12 /* Less-than-or-equal (ordered, non-signaling)  */
+                // _CMP_UNORD_S  0x13 /* Unordered (signaling)  */
+                // _CMP_NEQ_US   0x14 /* Not-equal (unordered, signaling)  */
+                // _CMP_NLT_UQ   0x15 /* Not-less-than (unordered, non-signaling)  */
+                // _CMP_NLE_UQ   0x16 /* Not-less-than-or-equal (unord, non-signaling)  */
+                // _CMP_ORD_S    0x17 /* Ordered (signaling)  */
+                // _CMP_EQ_US    0x18 /* Equal (unordered, signaling)  */
+                // _CMP_NGE_UQ   0x19 /* Not-greater-than-or-equal (unord, non-sign)  */
+                // _CMP_NGT_UQ   0x1a /* Not-greater-than (unordered, non-signaling)  */
+                // _CMP_FALSE_OS 0x1b /* False (ordered, signaling)  */
+                // _CMP_NEQ_OS   0x1c /* Not-equal (ordered, signaling)  */
+                // _CMP_GE_OQ    0x1d /* Greater-than-or-equal (ordered, non-signaling)  */
+                // _CMP_GT_OQ    0x1e /* Greater-than (ordered, non-signaling)  */
+                // _CMP_TRUE_US  0x1f /* True (unordered, signaling)  */
+                //
+
+                // unordered eq zero?
+                //let ok_mask = _mm256_cmp_ps::<12>(r_inv, splat(0.0));
+                let ok_mask = _mm256_cmp_ps::<0x8>(r_inv, splat(0.0));
+                let t_masked = and(ok_mask, t);
+
+                //dbg!(t, ok_mask, t_masked);
+                //dbg!();
+
+                {
+                    let mut t_buffer: [f32; 8] = [0.0; 8];
+                    //_mm256_storeu_ps(t_buffer.as_mut_ptr() as _, t_masked);
+                    _mm256_storeu_ps(t_buffer.as_mut_ptr() as _, t_masked);
+
+                    let mut sum_t: f32 = t_buffer.into_iter().sum();
+                    assert!(!sum_t.is_nan(), "{sum_t}, {t:?}, {ok_mask:?}");
                 }
-                let p2 = points[j];
-                let p = &mut points[i];
+                simd_sum_dx = fmadd(t_masked, dx, simd_sum_dx);
+                simd_sum_dy = fmadd(t_masked, dy, simd_sum_dy);
+            }
+            {
+                let mut dx_buffer: [f32; 8] = [0.0; 8];
+                let mut dy_buffer: [f32; 8] = [0.0; 8];
+                _mm256_storeu_ps(dx_buffer.as_mut_ptr() as _, simd_sum_dx);
+                _mm256_storeu_ps(dy_buffer.as_mut_ptr() as _, simd_sum_dy);
+                let mut sum_dx: f32 = dx_buffer.into_iter().sum();
+                let mut sum_dy: f32 = dy_buffer.into_iter().sum();
+                if sum_dx != 0.0 || sum_dy != 0.0 {
+                    assert!(!sum_dx.is_nan(), "{sum_dx}");
+                    assert!(!sum_dy.is_nan(), "{sum_dy}");
+                    dbg!(sum_dx, sum_dy);
+                }
+            }
+
+            let mut p_vx = points[i as usize].vx;
+            let mut p_vy = points[i as usize].vy;
+            for &j in outer_remaining {
+                let p2 = points[j as usize];
+                let p = &mut points[i as usize];
 
                 let (dix, diy) = (p.x - p2.x, p.y - p2.y);
                 let r2 = dix * dix + diy * diy;
@@ -1462,7 +1681,8 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
                 let fac = {
                     let x = r / GRID_RADIUS;
                     let beta = 0.3;
-                    let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
+                    let relation_force =
+                        relation_lookup[i as usize % NUM_KINDS][j as usize % NUM_KINDS];
                     let f = relation_force;
 
                     f32::max(
@@ -1474,148 +1694,83 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
                 let dx = fac * dixn * dt;
                 let dy = fac * diyn * dt;
                 p.vx += if dx.is_nan() {
-                    (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                    //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                    0.0
                 } else {
                     dx
                 };
                 p.vy += if dy.is_nan() {
-                    (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                    //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                    0.0
                 } else {
                     dy
                 };
             }
-
-            let p = &mut points[i];
-
-            if p.x > 1.0 {
-                p.x = 1.0;
-                p.vx = -p.vx.abs() - dt;
-            } else if p.x < -1.0 {
-                p.x = -1.0;
-                p.vx = p.vx.abs() - dt;
-            }
-            if p.y > 1.0 {
-                p.y = 1.0;
-                p.vy = -p.vy.abs() - dt;
-            } else if p.y < -1.0 {
-                p.y = -1.0;
-                p.vy = p.vy.abs() + dt;
-            }
-
-            p.vx *= 0.05_f32.powf(dt);
-            p.vy *= 0.05_f32.powf(dt);
-
-            p.vx -= p.x * (dt * 0.01);
-            p.vy -= p.y * (dt * 0.01);
-
-            p.x += p.vx * dt;
-            p.y += p.vy * dt;
         }
-        /*for i in 0..NUM_POINTS as usize {
-            let p = &points[i];
+        for &j in outer_group {
+            // !0: we know that i != j here and that positions are distinct
+            // 0: i may equal j, r may equal zero
 
-            let key: (isize, isize) = hash_point_pos(p.x, p.y);
+            let p2 = points[j as usize];
+            let p = &mut points[i as usize];
 
-            for &j in [
-                (1, 1),
-                (1, 0),
-                (1, -1),
-                (0, 1),
-                (0, 0),
-                (0, -1),
-                (-1, 1),
-                (-1, 0),
-                (-1, -1),
-            ]
-            .iter()
-            .map(|(dx, dy): &(isize, isize)| {
-                &spatial_hash[join_coords((
-                    key.0.wrapping_add(*dx as isize),
-                    key.1.wrapping_add(*dy as isize),
-                ))]
-            })
-            .flat_map(|v| v.iter())
-            {
-                if i != j {
-                    let p2 = points[j];
-                    let p = &mut points[i];
+            let (dix, diy) = (p.x - p2.x, p.y - p2.y);
+            let r2 = dix * dix + diy * diy;
+            let r = r2.sqrt();
+            let (dixn, diyn) = (dix / r, diy / r);
+            let fac = {
+                let x = r / GRID_RADIUS;
+                let beta = 0.3;
+                let relation_force =
+                    relation_lookup[i as usize % NUM_KINDS][j as usize % NUM_KINDS];
+                let f = relation_force;
 
-                    let dix = p.x - p2.x;
-                    let diy = p.y - p2.y;
+                f32::max(
+                    f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
+                    1.0 - x / beta,
+                )
+            };
 
-                    let r2 = dix * dix + diy * diy;
+            let dx = fac * dixn * dt;
+            let dy = fac * diyn * dt;
+            p.vx += if dx.is_nan() {
+                //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                0.0
+            } else {
+                dx
+            };
+            p.vy += if dy.is_nan() {
+                //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                0.0
+            } else {
+                dy
+            };
+        }
 
-                    let r = r2.sqrt();
-                    //if r2 < f32::EPSILON {
-                    //    println!("r < EPSILON: r = {r}, p: {p:?}, p2: {p2:?}");
-                    //    continue;
-                    //}
+        let p = &mut points[i as usize];
 
-                    let dixn = dix / r;
-                    let diyn = diy / r;
+        if p.x > 1.0 {
+            p.x = 1.0;
+            p.vx = -p.vx.abs() - dt;
+        } else if p.x < -1.0 {
+            p.x = -1.0;
+            p.vx = p.vx.abs() - dt;
+        }
+        if p.y > 1.0 {
+            p.y = 1.0;
+            p.vy = -p.vy.abs() - dt;
+        } else if p.y < -1.0 {
+            p.y = -1.0;
+            p.vy = p.vy.abs() + dt;
+        }
 
-                    let fac;
-                    fac = {
-                        let x = r / GRID_RADIUS;
-                        let beta = 0.3;
+        p.vx *= 0.05_f32.powf(dt);
+        p.vy *= 0.05_f32.powf(dt);
 
-                        //let relation_force = &params.forces[(my_kind % NUM_KINDS)
-                        //    * NUM_KINDS
-                        //    + their_kind % NUM_KINDS]
-                        //    .force;
-                        let relation_force = relation_lookup[i % NUM_KINDS][j % NUM_KINDS];
-                        let f = relation_force;
+        p.vx -= p.x * (dt * 0.01);
+        p.vy -= p.y * (dt * 0.01);
 
-                        f32::max(
-                            f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
-                            1.0 - x / beta,
-                        )
-                    };
-                    // clear NaN
-                    let dx = fac * dixn * dt;
-                    let dy = fac * diyn * dt;
-                    p.vx += if dx.is_nan() {
-                        (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                    } else {
-                        dx
-                    };
-                    p.vy += if dy.is_nan() {
-                        (i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                    } else {
-                        dy
-                    };
-                }
-            }
-            let p = &mut points[i];
-
-            if p.x > 1.0 {
-                p.x = 1.0;
-                p.vx = -p.vx.abs() - dt;
-            } else if p.x < -1.0 {
-                p.x = -1.0;
-                p.vx = p.vx.abs() - dt;
-            }
-            if p.y > 1.0 {
-                p.y = 1.0;
-                p.vy = -p.vy.abs() - dt;
-            } else if p.y < -1.0 {
-                p.y = -1.0;
-                p.vy = p.vy.abs() + dt;
-            }
-
-            p.vx *= 0.05_f32.powf(dt);
-            p.vy *= 0.05_f32.powf(dt);
-
-            p.vx -= p.x * (dt * 0.01);
-            p.vy -= p.y * (dt * 0.01);
-
-            p.x += p.vx * dt;
-            p.y += p.vy * dt;
-
-            //debug_assert_ok_f32!(p.x);
-            //debug_assert_ok_f32!(p.y);
-            //debug_assert_ok_f32!(p.vx);
-            //debug_assert_ok_f32!(p.vy);
-        }*/
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
     }
 }
