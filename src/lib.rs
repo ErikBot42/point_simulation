@@ -1451,12 +1451,12 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
                 outer_group.extend_from_slice(jj);
             }
 
-            fun_name(inner_group, &outer_group, points, relation_lookup, dt);
+            evaluate_groups(inner_group, &outer_group, points, relation_lookup, dt);
         }
     }
 }
 
-fn fun_name(
+fn evaluate_groups(
     inner_group: &Vec<u32>,
     outer_group: &Vec<u32>,
     points: &mut [Point],
@@ -1479,9 +1479,15 @@ fn fun_name(
     }
 
     let (outer_remaining, outer_chunks) = as_rchunks::<_, 8>(outer_group);
+    assert_eq!(
+        outer_remaining.len() + outer_chunks.len() * 8,
+        outer_group.len()
+    );
+    //let outer_chunks: &[u32] = &[];
+    //let outer_remaining = outer_group;
     for &i in inner_group {
         unsafe {
-            use core::arch::x86_64::*;
+            /*use core::arch::x86_64::*;
             #[inline(always)]
             unsafe fn mul(a: __m256, b: __m256) -> __m256 {
                 _mm256_mul_ps(a, b)
@@ -1548,6 +1554,8 @@ fn fun_name(
             unsafe fn min(a: __m256, b: __m256) -> __m256 {
                 _mm256_min_ps(a, b)
             }
+
+
 
             let x1 = splat(points[i as usize].x);
             let y1 = splat(points[i as usize].y);
@@ -1653,26 +1661,53 @@ fn fun_name(
                 }
                 simd_sum_dx = fmadd(t_masked, dx, simd_sum_dx);
                 simd_sum_dy = fmadd(t_masked, dy, simd_sum_dy);
-            }
-            {
-                let mut dx_buffer: [f32; 8] = [0.0; 8];
-                let mut dy_buffer: [f32; 8] = [0.0; 8];
-                _mm256_storeu_ps(dx_buffer.as_mut_ptr() as _, simd_sum_dx);
-                _mm256_storeu_ps(dy_buffer.as_mut_ptr() as _, simd_sum_dy);
-                let mut sum_dx: f32 = dx_buffer.into_iter().sum();
-                let mut sum_dy: f32 = dy_buffer.into_iter().sum();
-                if sum_dx != 0.0 || sum_dy != 0.0 {
-                    assert!(!sum_dx.is_nan(), "{sum_dx}");
-                    assert!(!sum_dy.is_nan(), "{sum_dy}");
-                    dbg!(sum_dx, sum_dy);
-                }
-            }
+            }*/
 
             let mut p_vx = points[i as usize].vx;
             let mut p_vy = points[i as usize].vy;
+
+            for outer_chunk in outer_chunks {
+                for &j in outer_chunk {
+                    let p2 = points[j as usize];
+                    let p = points[i as usize];
+
+                    let (dix, diy) = (p.x - p2.x, p.y - p2.y);
+                    let r2 = dix * dix + diy * diy;
+                    let r = r2.sqrt();
+                    let (dixn, diyn) = (dix / r, diy / r);
+                    let fac = {
+                        let x = r / GRID_RADIUS;
+                        let beta = 0.3;
+                        let relation_force =
+                            relation_lookup[i as usize % NUM_KINDS][j as usize % NUM_KINDS];
+                        let f = relation_force;
+
+                        f32::max(
+                            f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
+                            1.0 - x / beta,
+                        )
+                    };
+
+                    let dx = fac * dixn * dt;
+                    let dy = fac * diyn * dt;
+                    p_vx += if dx.is_nan() {
+                        //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                        0.0
+                    } else {
+                        dx
+                    };
+                    p_vy += if dy.is_nan() {
+                        //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
+                        0.0
+                    } else {
+                        dy
+                    };
+                }
+            }
+
             for &j in outer_remaining {
                 let p2 = points[j as usize];
-                let p = &mut points[i as usize];
+                let p = points[i as usize];
 
                 let (dix, diy) = (p.x - p2.x, p.y - p2.y);
                 let r2 = dix * dix + diy * diy;
@@ -1693,21 +1728,38 @@ fn fun_name(
 
                 let dx = fac * dixn * dt;
                 let dy = fac * diyn * dt;
-                p.vx += if dx.is_nan() {
+                p_vx += if dx.is_nan() {
                     //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
                     0.0
                 } else {
                     dx
                 };
-                p.vy += if dy.is_nan() {
+                p_vy += if dy.is_nan() {
                     //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
                     0.0
                 } else {
                     dy
                 };
             }
+            //{
+            //    let mut dx_buffer: [f32; 8] = [0.0; 8];
+            //    let mut dy_buffer: [f32; 8] = [0.0; 8];
+            //    _mm256_storeu_ps(dx_buffer.as_mut_ptr() as _, simd_sum_dx);
+            //    _mm256_storeu_ps(dy_buffer.as_mut_ptr() as _, simd_sum_dy);
+            //    let mut sum_dx: f32 = dx_buffer.into_iter().sum();
+            //    let mut sum_dy: f32 = dy_buffer.into_iter().sum();
+            //    if sum_dx != 0.0 || sum_dy != 0.0 {
+            //        assert!(!sum_dx.is_nan(), "{sum_dx}");
+            //        assert!(!sum_dy.is_nan(), "{sum_dy}");
+            //        dbg!(sum_dx, sum_dy);
+            //    }
+            //    p_vx += sum_dx;
+            //    p_vx += sum_dx;
+            //}
+            points[i as usize].vx = p_vx;
+            points[i as usize].vy = p_vy;
         }
-        for &j in outer_group {
+        /*for &j in outer_group {
             // !0: we know that i != j here and that positions are distinct
             // 0: i may equal j, r may equal zero
 
@@ -1745,7 +1797,7 @@ fn fun_name(
             } else {
                 dy
             };
-        }
+        }*/
 
         let p = &mut points[i as usize];
 
