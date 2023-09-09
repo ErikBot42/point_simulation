@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 use wgpu::util::DeviceExt;
 use wgpu::SurfaceError;
 use winit::window::Window;
@@ -9,6 +11,23 @@ use winit::{
 
 use std::mem::{replace, size_of};
 
+// ideal repr:
+// x0: [f32]
+// y0: [f32]
+// x1: [f32]
+// y1: [f32]
+// then do verlet integration
+//
+// minimize allocations:
+// [x0 | y0] and [x1 | y1]
+//
+//	x0 = 2 * x1 - x0 + A(x1} * (dt * dt);
+//	x0 = x1 + (x1 - x0) + A(x1} * (dt * dt);
+//
+// 	(v = (x_{n+1} - x_{n-1}) / (2 * dt);)
+//
+//
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 struct Point {
@@ -19,11 +38,6 @@ struct Point {
 }
 unsafe impl bytemuck::Zeroable for Point {}
 unsafe impl bytemuck::Pod for Point {}
-
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-
-//static MAX_NUM_ENTRIES_FOUND: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -153,17 +167,17 @@ impl SimParams {
         let w = 16.0;
 
         let mut rng;
-        rng = Prng(13);
-        //cfg_if::cfg_if! {
-        //    if #[cfg(target_arch = "wasm32")] {
-        //        rng = Prng(13);
-        //    } else {
-        //        rng = Prng(SystemTime::now()
-        //            .duration_since(SystemTime::UNIX_EPOCH)
-        //            .unwrap()
-        //            .as_micros() as u64);
-        //    }
-        //}
+        //rng = Prng(13);
+        cfg_if::cfg_if! {
+            if #[cfg(target_arch = "wasm32")] {
+                rng = Prng(13);
+            } else {
+                rng = Prng(SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64);
+            }
+        }
 
         printlnc!("seed: {}", rng.0);
 
@@ -263,6 +277,7 @@ pub async fn run() {
                     W => state.use_render_bundles = dbgc!(!state.use_render_bundles),
                     C => state.use_cpu = dbgc!(!state.use_cpu),
                     S => state.start_sort = dbgc!(!state.start_sort),
+                    U => state.use_simd = dbgc!(!state.use_simd),
                     _ => (),
                 }
             }
@@ -321,6 +336,7 @@ struct State {
     use_render_bundles: bool,
     use_cpu: bool,
     start_sort: bool,
+    use_simd: bool,
 
     update_bundles: [wgpu::RenderBundle; 2],
     hash_bundles: [wgpu::RenderBundle; 2],
@@ -404,8 +420,8 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            //present_mode: wgpu::PresentMode::AutoVsync,
-            present_mode: wgpu::PresentMode::Immediate,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            //present_mode: wgpu::PresentMode::Immediate,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -1091,6 +1107,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             point_write_buffer,
             point_textures,
             start_sort: false,
+            use_simd: true,
         }
     }
 
@@ -1260,6 +1277,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                 &mut data,
                 &self.sim_params,
                 replace(&mut self.start_sort, false),
+                self.use_simd,
             );
 
             let write_buffer_slice = self.point_write_buffer.slice(..);
@@ -1365,7 +1383,7 @@ const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
 const GRID_RADIUS: f32 = GRID_LEN / 2.0;
 
 #[inline(never)]
-fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
+fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool, use_simd: bool) {
     #[inline(always)]
     fn hash_point_pos(px: f32, py: f32) -> (isize, isize) {
         let px = ((px + 1.0) / 2.0).rem_euclid(1.0);
@@ -1413,7 +1431,7 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
 
     let mut outer_group: Vec<u32> = Vec::with_capacity(NUM_POINTS as _);
 
-    for _ in 0..10 {
+    for _ in 0..5 {
         for e in spatial_hash.iter_mut() {
             e.clear();
         }
@@ -1425,7 +1443,7 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
             spatial_hash[key].push(i as u32);
         }
 
-        let dt = 0.01;
+        let dt = 0.05;
 
         let grid_size = GRID_SIZE as isize;
         for (hash_index, inner_group) in spatial_hash.iter().enumerate()
@@ -1451,223 +1469,99 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool) {
                 outer_group.extend_from_slice(jj);
             }
 
-            evaluate_groups(inner_group, &outer_group, points, relation_lookup, dt);
+            evaluate_groups(inner_group, &outer_group, points, relation_lookup, dt, use_simd);
         }
     }
 }
 
 fn evaluate_groups(
-    inner_group: &Vec<u32>,
-    outer_group: &Vec<u32>,
+    inner_group: &[u32],
+    outer_group: &[u32],
     points: &mut [Point],
     relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS],
     dt: f32,
+    _use_simd: bool,
 ) {
-    fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
-        assert!(N != 0, "chunk size must be non-zero");
-        let len = this.len() / N;
-        let (remainder, multiple_of_n) = this.split_at(this.len() - len * N);
-        // SAFETY: We already panicked for zero, and ensured by construction
-        // that the length of the subslice is a multiple of N.
-        let array_slice = unsafe { as_chunks_unchecked(multiple_of_n) };
-        (remainder, array_slice)
-    }
-
-    unsafe fn as_chunks_unchecked<T, const N: usize>(s: &[T]) -> &[[T; N]] {
-        let new_len = s.len() / N;
-        unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), new_len) }
-    }
-
-    let (outer_remaining, outer_chunks) = as_rchunks::<_, 8>(outer_group);
-    assert_eq!(
-        outer_remaining.len() + outer_chunks.len() * 8,
-        outer_group.len()
-    );
-    //let outer_chunks: &[u32] = &[];
-    //let outer_remaining = outer_group;
+    let (outer_remaining, outer_chunks) = as_rchunks::<_, NUM_KINDS>(outer_group);
     for &i in inner_group {
-        unsafe {
-            /*use core::arch::x86_64::*;
-            #[inline(always)]
-            unsafe fn mul(a: __m256, b: __m256) -> __m256 {
-                _mm256_mul_ps(a, b)
-            }
-            #[inline(always)]
-            unsafe fn addi(a: __m256i, b: __m256i) -> __m256i {
-                _mm256_add_epi32(a, b)
-            }
-            #[inline(always)]
-            unsafe fn add(a: __m256, b: __m256) -> __m256 {
-                _mm256_add_ps(a, b)
-            }
-            #[inline(always)]
-            unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
-                _mm256_and_si256(a, b)
-            }
-            #[inline(always)]
-            unsafe fn and(a: __m256, b: __m256) -> __m256 {
-                _mm256_and_ps(a, b)
-            }
-            #[inline(always)]
-            unsafe fn sub(a: __m256, b: __m256) -> __m256 {
-                _mm256_sub_ps(a, b)
-            }
-            #[inline(always)]
-            unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
-                _mm256_fmadd_ps(a, b, c)
-            }
-            #[inline(always)]
-            unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
-                _mm256_fmsub_ps(a, b, c)
-            }
-            #[inline(always)]
-            unsafe fn dot(a: __m256, b: __m256) -> __m256 {
-                fmadd(a, a, mul(b, b))
-            }
-            #[inline(always)]
-            unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
-                _mm256_i32gather_ps::<SCALE>(p, indexes)
-            }
-            #[inline(always)]
-            unsafe fn rsqrt(a: __m256) -> __m256 {
-                _mm256_rsqrt_ps(a)
-            }
-            #[inline(always)]
-            unsafe fn splat(a: f32) -> __m256 {
-                _mm256_set1_ps(a)
-            }
-            #[inline(always)]
-            unsafe fn splati(a: i32) -> __m256i {
-                _mm256_set1_epi32(a)
-            }
-            #[inline(always)]
-            unsafe fn mod8(a: __m256i) -> __m256i {
-                assert_eq!(NUM_KINDS, 8);
-                let avoid_zero = addi(splati(GRID_SIZE as i32 * 2), a);
-                andi(avoid_zero, splati(0b111))
-            }
-            #[inline(always)]
-            unsafe fn max(a: __m256, b: __m256) -> __m256 {
-                _mm256_max_ps(a, b)
-            }
-            #[inline(always)]
-            unsafe fn min(a: __m256, b: __m256) -> __m256 {
-                _mm256_min_ps(a, b)
-            }
+        if true {
+            unsafe {
+                let p_x = points.get_unchecked(i as usize).x;
+                let p_y = points.get_unchecked(i as usize).y;
 
+                let mut p_vx = points.get_unchecked(i as usize).vx;
+                let mut p_vy = points.get_unchecked(i as usize).vy;
 
+                let mut p_vx_s = _mm256_setzero_ps();
+                let mut p_vy_s = _mm256_setzero_ps();
 
-            let x1 = splat(points[i as usize].x);
-            let y1 = splat(points[i as usize].y);
-            //let vx1 = splat(points[i as usize].vx);
-            //let vy1 = splat(points[i as usize].vy);
+                for outer_chunk in outer_chunks {
+                    let j_s: __m256i = _mm256_loadu_si256(outer_chunk.as_ptr() as _);
 
-            let kind_i = i.rem_euclid(NUM_KINDS as _);
+                    let points_ptr: *const f32 = points.as_ptr() as _;
 
-            let mut simd_sum_dx = splat(0.0);
-            let mut simd_sum_dy = splat(0.0);
+                    let x2_s: __m256 = gather::<4>(points_ptr.offset(0), slli::<2>(j_s));
+                    let y2_s: __m256 = gather::<4>(points_ptr.offset(1), slli::<2>(j_s));
 
-            for outer_chunk in outer_chunks {
-                let outer_chunk: __m256i = _mm256_loadu_si256(outer_chunk.as_ptr() as _);
-                let points_pointer: *const f32 = points.as_ptr() as _;
+                    let dix_s: __m256 = sub(splat(p_x), x2_s);
+                    let diy_s: __m256 = sub(splat(p_y), y2_s);
 
-                let x2: __m256 = gather::<4>(points_pointer.offset(0), outer_chunk);
-                let y2: __m256 = gather::<4>(points_pointer.offset(1), outer_chunk);
-                //let vx2: __m256 = gather::<4>(points_pointer.offset(2), outer_chunk);
-                //let vy2: __m256 = gather::<4>(points_pointer.offset(3), outer_chunk);
+                    let r2_s = fmadd(dix_s, dix_s, mul(diy_s, diy_s));
+                    let r_inv_s = rsqrt(r2_s);
+                    let r_s = mul(r2_s, r_inv_s);
 
-                let dx: __m256 = sub(x1, x2);
-                let dy: __m256 = sub(y1, y2);
+                    let dixn_s = mul(r_inv_s, dix_s);
+                    let diyn_s = mul(r_inv_s, diy_s);
 
-                let r2: __m256 = dot(dx, dy);
-                let r_inv: __m256 = rsqrt(r2);
-                let r: __m256 = mul(r2, r_inv);
+                    let x_s = mul(r_s, splat(1.0 / GRID_RADIUS));
+                    let beta = 0.3;
+                    let relation_force_s = gather::<4>(
+                        (relation_lookup.as_ptr() as *const f32)
+                            .add((i as usize % NUM_KINDS) * NUM_KINDS),
+                        andi(j_s, splati(0b111)),
+                    );
+                    assert_eq!(NUM_KINDS, 8, "0x111");
+                    let f_s = relation_force_s;
+                    let fac_dt_s = mul(
+                        max(
+                            mul(
+                                max(min(sub(x_s, splat(beta)), sub(splat(1.0), x_s)), splat(0.0)),
+                                f_s,
+                            ),
+                            sub(splat(1.0), mul(x_s, splat(1.0 / beta))),
+                            //fmsub(x_s, splat(1.0 / beta), splat(1.0))
+                        ),
+                        splat(dt),
+                    );
+                    let ok_mask = _mm256_cmp_ps::<0x8>(fac_dt_s, splat(0.0));
+                    let fac_dt_masked_s = andn(ok_mask, fac_dt_s);
 
-                let kind_j: __m256i = mod8(outer_chunk);
+                    let fac_dt_s = fac_dt_masked_s;
 
-                let forces: __m256 = gather::<{ NUM_KINDS as i32 }>(
-                    (relation_lookup.as_ptr() as *const f32).offset(kind_i as _),
-                    _mm256_srli_epi32(kind_j, 3),
-                );
+                    let final_vx = mul(dixn_s, fac_dt_s);
+                    let final_vy = mul(diyn_s, fac_dt_s);
+                    let ok_mask_x = _mm256_cmp_ps::<0x8>(final_vx, splat(0.0));
+                    let ok_mask_y = _mm256_cmp_ps::<0x8>(final_vy, splat(0.0));
+                    let final_vx = andn(ok_mask_x, final_vx);
+                    let final_vy = andn(ok_mask_y, final_vy);
 
-                // TODO: more fusing
-
-                let beta = 0.3;
-
-                let rx = mul(r, splat(1.0 / GRID_RADIUS as f32));
-
-                let fac = max(
-                    mul(
-                        max(min(sub(rx, splat(beta)), sub(splat(1.0), rx)), splat(0.0)),
-                        forces,
-                    ),
-                    sub(splat(1.0), mul(rx, splat(1.0 / beta))),
-                );
-
-                let t = mul(mul(splat(dt), r_inv), fac); // t >= 0.0
-
-                // NaN mask
-                // 12: not equal ordered, non signaling
-
-                // _CMP_EQ_OQ    0x00 /* Equal (ordered, non-signaling)  */
-                // _CMP_LT_OS    0x01 /* Less-than (ordered, signaling)  */
-                // _CMP_LE_OS    0x02 /* Less-than-or-equal (ordered, signaling)  */
-                // _CMP_UNORD_Q  0x03 /* Unordered (non-signaling)  */
-                // _CMP_NEQ_UQ   0x04 /* Not-equal (unordered, non-signaling)  */
-                // _CMP_NLT_US   0x05 /* Not-less-than (unordered, signaling)  */
-                // _CMP_NLE_US   0x06 /* Not-less-than-or-equal (unordered, signaling)  */
-                // _CMP_ORD_Q    0x07 /* Ordered (nonsignaling)   */
-                // _CMP_EQ_UQ    0x08 /* Equal (unordered, non-signaling)  */
-                // _CMP_NGE_US   0x09 /* Not-greater-than-or-equal (unord, signaling)  */
-                // _CMP_NGT_US   0x0a /* Not-greater-than (unordered, signaling)  */
-                // _CMP_FALSE_OQ 0x0b /* False (ordered, non-signaling)  */
-                // _CMP_NEQ_OQ   0x0c /* Not-equal (ordered, non-signaling)  */
-                // _CMP_GE_OS    0x0d /* Greater-than-or-equal (ordered, signaling)  */
-                // _CMP_GT_OS    0x0e /* Greater-than (ordered, signaling)  */
-                // _CMP_TRUE_UQ  0x0f /* True (unordered, non-signaling)  */
-                // _CMP_EQ_OS    0x10 /* Equal (ordered, signaling)  */
-                // _CMP_LT_OQ    0x11 /* Less-than (ordered, non-signaling)  */
-                // _CMP_LE_OQ    0x12 /* Less-than-or-equal (ordered, non-signaling)  */
-                // _CMP_UNORD_S  0x13 /* Unordered (signaling)  */
-                // _CMP_NEQ_US   0x14 /* Not-equal (unordered, signaling)  */
-                // _CMP_NLT_UQ   0x15 /* Not-less-than (unordered, non-signaling)  */
-                // _CMP_NLE_UQ   0x16 /* Not-less-than-or-equal (unord, non-signaling)  */
-                // _CMP_ORD_S    0x17 /* Ordered (signaling)  */
-                // _CMP_EQ_US    0x18 /* Equal (unordered, signaling)  */
-                // _CMP_NGE_UQ   0x19 /* Not-greater-than-or-equal (unord, non-sign)  */
-                // _CMP_NGT_UQ   0x1a /* Not-greater-than (unordered, non-signaling)  */
-                // _CMP_FALSE_OS 0x1b /* False (ordered, signaling)  */
-                // _CMP_NEQ_OS   0x1c /* Not-equal (ordered, signaling)  */
-                // _CMP_GE_OQ    0x1d /* Greater-than-or-equal (ordered, non-signaling)  */
-                // _CMP_GT_OQ    0x1e /* Greater-than (ordered, non-signaling)  */
-                // _CMP_TRUE_US  0x1f /* True (unordered, signaling)  */
-                //
-
-                // unordered eq zero?
-                //let ok_mask = _mm256_cmp_ps::<12>(r_inv, splat(0.0));
-                let ok_mask = _mm256_cmp_ps::<0x8>(r_inv, splat(0.0));
-                let t_masked = and(ok_mask, t);
-
-                //dbg!(t, ok_mask, t_masked);
-                //dbg!();
+                    p_vx_s = add(final_vx, p_vx_s);
+                    p_vy_s = add(final_vy, p_vy_s);
+                }
 
                 {
-                    let mut t_buffer: [f32; 8] = [0.0; 8];
-                    //_mm256_storeu_ps(t_buffer.as_mut_ptr() as _, t_masked);
-                    _mm256_storeu_ps(t_buffer.as_mut_ptr() as _, t_masked);
+                    let mut buffer: [f32; 8] = [0.0; 8];
+                    _mm256_storeu_ps(buffer.as_mut_ptr() as _, p_vx_s);
+                    let diff = buffer.into_iter().sum::<f32>();
+                    p_vx += diff;
 
-                    let mut sum_t: f32 = t_buffer.into_iter().sum();
-                    assert!(!sum_t.is_nan(), "{sum_t}, {t:?}, {ok_mask:?}");
+                    let mut buffer: [f32; 8] = [0.0; 8];
+                    _mm256_storeu_ps(buffer.as_mut_ptr() as _, p_vy_s);
+                    let diff = buffer.into_iter().sum::<f32>();
+                    p_vy += diff;
                 }
-                simd_sum_dx = fmadd(t_masked, dx, simd_sum_dx);
-                simd_sum_dy = fmadd(t_masked, dy, simd_sum_dy);
-            }*/
 
-            let mut p_vx = points[i as usize].vx;
-            let mut p_vy = points[i as usize].vy;
-
-            for outer_chunk in outer_chunks {
-                for &j in outer_chunk {
+                for &j in outer_remaining {
                     let p2 = points[j as usize];
                     let p = points[i as usize];
 
@@ -1690,24 +1584,19 @@ fn evaluate_groups(
 
                     let dx = fac * dixn * dt;
                     let dy = fac * diyn * dt;
-                    p_vx += if dx.is_nan() {
-                        //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                        0.0
-                    } else {
-                        dx
-                    };
-                    p_vy += if dy.is_nan() {
-                        //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                        0.0
-                    } else {
-                        dy
-                    };
+                    p_vx += if dx.is_nan() { 0.0 } else { dx };
+                    p_vy += if dy.is_nan() { 0.0 } else { dy };
                 }
+                points[i as usize].vx = p_vx;
+                points[i as usize].vy = p_vy;
             }
+        } else {
+            for &j in outer_group {
+                // !0: we know that i != j here and that positions are distinct
+                // 0: i may equal j, r may equal zero
 
-            for &j in outer_remaining {
                 let p2 = points[j as usize];
-                let p = points[i as usize];
+                let p = &mut points[i as usize];
 
                 let (dix, diy) = (p.x - p2.x, p.y - p2.y);
                 let r2 = dix * dix + diy * diy;
@@ -1728,101 +1617,135 @@ fn evaluate_groups(
 
                 let dx = fac * dixn * dt;
                 let dy = fac * diyn * dt;
-                p_vx += if dx.is_nan() {
+                p.vx += if dx.is_nan() {
                     //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
                     0.0
                 } else {
                     dx
                 };
-                p_vy += if dy.is_nan() {
+                p.vy += if dy.is_nan() {
                     //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
                     0.0
                 } else {
                     dy
                 };
             }
-            //{
-            //    let mut dx_buffer: [f32; 8] = [0.0; 8];
-            //    let mut dy_buffer: [f32; 8] = [0.0; 8];
-            //    _mm256_storeu_ps(dx_buffer.as_mut_ptr() as _, simd_sum_dx);
-            //    _mm256_storeu_ps(dy_buffer.as_mut_ptr() as _, simd_sum_dy);
-            //    let mut sum_dx: f32 = dx_buffer.into_iter().sum();
-            //    let mut sum_dy: f32 = dy_buffer.into_iter().sum();
-            //    if sum_dx != 0.0 || sum_dy != 0.0 {
-            //        assert!(!sum_dx.is_nan(), "{sum_dx}");
-            //        assert!(!sum_dy.is_nan(), "{sum_dy}");
-            //        dbg!(sum_dx, sum_dy);
-            //    }
-            //    p_vx += sum_dx;
-            //    p_vx += sum_dx;
-            //}
-            points[i as usize].vx = p_vx;
-            points[i as usize].vy = p_vy;
         }
-        /*for &j in outer_group {
-            // !0: we know that i != j here and that positions are distinct
-            // 0: i may equal j, r may equal zero
-
-            let p2 = points[j as usize];
-            let p = &mut points[i as usize];
-
-            let (dix, diy) = (p.x - p2.x, p.y - p2.y);
-            let r2 = dix * dix + diy * diy;
-            let r = r2.sqrt();
-            let (dixn, diyn) = (dix / r, diy / r);
-            let fac = {
-                let x = r / GRID_RADIUS;
-                let beta = 0.3;
-                let relation_force =
-                    relation_lookup[i as usize % NUM_KINDS][j as usize % NUM_KINDS];
-                let f = relation_force;
-
-                f32::max(
-                    f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
-                    1.0 - x / beta,
-                )
-            };
-
-            let dx = fac * dixn * dt;
-            let dy = fac * diyn * dt;
-            p.vx += if dx.is_nan() {
-                //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                0.0
-            } else {
-                dx
-            };
-            p.vy += if dy.is_nan() {
-                //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                0.0
-            } else {
-                dy
-            };
-        }*/
 
         let p = &mut points[i as usize];
 
         if p.x > 1.0 {
-            p.x = 1.0;
-            p.vx = -p.vx.abs() - dt;
-        } else if p.x < -1.0 {
             p.x = -1.0;
-            p.vx = p.vx.abs() - dt;
+            //p.vx = -p.vx.abs() - dt;
+        } else if p.x < -1.0 {
+            p.x = 1.0;
+            //p.vx = p.vx.abs() - dt;
         }
         if p.y > 1.0 {
-            p.y = 1.0;
-            p.vy = -p.vy.abs() - dt;
-        } else if p.y < -1.0 {
             p.y = -1.0;
-            p.vy = p.vy.abs() + dt;
+            //p.vy = -p.vy.abs() - dt;
+        } else if p.y < -1.0 {
+            p.y = 1.0;
+            //p.vy = p.vy.abs() + dt;
         }
 
-        p.vx *= 0.05_f32.powf(dt);
-        p.vy *= 0.05_f32.powf(dt);
+        p.vx *= 0.01_f32.powf(dt);
+        p.vy *= 0.01_f32.powf(dt);
 
-        p.vx -= p.x * (dt * 0.01);
-        p.vy -= p.y * (dt * 0.01);
+        p.vx -= p.x * (dt * 0.001);
+        p.vy -= p.y * (dt * 0.001);
 
         p.x += p.vx * dt;
         p.y += p.vy * dt;
     }
+}
+
+use core::arch::x86_64::*;
+#[inline(always)]
+unsafe fn mul(a: __m256, b: __m256) -> __m256 {
+    _mm256_mul_ps(a, b)
+}
+#[inline(always)]
+unsafe fn addi(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_add_epi32(a, b)
+}
+#[inline(always)]
+unsafe fn add(a: __m256, b: __m256) -> __m256 {
+    _mm256_add_ps(a, b)
+}
+#[inline(always)]
+unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_and_si256(a, b)
+}
+#[inline(always)]
+unsafe fn and(a: __m256, b: __m256) -> __m256 {
+    _mm256_and_ps(a, b)
+}
+#[inline(always)]
+unsafe fn andn(a: __m256, b: __m256) -> __m256 {
+    _mm256_andnot_ps(a, b)
+}
+#[inline(always)]
+unsafe fn sub(a: __m256, b: __m256) -> __m256 {
+    _mm256_sub_ps(a, b)
+}
+#[inline(always)]
+unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
+    _mm256_fmadd_ps(a, b, c)
+}
+#[inline(always)]
+unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
+    _mm256_fmsub_ps(a, b, c)
+}
+#[inline(always)]
+unsafe fn dot(a: __m256, b: __m256) -> __m256 {
+    fmadd(a, a, mul(b, b))
+}
+#[inline(always)]
+unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
+    _mm256_i32gather_ps::<SCALE>(p, indexes)
+}
+#[inline(always)]
+unsafe fn rsqrt(a: __m256) -> __m256 {
+    _mm256_rsqrt_ps(a)
+}
+#[inline(always)]
+unsafe fn splat(a: f32) -> __m256 {
+    _mm256_set1_ps(a)
+}
+#[inline(always)]
+unsafe fn splati(a: i32) -> __m256i {
+    _mm256_set1_epi32(a)
+}
+#[inline(always)]
+unsafe fn mod8(a: __m256i) -> __m256i {
+    assert_eq!(NUM_KINDS, 8);
+    let avoid_zero = addi(splati(GRID_SIZE as i32 * 2), a);
+    andi(avoid_zero, splati(0b111))
+}
+#[inline(always)]
+unsafe fn max(a: __m256, b: __m256) -> __m256 {
+    _mm256_max_ps(a, b)
+}
+#[inline(always)]
+unsafe fn min(a: __m256, b: __m256) -> __m256 {
+    _mm256_min_ps(a, b)
+}
+#[inline(always)]
+unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i {
+    _mm256_slli_epi32::<IMM>(a)
+}
+
+fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
+    unsafe fn as_chunks_unchecked<T, const N: usize>(s: &[T]) -> &[[T; N]] {
+        let new_len = s.len() / N;
+        unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), new_len) }
+    }
+    assert!(N != 0, "chunk size must be non-zero");
+    let len = this.len() / N;
+    let (remainder, multiple_of_n) = this.split_at(this.len() - len * N);
+    // SAFETY: We already panicked for zero, and ensured by construction
+    // that the length of the subslice is a multiple of N.
+    let array_slice = unsafe { as_chunks_unchecked(multiple_of_n) };
+    (remainder, array_slice)
 }
