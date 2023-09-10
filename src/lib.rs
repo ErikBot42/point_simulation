@@ -64,25 +64,7 @@ const BETA: f64 = 0.4;
 
 const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
 
-const DISTINCT_COLORS: [u32; 20] = [
-    0xFFB30000, 0x803E7500, 0xFF680000, 0xA6BDD700, 0xC1002000, 0xCEA26200, 0x81706600, 0x007D3400,
-    0xF6768E00, 0x00538A00, 0xFF7A5C00, 0x53377A00, 0xFF8E0000, 0xB3285100, 0xF4C80000, 0x7F180D00,
-    0x93AA0000, 0x59331500, 0xF13A1300, 0x232C1600,
-];
 
-macro_rules! debug_assert_ok_f32 {
-    ($a:expr) => {{
-        let a = $a;
-        debug_assert!(check_ok_f32(a), "{}: {}", stringify!($a), a);
-    }};
-}
-fn check_ok_f32(f: f32) -> bool {
-    use std::num::FpCategory::*;
-    match f.classify() {
-        Nan | Infinite => false,
-        Zero | Subnormal | Normal => true,
-    }
-}
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime};
@@ -249,7 +231,7 @@ pub async fn run() {
     let mut state = State::new(window).await;
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
-            ref event,
+            event,
             window_id,
         } if window_id == state.window.id() => match event {
             WindowEvent::CloseRequested
@@ -281,11 +263,11 @@ pub async fn run() {
                     _ => (),
                 }
             }
-            WindowEvent::Resized(physical_size) => state.resize(*physical_size),
+            WindowEvent::Resized(physical_size) => state.resize(physical_size),
             WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                state.resize(**new_inner_size)
+                state.resize(*new_inner_size)
             }
-            _ => state.input(event),
+            _ => state.input(&event),
         },
         Event::RedrawRequested(window_id) if window_id == state.window().id() => {
             state.update();
@@ -1666,20 +1648,12 @@ unsafe fn mul(a: __m256, b: __m256) -> __m256 {
     _mm256_mul_ps(a, b)
 }
 #[inline(always)]
-unsafe fn addi(a: __m256i, b: __m256i) -> __m256i {
-    _mm256_add_epi32(a, b)
-}
-#[inline(always)]
 unsafe fn add(a: __m256, b: __m256) -> __m256 {
     _mm256_add_ps(a, b)
 }
 #[inline(always)]
 unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
     _mm256_and_si256(a, b)
-}
-#[inline(always)]
-unsafe fn and(a: __m256, b: __m256) -> __m256 {
-    _mm256_and_ps(a, b)
 }
 #[inline(always)]
 unsafe fn andn(a: __m256, b: __m256) -> __m256 {
@@ -1692,14 +1666,6 @@ unsafe fn sub(a: __m256, b: __m256) -> __m256 {
 #[inline(always)]
 unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
     _mm256_fmadd_ps(a, b, c)
-}
-#[inline(always)]
-unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
-    _mm256_fmsub_ps(a, b, c)
-}
-#[inline(always)]
-unsafe fn dot(a: __m256, b: __m256) -> __m256 {
-    fmadd(a, a, mul(b, b))
 }
 #[inline(always)]
 unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
@@ -1716,12 +1682,6 @@ unsafe fn splat(a: f32) -> __m256 {
 #[inline(always)]
 unsafe fn splati(a: i32) -> __m256i {
     _mm256_set1_epi32(a)
-}
-#[inline(always)]
-unsafe fn mod8(a: __m256i) -> __m256i {
-    assert_eq!(NUM_KINDS, 8);
-    let avoid_zero = addi(splati(GRID_SIZE as i32 * 2), a);
-    andi(avoid_zero, splati(0b111))
 }
 #[inline(always)]
 unsafe fn max(a: __m256, b: __m256) -> __m256 {
