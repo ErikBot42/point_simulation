@@ -11,33 +11,57 @@ use winit::{
 
 use std::mem::{replace, size_of};
 
-// ideal repr:
-// x0: [f32]
-// y0: [f32]
-// x1: [f32]
-// y1: [f32]
-// then do verlet integration
-//
-// minimize allocations:
-// [x0 | y0] and [x1 | y1]
-//
-//	x0 = 2 * x1 - x0 + A(x1} * (dt * dt);
-//	x0 = x1 + (x1 - x0) + A(x1} * (dt * dt);
-//
-// 	(v = (x_{n+1} - x_{n-1}) / (2 * dt);)
-//
-//
-
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
-struct Point {
+struct EulerPoint {
     x: f32,
     y: f32,
     vx: f32,
     vy: f32,
 }
-unsafe impl bytemuck::Zeroable for Point {}
-unsafe impl bytemuck::Pod for Point {}
+struct EulerRepr {
+    points: Vec<EulerPoint>,
+}
+struct VerletRepr {
+    x0: Vec<f32>,
+    y0: Vec<f32>,
+    x1: Vec<f32>,
+    y1: Vec<f32>,
+}
+fn euler_to_verlet(euler: &EulerRepr, dt: f32) -> VerletRepr {
+    let mut x0 = Vec::new();
+    let mut y0 = Vec::new();
+    let mut x1 = Vec::new();
+    let mut y1 = Vec::new();
+    for point in &euler.points {
+        x0.push(point.x);
+        y0.push(point.y);
+        x1.push(point.x + point.vx * dt);
+        y1.push(point.y + point.vy * dt);
+    }
+    VerletRepr { x0, y0, x1, y1 }
+}
+fn verlet_to_euler(verlet: &VerletRepr, dt: f32) -> EulerRepr {
+    let mut points = Vec::new();
+    for (((&x0, &y0), &x1), &y1) in verlet
+        .x0
+        .iter()
+        .zip(verlet.y0.iter())
+        .zip(verlet.x1.iter())
+        .zip(verlet.y1.iter())
+    {
+        points.push(EulerPoint {
+            x: x0,
+            y: y0,
+            vx: (x1 - x0) / dt,
+            vy: (y1 - y0) / dt,
+        });
+    }
+    todo!()
+}
+
+unsafe impl bytemuck::Zeroable for EulerPoint {}
+unsafe impl bytemuck::Pod for EulerPoint {}
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -63,8 +87,6 @@ const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE a
 const BETA: f64 = 0.4;
 
 const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
-
-
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime};
@@ -105,44 +127,12 @@ struct SimParams {
     r_outer: f32,
     w: f32,
     kinds: u32,
-    _0: u32,
-    _1: u32,
-    _2: u32,
-    forces: Vec<Relation>,
-}
-#[derive(Debug)]
-struct Relation {
-    force: f32,
-    r: f32,
-    r_inner: f32,
-    r_outer: f32,
+    forces: Vec<f32>,
 }
 
 impl SimParams {
-    #[inline(never)]
-    fn as_buffer(&self) -> Vec<u8> {
-        let mut buffer = Vec::new();
-        buffer.extend(
-            [self.dt, self.r_inner, self.r_outer, self.w]
-                .into_iter()
-                .flat_map(f32::to_le_bytes),
-        );
-        buffer.extend(
-            [self.kinds, self._0, self._1, self._2]
-                .into_iter()
-                .flat_map(u32::to_le_bytes),
-        );
-        buffer.extend(
-            self.forces
-                .iter()
-                .flat_map(|r| [r.force, r.r, r.r_inner, r.r_outer].into_iter())
-                .flat_map(f32::to_le_bytes),
-        );
-        buffer
-    }
-
     fn new() -> SimParams {
-        let dt = 0.01; // 0.01
+        let dt = 0.01;
         let kinds = NUM_KINDS as _;
         let r_inner = 0.02;
         let r_outer = 0.06;
@@ -169,24 +159,7 @@ impl SimParams {
             r_outer,
             w,
             kinds,
-            _0: 0,
-            _1: 0,
-            _2: 0,
-            forces: (0..kinds * kinds)
-                .map(|_| {
-                    let force = rng.f32(-1.0..1.0);
-                    let r = r_inner;
-                    let r_inner = rng.f32(0.02..0.04);
-                    let r_outer = rng.f32((r_inner + 0.01)..0.1);
-
-                    Relation {
-                        force,
-                        r,
-                        r_inner,
-                        r_outer,
-                    }
-                })
-                .collect(),
+            forces: (0..kinds * kinds).map(|_| rng.f32(-1.0..1.0)).collect(),
         }
     }
 }
@@ -230,10 +203,7 @@ pub async fn run() {
 
     let mut state = State::new(window).await;
     event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent {
-            event,
-            window_id,
-        } if window_id == state.window.id() => match event {
+        Event::WindowEvent { event, window_id } if window_id == state.window.id() => match event {
             WindowEvent::CloseRequested
             | WindowEvent::KeyboardInput {
                 input:
@@ -255,18 +225,12 @@ pub async fn run() {
             } => {
                 use VirtualKeyCode::*;
                 match keycode {
-                    Space => state.render_tris = dbgc!(!state.render_tris),
-                    W => state.use_render_bundles = dbgc!(!state.use_render_bundles),
-                    C => state.use_cpu = dbgc!(!state.use_cpu),
-                    S => state.start_sort = dbgc!(!state.start_sort),
                     U => state.use_simd = dbgc!(!state.use_simd),
                     _ => (),
                 }
             }
             WindowEvent::Resized(physical_size) => state.resize(physical_size),
-            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                state.resize(*new_inner_size)
-            }
+            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => state.resize(*new_inner_size),
             _ => state.input(&event),
         },
         Event::RedrawRequested(window_id) if window_id == state.window().id() => {
@@ -293,18 +257,11 @@ struct State {
     window: Window,
 
     render_pipeline: wgpu::RenderPipeline,
-    update_pipeline: wgpu::RenderPipeline,
-    hash_pipeline: wgpu::RenderPipeline,
-    debug_hash_pipeline: wgpu::RenderPipeline,
 
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
 
     bind_groups: [wgpu::BindGroup; 2],
-    hash_bind_groups: [wgpu::BindGroup; 2],
-
-    point_texture_views: [wgpu::TextureView; 2],
-    hash_texture_views: [wgpu::TextureView; 2],
 
     point_textures: [wgpu::Texture; 2],
 
@@ -314,14 +271,7 @@ struct State {
 
     sim_params: SimParams,
 
-    render_tris: bool,
-    use_render_bundles: bool,
-    use_cpu: bool,
-    start_sort: bool,
     use_simd: bool,
-
-    update_bundles: [wgpu::RenderBundle; 2],
-    hash_bundles: [wgpu::RenderBundle; 2],
 
     point_read_buffer: wgpu::Buffer,
     point_write_buffer: wgpu::Buffer,
@@ -459,158 +409,43 @@ impl State {
             .try_into()
             .unwrap();
 
-        let hash_textures: [wgpu::Texture; 2] = from_fn(|_| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Hash Texture"),
-                size: wgpu::Extent3d {
-                    width: HASH_TEXTURE_SIZE,
-                    height: HASH_TEXTURE_SIZE,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba32Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[wgpu::TextureFormat::Rgba32Float],
-            })
-        });
-
-        let hash_texture_views: [wgpu::TextureView; 2] = hash_textures
-            .iter()
-            .map(|texture| texture.create_view(&Default::default()))
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-
         let sim_params = SimParams::new();
-        let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Sim params buffer"),
-            contents: &sim_params.as_buffer(),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
 
         let bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                ],
+                    count: None,
+                }],
             });
 
         let bind_groups: [_; 2] = point_texture_views
             .iter()
-            .zip(hash_texture_views.iter())
-            .map(|(point_texture_view, hash_texture_view)| {
+            .map(|point_texture_view| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Bind group"),
                     layout: &bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(point_texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: sim_params_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(hash_texture_view),
-                        },
-                    ],
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(point_texture_view),
+                    }],
                 })
             })
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
 
-        let hash_bind_groups: [wgpu::BindGroup; 2] = point_texture_views
-            .iter()
-            .zip(hash_texture_views.iter().rev())
-            .map(|(point_texture_view, hash_texture_view)| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bind group"),
-                    layout: &bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(point_texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: sim_params_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(hash_texture_view),
-                        },
-                    ],
-                })
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-
-        let shader_source: String = format!("
+        let shader_source: String = format!(
+            "
 @group(0) @binding(0) 
 var compute_texture: texture_2d<f32>;
-
-@group(0) @binding(1)
-var<uniform> params: SimParams;
-
-@group(0) @binding(2) 
-var hash_texture: texture_2d<f32>;
-
-struct SimParams {{
-    dt: f32,
-    r_inner: f32,
-    r_outer: f32,
-    w: f32,
-    kinds: u32,
-    _0: u32,
-    _1: u32,
-    _2: u32,
-    forces: array<Relation, {NUM_KINDS2}>,
-}}
-
-struct Relation {{
-    force: f32,
-    r: f32,
-    r_inner: f32,
-    r_outer: f32,
-}}
-
 
 struct FillVertexInput {{
     @location(0) position: vec2<f32>,
@@ -618,23 +453,6 @@ struct FillVertexInput {{
 struct FillVertexOuput {{
     @builtin(position) clip_position: vec4<f32>,
     @location(0) pos: vec4<f32>,
-}}
-@vertex
-fn vs_hash(
-    in: VertexInput
-) -> VertexOutput {{
-    var out: VertexOutput;
-    let group = in.vertex_index;
-    let pos = textureLoad(compute_texture, vec2<u32>(group, 0u), 0).xy;
-    out.clip_position = vec4<f32>(pos.x, -pos.y, 0.0, 1.0);
-    out.group = group;
-    return out;   
-}}
-@fragment
-fn fs_hash(in: VertexOutput) -> @location(0) vec4<f32> {{
-
-    let group = in.group;
-    return vec4<f32>(in.clip_position.xy / {HASH_TEXTURE_SIZE}.0 * 2.0 - 1.0, f32(group), 0.0);
 }}
 
 
@@ -653,127 +471,10 @@ fn fs_fill(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {{
     let c: f32 = in.pos.x;
-    //return vec4<f32>(c, sin(c * ({NUM_POINTS}.0 + 1.9008)), cos(c*2338.23894), sin(c*2783.7893));
     return vec4<f32>(c, sin(c * ({NUM_POINTS}.0 + 1.9008)), 0.0, 0.0);
 }}
 
-@fragment
-fn fs_debug_hash(
-    in: FillVertexOuput,
-) -> @location(0) vec4<f32> {{
-    let pos = (vec2<f32>(in.pos.xy) + 1.0) * 0.5;
-    let a = textureLoad(hash_texture, vec2<u32>(pos * {HASH_TEXTURE_SIZE}.0), 0);
-    return a;
-}}
-
-// TODO: let hardware do the wrapping?
-// TODO: rearrange to make sampling cheaper
-@fragment
-fn fs_update(
-    in: FillVertexOuput,
-) -> @location(0) vec4<f32> {{
-    var a = textureLoad(compute_texture, vec2<u32>(u32(in.clip_position.x), 0u), 0);
-    let dt = params.dt;
-    var p = a.xy;
-    var v = a.zw;
-
-    let my_id = u32(in.clip_position.x);
-
-    let my_origin = vec2<i32>(((p + 1.0) * 0.5) * {HASH_TEXTURE_SIZE}.0 + 0.5);
-
-    let range: i32 = {RANGE_INDEX};
-    
-    var v_i = vec2<f32>(0.0, 0.0);
-    for (var i: i32 = -range; i < range; i++) {{
-    for (var j: i32 = -range; j < range; j++) {{
-        
-        var sample = textureLoad(hash_texture, vec2<i32>(my_origin.x + i, my_origin.y + j), 0);
-        
-        let other_id: u32 = u32(sample.z);//i;
-        //var other = textureLoad(compute_texture, vec2<u32>(other_id, 0u), 0);
-        //let other_pos = other.xy;
-        let other_pos = vec2<f32>(sample.xy);
-
-        if other_id != my_id  && sample.r != 0.0 && sample.g != 0.0 {{
-
-            let relation = params.forces[my_id % {NUM_KINDS}u + (other_id % {NUM_KINDS}u) * {NUM_KINDS}u];
-            var f = relation.force;
-
-            let diff = (p - other_pos);
-            let l = length(diff);
-
-            let x = l;
-            /* 
-                let c = 4.0/{HASH_TEXTURE_SIZE}.0;
-                //let c = 2.5/{HASH_TEXTURE_SIZE}.0;
-                let a = c * 2.0; 
-
-                let d = a;
-                let g = a * 2.0; // <- tweak me
-                let h = (g + d) / 2.0;
-                let k_1 = f / (h - d); // dyn (f)
-                let k_2 = 1.0 / (a - c);
-
-                let i_s = 20.0;
-                
-                //if x < c {{
-                //    f = 10.0;
-                //}} else if x < a {{
-                //    f = min(10.0, 0.04 * (1.0 / (x - c) - k_2));
-                if x < a {{
-                    f = max(- i_s * x / (a * 0.8) + i_s, 0.0);
-                }} else if x < h {{
-                    f = (x - d) * k_1;
-                }} else if x < g {{
-                    f = ( - x + g) * k_1;
-                }} else {{
-                    f = 0.0;
-                }}
-            */
-            
-            
-                let beta = {BETA}; // const
-                let alpha = 5.0; // const
-                let g = {RADIUS_CLIP_SPACE}; // const
-
-                let k1 = (2.0 / ((1.0 - beta) * alpha)); // const
-                let k2 = - 1.0 / beta; // const
-                let k3 = 1.0 / g; // const
-                
-                let x_g = x * k3;
-                f = max(
-                    fma(x_g, k2, 1.0), 
-                    f * k1 * 
-                        max(
-                            0.0, 
-                            min(
-                                x_g - beta, 
-                                1.0 - x_g
-                            )
-                        )
-                ) * alpha;
-            
-
-
-
-            //v += 0.1 * f * normalize(diff) * dt;
-            v_i += f * diff / l;
-        }}
-    }}
-    }}
-    v += v_i * 0.1 * dt;
-    //v -= 0.01 * p * dt;
-    if p.x > 1.0 {{ p.x = -1.0; }} else if p.x < -1.0 {{ p.x = 1.0; }}
-    if p.y > 1.0 {{ p.y = -1.0; }} else if p.y < -1.0 {{ p.y = 1.0; }}
-
-    v *= pow(0.1, dt);
-
-    p += v * dt;// / {HASH_TEXTURE_SIZE}.0 * 512.0;
-    return vec4<f32>(p, v);
-}}
-
 struct VertexInput {{
-    //@location(0) position: vec2<f32>,
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
 }}
@@ -836,14 +537,12 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
     return in.color;
 }}
 
-");
+"
+        );
         dbgc!(RADIUS_CLIP_SPACE);
 
         let render_pipeline;
-        let update_pipeline;
         let fill_pipeline;
-        let hash_pipeline;
-        let debug_hash_pipeline;
         {
             let fragment_vertex_shader: wgpu::ShaderModule =
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -876,48 +575,6 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                 entry_point: "vs_fill",
                 buffers: &[Vertex::desc()],
             };
-
-            debug_hash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Debug Hash Pipeline"),
-                layout,
-                vertex: vertex_fill.clone(),
-                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
-                depth_stencil: None,
-                multisample,
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_vertex_shader,
-                    entry_point: "fs_debug_hash",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview: None,
-            });
-
-            hash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Hash Pipeline"),
-                layout,
-                vertex: wgpu::VertexState {
-                    module: &fragment_vertex_shader,
-                    entry_point: "vs_hash",
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_vertex_shader,
-                    entry_point: "fs_hash",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba32Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: make_primitive(wgpu::PrimitiveTopology::PointList),
-                depth_stencil: None,
-                multisample,
-                multiview: None,
-            });
 
             render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Render Pipeline"),
@@ -959,73 +616,6 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                 multisample,
                 multiview: None,
             });
-            update_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Update Pipeline"),
-                layout,
-                vertex: vertex_fill.clone(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_vertex_shader,
-                    entry_point: "fs_update",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba32Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
-                depth_stencil: None,
-                multisample,
-                multiview: None,
-            });
-        }
-
-        let hash_bundles: [_; 2];
-        let update_bundles: [_; 2];
-        {
-            hash_bundles = hash_bind_groups
-                .iter()
-                .map(|hash_bind_group| {
-                    let mut hash_pass =
-                        device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
-                            label: Some("Hash Bundle Encoder"),
-                            color_formats: &[Some(wgpu::TextureFormat::Rgba32Float)],
-                            depth_stencil: None,
-                            sample_count: 1,
-                            multiview: None,
-                        });
-                    hash_pass.set_pipeline(&hash_pipeline);
-                    hash_pass.set_bind_group(0, hash_bind_group, &[]);
-                    hash_pass.draw(0..NUM_POINTS, 0..1);
-                    hash_pass.finish(&wgpu::RenderBundleDescriptor {
-                        label: Some("Hash Pass Bundle"),
-                    })
-                })
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap();
-            update_bundles = bind_groups
-                .iter()
-                .map(|bind_group| {
-                    let mut update_pass =
-                        device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
-                            label: Some("Update Bundle Encoder"),
-                            color_formats: &[Some(wgpu::TextureFormat::Rgba32Float)],
-                            depth_stencil: None,
-                            sample_count: 1,
-                            multiview: None,
-                        });
-
-                    update_pass.set_pipeline(&update_pipeline);
-                    update_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                    update_pass.set_bind_group(0, bind_group, &[]);
-                    update_pass.draw(0..num_vertices, 0..1);
-                    update_pass.finish(&wgpu::RenderBundleDescriptor {
-                        label: Some("Update Pass Bundle"),
-                    })
-                })
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap();
         }
 
         // init state
@@ -1067,28 +657,16 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             size,
             window,
             render_pipeline,
-            update_pipeline,
-            hash_pipeline,
-            debug_hash_pipeline,
             vertex_buffer,
             num_vertices,
             bind_groups,
-            hash_bind_groups,
-            point_texture_views,
-            hash_texture_views,
             #[cfg(not(target_arch = "wasm32"))]
             last_print: Instant::now(),
             frame: 0,
             sim_params,
-            update_bundles,
-            hash_bundles,
-            render_tris: true,
-            use_render_bundles: false,
-            use_cpu: true,
             point_read_buffer,
             point_write_buffer,
             point_textures,
-            start_sort: false,
             use_simd: true,
         }
     }
@@ -1115,116 +693,7 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
                     label: Some("Encoder"),
                 });
 
-        if !self.use_cpu {
-            for _ in 0..5 {
-                if self.use_render_bundles {
-                    for (((hash_view, view), hash_bundle), update_bundle) in self
-                        .hash_texture_views
-                        .iter()
-                        .zip(self.point_texture_views.iter().rev())
-                        .zip(self.hash_bundles.iter())
-                        .zip(self.update_bundles.iter())
-                    {
-                        let mut hash_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("Hash Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: hash_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.0,
-                                            g: 0.0,
-                                            b: 0.0,
-                                            a: 0.0,
-                                        }),
-                                        store: true,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                            });
-                        hash_pass.execute_bundles(Some(hash_bundle));
-                        drop(hash_pass);
-
-                        let mut update_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("Update Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.0,
-                                            g: 0.0,
-                                            b: 0.0,
-                                            a: 1.0,
-                                        }),
-                                        store: true,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                            });
-                        update_pass.execute_bundles(Some(update_bundle));
-                        drop(update_pass);
-                    }
-                } else {
-                    for (((hash_view, hash_bind_group), view), bind_group) in self
-                        .hash_texture_views
-                        .iter()
-                        .zip(self.hash_bind_groups.iter())
-                        .zip(self.point_texture_views.iter().rev())
-                        .zip(self.bind_groups.iter())
-                    {
-                        let mut hash_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("Hash Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: hash_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.0,
-                                            g: 0.0,
-                                            b: 0.0,
-                                            a: 0.0,
-                                        }),
-                                        store: true,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                            });
-                        hash_pass.set_pipeline(&self.hash_pipeline);
-                        hash_pass.set_bind_group(0, hash_bind_group, &[]);
-                        hash_pass.draw(0..NUM_POINTS, 0..1);
-                        drop(hash_pass);
-
-                        let mut update_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("Update Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.0,
-                                            g: 0.0,
-                                            b: 0.0,
-                                            a: 1.0,
-                                        }),
-                                        store: true,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                            });
-                        update_pass.set_pipeline(&self.update_pipeline);
-                        update_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                        update_pass.set_bind_group(0, bind_group, &[]);
-                        update_pass.draw(0..self.num_vertices, 0..1);
-                        drop(update_pass);
-                    }
-                }
-            }
-        } else {
+        {
             encoder.copy_texture_to_buffer(
                 self.point_textures[0].as_image_copy(),
                 wgpu::ImageCopyBuffer {
@@ -1252,15 +721,10 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             let read_buffer_slice = self.point_read_buffer.slice(..);
             read_buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
             self.device.poll(wgpu::Maintain::Wait);
-            let mut data: Vec<Point> =
+            let mut data: Vec<EulerPoint> =
                 bytemuck::cast_slice(&read_buffer_slice.get_mapped_range()).to_vec();
 
-            update_points(
-                &mut data,
-                &self.sim_params,
-                replace(&mut self.start_sort, false),
-                self.use_simd,
-            );
+            update_points(&mut data, &self.sim_params);
 
             let write_buffer_slice = self.point_write_buffer.slice(..);
             write_buffer_slice.map_async(wgpu::MapMode::Write, |_| ());
@@ -1289,52 +753,27 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             );
         }
 
-        if self.render_tris {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.bind_groups[0], &[]);
-            render_pass.draw(0..(3 * NUM_POINTS), 0..1);
-            drop(render_pass);
-        } else {
-            let mut debug_hash_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Debug Hash Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-            debug_hash_pass.set_pipeline(&self.debug_hash_pipeline);
-            debug_hash_pass.set_bind_group(0, &self.bind_groups[0], &[]);
-            debug_hash_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            debug_hash_pass.draw(0..self.num_vertices, 0..1);
-            drop(debug_hash_pass);
-        }
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    store: true,
+                },
+            })],
+            depth_stencil_attachment: None,
+        });
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.bind_groups[0], &[]);
+        render_pass.draw(0..(3 * NUM_POINTS), 0..1);
+        drop(render_pass);
 
         self.queue.submit(Some(encoder.finish()));
         output.present();
@@ -1365,7 +804,7 @@ const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
 const GRID_RADIUS: f32 = GRID_LEN / 2.0;
 
 #[inline(never)]
-fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool, use_simd: bool) {
+fn update_points(points: &mut [EulerPoint], params: &SimParams) {
     #[inline(always)]
     fn hash_point_pos(px: f32, py: f32) -> (isize, isize) {
         let px = ((px + 1.0) / 2.0).rem_euclid(1.0);
@@ -1379,37 +818,10 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool, us
     }
 
     let relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS] =
-        from_fn(|i| from_fn(|j| params.forces[i + NUM_KINDS * j].force * -0.1));
+        from_fn(|i| from_fn(|j| params.forces[i + NUM_KINDS * j] * -0.1));
 
     let mut spatial_hash: Vec<Vec<u32>> =
         (0..(GRID_SIZE * GRID_SIZE)).map(|_| Vec::new()).collect();
-
-    if sort_points {
-        let mut vecs: Vec<_> = (0..NUM_KINDS).map(|_| Vec::new()).collect();
-        for chunk in points.chunks(NUM_KINDS) {
-            for (i, &point) in chunk.into_iter().enumerate() {
-                vecs[i].push(point);
-            }
-        }
-        for v in &mut vecs {
-            v.sort_by_cached_key(|p| join_coords(hash_point_pos(p.x, p.y)));
-        }
-        let mut iters: Vec<_> = vecs.iter().map(|v| v.iter()).collect();
-        let mut reconstructed = Vec::new();
-        loop {
-            let mut found_some = false;
-            for iter in &mut iters {
-                if let Some(&point) = iter.next() {
-                    found_some = true;
-                    reconstructed.push(point);
-                }
-            }
-            if !found_some {
-                break;
-            }
-        }
-        points.copy_from_slice(&reconstructed);
-    }
 
     let mut outer_group: Vec<u32> = Vec::with_capacity(NUM_POINTS as _);
 
@@ -1421,16 +833,13 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool, us
         for i in 0..NUM_POINTS as usize {
             let p = &points[i];
             let key = join_coords(hash_point_pos(p.x, p.y));
-            //spatial_hash.entry(key).or_default().push(i);
             spatial_hash[key].push(i as u32);
         }
 
         let dt = 0.05;
 
         let grid_size = GRID_SIZE as isize;
-        for (hash_index, inner_group) in spatial_hash.iter().enumerate()
-        //.flat_map(|(i, v)| std::iter::repeat(i).zip(v.iter()))
-        {
+        for (hash_index, inner_group) in spatial_hash.iter().enumerate() {
             outer_group.clear();
 
             for jj in [
@@ -1451,7 +860,7 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool, us
                 outer_group.extend_from_slice(jj);
             }
 
-            evaluate_groups(inner_group, &outer_group, points, relation_lookup, dt, use_simd);
+            evaluate_groups(inner_group, &outer_group, points, relation_lookup, dt);
         }
     }
 }
@@ -1459,10 +868,9 @@ fn update_points(points: &mut [Point], params: &SimParams, sort_points: bool, us
 fn evaluate_groups(
     inner_group: &[u32],
     outer_group: &[u32],
-    points: &mut [Point],
+    points: &mut [EulerPoint],
     relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS],
     dt: f32,
-    _use_simd: bool,
 ) {
     let (outer_remaining, outer_chunks) = as_rchunks::<_, NUM_KINDS>(outer_group);
     for &i in inner_group {
