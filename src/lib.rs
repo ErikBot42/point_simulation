@@ -9,6 +9,8 @@ use winit::{
     window::WindowBuilder,
 };
 
+const DELTA_TIME: f32 = 0.05;
+
 use std::mem::{replace, size_of};
 
 #[derive(Copy, Clone, Debug)]
@@ -22,43 +24,95 @@ struct EulerPoint {
 struct EulerRepr {
     points: Vec<EulerPoint>,
 }
+
+
+// v0 and v1 will be indexed randomly with gather instruction.
+// we want to read x and y simultaneously
+//
+// register(indexes to v0) 
+// -> register(xs), register(ys) 
+// -> reduction 
+// -> single scalar write to v1
+//
+// we can perform two 64 bit gathers and interleave the results.
+// i0, i1, i2, i3
+// i4, i5, i6, i7
+//
+// ->
+// (x0 y0) (x1 y1) (x2 y2) (x3 y3) 
+// (x4 y4) (x5 y5) (x6 y6) (x7 y7)
+// ->
+// x0 x1 x2 x3 x4 x5 x6 x7
+// y0 y1 y2 y3 y4 y5 y6 y7
+//  
+//
+/*
+DEFINE INTERLEAVE_DWORDS(src1[127:0], src2[127:0]) {
+	dst[31:0] := src1[31:0] 
+	dst[63:32] := src2[31:0] 
+	dst[95:64] := src1[63:32] 
+	dst[127:96] := src2[63:32] 
+	RETURN dst[127:0]	
+}
+dst[127:0] := INTERLEAVE_DWORDS(a[127:0], b[127:0])
+dst[255:128] := INTERLEAVE_DWORDS(a[255:128], b[255:128])
+dst[MAX:256] := 0
+
+src1 = x0 y0 x1 y1
+src2 = x4 y5 x6 y6
+
+
+actual order of values is mostly irrelevant
+
+all indices are 32-bit even if elements are 64-bit
+
+-> no need to do interleave tricks with the indexes, just shift upper half (probably specific instruction for this though)
+
+
+
+
+
+
+
+
+ * */
+//
 struct VerletRepr {
-    x0: Vec<f32>,
-    y0: Vec<f32>,
-    x1: Vec<f32>,
-    y1: Vec<f32>,
+    v0: Vec<f32>, // x | y
+    v1: Vec<f32>, // x | y
 }
-fn euler_to_verlet(euler: &EulerRepr, dt: f32) -> VerletRepr {
-    let mut x0 = Vec::new();
-    let mut y0 = Vec::new();
-    let mut x1 = Vec::new();
-    let mut y1 = Vec::new();
-    for point in &euler.points {
-        x0.push(point.x);
-        y0.push(point.y);
-        x1.push(point.x + point.vx * dt);
-        y1.push(point.y + point.vy * dt);
-    }
-    VerletRepr { x0, y0, x1, y1 }
-}
-fn verlet_to_euler(verlet: &VerletRepr, dt: f32) -> EulerRepr {
-    let mut points = Vec::new();
-    for (((&x0, &y0), &x1), &y1) in verlet
-        .x0
-        .iter()
-        .zip(verlet.y0.iter())
-        .zip(verlet.x1.iter())
-        .zip(verlet.y1.iter())
-    {
-        points.push(EulerPoint {
-            x: x0,
-            y: y0,
-            vx: (x1 - x0) / dt,
-            vy: (y1 - y0) / dt,
-        });
-    }
-    todo!()
-}
+
+//fn euler_to_verlet(euler: &EulerRepr, dt: f32) -> VerletRepr {
+//    let mut x0 = Vec::new();
+//    let mut y0 = Vec::new();
+//    let mut x1 = Vec::new();
+//    let mut y1 = Vec::new();
+//    for point in &euler.points {
+//        x0.push(point.x);
+//        y0.push(point.y);
+//        x1.push(point.x + point.vx * dt);
+//        y1.push(point.y + point.vy * dt);
+//    }
+//    VerletRepr { x0, y0, x1, y1 }
+//}
+//fn verlet_to_euler(verlet: &VerletRepr, dt: f32) -> EulerRepr {
+//    let mut points = Vec::new();
+//    for (((&x0, &y0), &x1), &y1) in verlet
+//        .x0
+//        .iter()
+//        .zip(verlet.y0.iter())
+//        .zip(verlet.x1.iter())
+//        .zip(verlet.y1.iter())
+//    {
+//        points.push(EulerPoint {
+//            x: x0,
+//            y: y0,
+//            vx: (x1 - x0) / dt,
+//            vy: (y1 - y0) / dt,
+//        });
+//    }
+//    EulerRepr { points }
+//}
 
 unsafe impl bytemuck::Zeroable for EulerPoint {}
 unsafe impl bytemuck::Pod for EulerPoint {}
@@ -74,18 +128,12 @@ use vertex::{Vertex, VERTICES};
 mod prng;
 mod vertex;
 
-const NUM_POINTS: u32 = 4096; //2048; //128;
-                              //const NUM_POINTS: u32 = 4 * 4096; //128;
+const NUM_POINTS: u32 = 2048; 
 const NUM_KINDS: usize = 8;
-const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
-
-const HASH_TEXTURE_SIZE: u32 = 256; //512;//128;
-
+const HASH_TEXTURE_SIZE: u32 = 256; 
 const RANGE_INDEX: u32 = 8;
-const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
-
 const BETA: f64 = 0.4;
-
+const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
 const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -122,22 +170,11 @@ macro_rules! dbgc {
 
 #[derive(Debug)]
 struct SimParams {
-    dt: f32,
-    r_inner: f32,
-    r_outer: f32,
-    w: f32,
-    kinds: u32,
     forces: Vec<f32>,
 }
 
 impl SimParams {
     fn new() -> SimParams {
-        let dt = 0.01;
-        let kinds = NUM_KINDS as _;
-        let r_inner = 0.02;
-        let r_outer = 0.06;
-        let w = 16.0;
-
         let mut rng;
         //rng = Prng(13);
         cfg_if::cfg_if! {
@@ -154,52 +191,16 @@ impl SimParams {
         printlnc!("seed: {}", rng.0);
 
         SimParams {
-            dt,
-            r_inner,
-            r_outer,
-            w,
-            kinds,
-            forces: (0..kinds * kinds).map(|_| rng.f32(-1.0..1.0)).collect(),
+            forces: (0..NUM_KINDS * NUM_KINDS)
+                .map(|_| rng.f32(-1.0..1.0))
+                .collect(),
         }
     }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub async fn run() {
-    cfg_if::cfg_if! {
-        if #[cfg(target_arch = "wasm32")] {
-            std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-            console_log::init_with_level(log::Level::Warn).expect("Couldn't initialize logger");
-        } else {
-            env_logger::init();
-        }
-    }
-
-    let event_loop = EventLoop::new();
-    let window = WindowBuilder::new()
-        .with_inner_size(winit::dpi::LogicalSize {
-            width: 960,
-            height: 540,
-        })
-        .build(&event_loop)
-        .unwrap();
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        use winit::dpi::PhysicalSize;
-        window.set_inner_size(PhysicalSize::new(450, 400));
-
-        use winit::platform::web::WindowExtWebSys;
-        web_sys::window()
-            .and_then(|win| win.document())
-            .and_then(|doc| {
-                let dst = doc.get_element_by_id("id-thingy")?;
-                let canvas = web_sys::Element::from(window.canvas());
-                dst.append_child(&canvas).ok()?;
-                Some(())
-            })
-            .expect("Couldn't append canvas to document body.");
-    }
+    let (event_loop, window) = window_setup();
 
     let mut state = State::new(window).await;
     event_loop.run(move |event, _, control_flow| match event {
@@ -248,6 +249,48 @@ pub async fn run() {
         _ => {}
     });
 }
+
+fn window_setup() -> (EventLoop<()>, Window) {
+    cfg_if::cfg_if! {
+        if #[cfg(target_arch = "wasm32")] {
+            std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+            console_log::init_with_level(log::Level::Warn).expect("Couldn't initialize logger");
+        } else {
+            env_logger::init();
+        }
+    }
+
+    let event_loop = EventLoop::new();
+    
+    let window_size = winit::dpi::LogicalSize {
+            width: 540,
+            height: 540,
+        };
+    let window = WindowBuilder::new()
+        .with_inner_size(window_size)
+        .with_max_inner_size(window_size)
+        .with_min_inner_size(window_size)
+        .build(&event_loop)
+        .unwrap();
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::dpi::PhysicalSize;
+        window.set_inner_size(PhysicalSize::new(450, 400));
+
+        use winit::platform::web::WindowExtWebSys;
+        web_sys::window()
+            .and_then(|win| win.document())
+            .and_then(|doc| {
+                let dst = doc.get_element_by_id("id-thingy")?;
+                let canvas = web_sys::Element::from(window.canvas());
+                dst.append_child(&canvas).ok()?;
+                Some(())
+            })
+            .expect("Couldn't append canvas to document body.");
+    }
+    (event_loop, window)
+}
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -257,9 +300,6 @@ struct State {
     window: Window,
 
     render_pipeline: wgpu::RenderPipeline,
-
-    vertex_buffer: wgpu::Buffer,
-    num_vertices: u32,
 
     bind_groups: [wgpu::BindGroup; 2],
 
@@ -279,55 +319,23 @@ struct State {
 
 impl State {
     async fn new(window: Window) -> Self {
-        // Limits {
-        //     max_texture_dimension_1d: 2048,
-        //     max_texture_dimension_2d: 2048,
-        //     max_texture_dimension_3d: 256,
-        //     max_texture_array_layers: 256,
-        //     max_bind_groups: 4,
-        //     max_bindings_per_bind_group: 640,
-        //     max_dynamic_uniform_buffers_per_pipeline_layout: 8,
-        //     max_dynamic_storage_buffers_per_pipeline_layout: 0,
-        //     max_sampled_textures_per_shader_stage: 16,
-        //     max_samplers_per_shader_stage: 16,
-        //     max_storage_buffers_per_shader_stage: 0,
-        //     max_storage_textures_per_shader_stage: 0,
-        //     max_uniform_buffers_per_shader_stage: 11,
-        //     max_uniform_buffer_binding_size: 16384,
-        //     max_storage_buffer_binding_size: 0,
-        //     max_vertex_buffers: 8,
-        //     max_buffer_size: 268435456,
-        //     max_vertex_attributes: 16,
-        //     max_vertex_buffer_array_stride: 255,
-        //     min_uniform_buffer_offset_alignment: 256,
-        //     min_storage_buffer_offset_alignment: 256,
-        //     max_inter_stage_shader_components: 60,
-        //     max_compute_workgroup_storage_size: 0,
-        //     max_compute_invocations_per_workgroup: 0,
-        //     max_compute_workgroup_size_x: 0,
-        //     max_compute_workgroup_size_y: 0,
-        //     max_compute_workgroup_size_z: 0,
-        //     max_compute_workgroups_per_dimension: 0,
-        //     max_push_constant_size: 0,
-        // }
-
         let size: winit::dpi::PhysicalSize<u32> = window.inner_size();
         let instance: wgpu::Instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             dx12_shader_compiler: Default::default(),
         });
-        let surface: wgpu::Surface = unsafe { instance.create_surface(&window) }.unwrap();
         dbgc!(instance
             .enumerate_adapters(wgpu::Backends::all())
             .collect::<Vec<_>>());
+        let surface: wgpu::Surface = unsafe { instance.create_surface(&window) }.unwrap();
         let adapter: wgpu::Adapter = instance
             .enumerate_adapters(wgpu::Backends::all())
             .find(|adapter| adapter.is_surface_supported(&surface))
             .unwrap();
         dbgc!(adapter.features());
         dbgc!(adapter.limits());
-        let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
-        limits.max_texture_dimension_2d = 16384;
+
+        let limits = wgpu::Limits::downlevel_webgl2_defaults();
 
         let (device, queue) = adapter
             .request_device(
@@ -442,103 +450,7 @@ impl State {
             .try_into()
             .unwrap();
 
-        let shader_source: String = format!(
-            "
-@group(0) @binding(0) 
-var compute_texture: texture_2d<f32>;
-
-struct FillVertexInput {{
-    @location(0) position: vec2<f32>,
-}}
-struct FillVertexOuput {{
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) pos: vec4<f32>,
-}}
-
-
-@vertex
-fn vs_fill(
-    in: FillVertexInput
-) -> FillVertexOuput {{
-    var out: FillVertexOuput;
-    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
-    out.pos = vec4<f32>(in.position, 0.0, 1.0);
-    return out;
-}}
-
-@fragment
-fn fs_fill(
-    in: FillVertexOuput,
-) -> @location(0) vec4<f32> {{
-    let c: f32 = in.pos.x;
-    return vec4<f32>(c, sin(c * ({NUM_POINTS}.0 + 1.9008)), 0.0, 0.0);
-}}
-
-struct VertexInput {{
-    @builtin(vertex_index) vertex_index: u32,
-    @builtin(instance_index) instance_index: u32,
-}}
-
-struct VertexOutput {{
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) group: u32,
-}};
-
-struct VertexOutputMain {{
-    @builtin(position) clip_position: vec4<f32>,
-    @location(1) color: vec4<f32>,
-}};
-
-@vertex
-fn vs_main(
-    in: VertexInput,
-) -> VertexOutputMain {{
-    var out: VertexOutputMain;
-
-    let group = in.vertex_index / 3u;
-    let member = in.vertex_index % 3u;
-    
-    var offset: vec2<f32>;
-
-    switch member {{
-        case 0u: {{
-            offset = vec2<f32>(sqrt(3.0) / 2.0, -0.5);
-        }}
-        case 1u: {{
-            offset = vec2<f32>(0.0, 1.0);
-        }}
-        case 2u, default: {{
-            offset = vec2<f32>(-sqrt(3.0) / 2.0, -0.5);
-        }}
-    }}
-    offset *= 0.8 * {INNER_RADIUS_CLIP_SPACE};//3.0/{HASH_TEXTURE_SIZE}.0;
-
-    let a = textureLoad(compute_texture, vec2<u32>(group, 0u), 0);
-
-    offset += a.xy;
-
-    let q = fract(f32(group) / {NUM_KINDS}.0);
-    let u = q * 1.0 * 3.141592;
-    let w = (1.0 / 3.0) * 2.0 * 3.241592;
-    let color = vec4<f32>(
-        pow(sin(u + 0.0 * w), 4.0),
-        pow(sin(u + 1.0 * w), 4.0),
-        pow(sin(u + 2.0 * w), 4.0),
-        1.0
-    );
-    out.color = color;
-
-    out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
-    return out;   
-}}
-
-@fragment
-fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
-    return in.color;
-}}
-
-"
-        );
+        let shader_source: String = include_str!("shader.wgsl").to_owned();
         dbgc!(RADIUS_CLIP_SPACE);
 
         let render_pipeline;
@@ -657,8 +569,6 @@ fn fs_main(in: VertexOutputMain) -> @location(0) vec4<f32> {{
             size,
             window,
             render_pipeline,
-            vertex_buffer,
-            num_vertices,
             bind_groups,
             #[cfg(not(target_arch = "wasm32"))]
             last_print: Instant::now(),
@@ -1051,69 +961,73 @@ fn evaluate_groups(
 }
 
 use core::arch::x86_64::*;
-#[inline(always)]
-unsafe fn mul(a: __m256, b: __m256) -> __m256 {
-    _mm256_mul_ps(a, b)
-}
-#[inline(always)]
-unsafe fn add(a: __m256, b: __m256) -> __m256 {
-    _mm256_add_ps(a, b)
-}
-#[inline(always)]
-unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
-    _mm256_and_si256(a, b)
-}
-#[inline(always)]
-unsafe fn andn(a: __m256, b: __m256) -> __m256 {
-    _mm256_andnot_ps(a, b)
-}
-#[inline(always)]
-unsafe fn sub(a: __m256, b: __m256) -> __m256 {
-    _mm256_sub_ps(a, b)
-}
-#[inline(always)]
-unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
-    _mm256_fmadd_ps(a, b, c)
-}
-#[inline(always)]
-unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
-    _mm256_i32gather_ps::<SCALE>(p, indexes)
-}
-#[inline(always)]
-unsafe fn rsqrt(a: __m256) -> __m256 {
-    _mm256_rsqrt_ps(a)
-}
-#[inline(always)]
-unsafe fn splat(a: f32) -> __m256 {
-    _mm256_set1_ps(a)
-}
-#[inline(always)]
-unsafe fn splati(a: i32) -> __m256i {
-    _mm256_set1_epi32(a)
-}
-#[inline(always)]
-unsafe fn max(a: __m256, b: __m256) -> __m256 {
-    _mm256_max_ps(a, b)
-}
-#[inline(always)]
-unsafe fn min(a: __m256, b: __m256) -> __m256 {
-    _mm256_min_ps(a, b)
-}
-#[inline(always)]
-unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i {
-    _mm256_slli_epi32::<IMM>(a)
-}
-
-fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
-    unsafe fn as_chunks_unchecked<T, const N: usize>(s: &[T]) -> &[[T; N]] {
-        let new_len = s.len() / N;
-        unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), new_len) }
+use simd::*;
+mod simd {
+    use core::arch::x86_64::*;
+    #[inline(always)]
+    pub unsafe fn mul(a: __m256, b: __m256) -> __m256 {
+        _mm256_mul_ps(a, b)
     }
-    assert!(N != 0, "chunk size must be non-zero");
-    let len = this.len() / N;
-    let (remainder, multiple_of_n) = this.split_at(this.len() - len * N);
-    // SAFETY: We already panicked for zero, and ensured by construction
-    // that the length of the subslice is a multiple of N.
-    let array_slice = unsafe { as_chunks_unchecked(multiple_of_n) };
-    (remainder, array_slice)
+    #[inline(always)]
+    pub unsafe fn add(a: __m256, b: __m256) -> __m256 {
+        _mm256_add_ps(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_and_si256(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn andn(a: __m256, b: __m256) -> __m256 {
+        _mm256_andnot_ps(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn sub(a: __m256, b: __m256) -> __m256 {
+        _mm256_sub_ps(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fmadd_ps(a, b, c)
+    }
+    #[inline(always)]
+    pub unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
+        _mm256_i32gather_ps::<SCALE>(p, indexes)
+    }
+    #[inline(always)]
+    pub unsafe fn rsqrt(a: __m256) -> __m256 {
+        _mm256_rsqrt_ps(a)
+    }
+    #[inline(always)]
+    pub unsafe fn splat(a: f32) -> __m256 {
+        _mm256_set1_ps(a)
+    }
+    #[inline(always)]
+    pub unsafe fn splati(a: i32) -> __m256i {
+        _mm256_set1_epi32(a)
+    }
+    #[inline(always)]
+    pub unsafe fn max(a: __m256, b: __m256) -> __m256 {
+        _mm256_max_ps(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn min(a: __m256, b: __m256) -> __m256 {
+        _mm256_min_ps(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i {
+        _mm256_slli_epi32::<IMM>(a)
+    }
+
+    pub fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
+        unsafe fn as_chunks_unchecked<T, const N: usize>(s: &[T]) -> &[[T; N]] {
+            let new_len = s.len() / N;
+            unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), new_len) }
+        }
+        assert!(N != 0, "chunk size must be non-zero");
+        let len = this.len() / N;
+        let (remainder, multiple_of_n) = this.split_at(this.len() - len * N);
+        // SAFETY: We already panicked for zero, and ensured by construction
+        // that the length of the subslice is a multiple of N.
+        let array_slice = unsafe { as_chunks_unchecked(multiple_of_n) };
+        (remainder, array_slice)
+    }
 }
