@@ -1,5 +1,12 @@
 #![feature(portable_simd)]
-
+use std::marker::PhantomData;
+use std::mem::{replace, size_of, swap};
+use std::ops::Add;
+use std::ops::AddAssign;
+use std::ops::Deref;
+use std::ops::DerefMut;
+use std::ops::Index;
+use std::ops::IndexMut;
 use wgpu::util::DeviceExt;
 use wgpu::SurfaceError;
 use winit::window::Window;
@@ -9,9 +16,18 @@ use winit::{
     window::WindowBuilder,
 };
 
-const DELTA_TIME: f32 = 0.05;
+const CELLS_X: u16 = 128;
+const CELLS_Y: u16 = 128;
+const CELLS: u16 = CELLS_X * CELLS_Y;
+const DT: f32 = 0.05; // TODO: define max speed/max dt from cell size.
+fn compute_cell(x: f32, y: f32) -> Cid {
+    // x in 0_f32..1_f32
+    // y in 0_f32..1_f32
 
-use std::mem::{replace, size_of};
+    let cell_x = ((x * CELLS_X as f32) as u16).min(CELLS_X);
+    let cell_y = ((y * CELLS_Y as f32) as u16).min(CELLS_Y);
+    Cid(cell_x + cell_y * CELLS_X)
+}
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -21,17 +37,15 @@ struct EulerPoint {
     vx: f32,
     vy: f32,
 }
-struct EulerRepr {
-    points: Vec<EulerPoint>,
-}
-
+unsafe impl bytemuck::Zeroable for EulerPoint {}
+unsafe impl bytemuck::Pod for EulerPoint {}
 
 // v0 and v1 will be indexed randomly with gather instruction.
 // we want to read x and y simultaneously
 //
-// register(indexes to v0) 
-// -> register(xs), register(ys) 
-// -> reduction 
+// register(indexes to v0)
+// -> register(xs), register(ys)
+// -> reduction
 // -> single scalar write to v1
 //
 // we can perform two 64 bit gathers and interleave the results.
@@ -39,20 +53,20 @@ struct EulerRepr {
 // i4, i5, i6, i7
 //
 // ->
-// (x0 y0) (x1 y1) (x2 y2) (x3 y3) 
+// (x0 y0) (x1 y1) (x2 y2) (x3 y3)
 // (x4 y4) (x5 y5) (x6 y6) (x7 y7)
 // ->
 // x0 x1 x2 x3 x4 x5 x6 x7
 // y0 y1 y2 y3 y4 y5 y6 y7
-//  
+//
 //
 /*
 DEFINE INTERLEAVE_DWORDS(src1[127:0], src2[127:0]) {
-	dst[31:0] := src1[31:0] 
-	dst[63:32] := src2[31:0] 
-	dst[95:64] := src1[63:32] 
-	dst[127:96] := src2[63:32] 
-	RETURN dst[127:0]	
+    dst[31:0] := src1[31:0]
+    dst[63:32] := src2[31:0]
+    dst[95:64] := src1[63:32]
+    dst[127:96] := src2[63:32]
+    RETURN dst[127:0]
 }
 dst[127:0] := INTERLEAVE_DWORDS(a[127:0], b[127:0])
 dst[255:128] := INTERLEAVE_DWORDS(a[255:128], b[255:128])
@@ -69,53 +83,597 @@ all indices are 32-bit even if elements are 64-bit
 -> no need to do interleave tricks with the indexes, just shift upper half (probably specific instruction for this though)
 
 
+avaliable shuffling instructions:
+
+_mm256_blend_ps/vblendps ymm, ymm, ymm, imm8: (0.33/0.33, 1*p015)
+select based on imm8 between two registers. essentially just a mask operation
+this but variable exists but is high latency
+
+_mm256_permute_ps/vpermilps ymm, ymm, imm8: (1.0/1.0, 1*p5)
+within each 128-bit group, perform arbitrary permute.
+
+_mm256_permutevar8x32_ps/vpermps ymm, ymm, ymm: (1.0/1.0, 1*p5)
+generic 32-bit shuffle based on dynamic 32-bit indexes.
+
+strategies:
+circular shift r1 by 1 and use blend ops to produce reg with xs and ys
+
+x0 y0 x1 y1 x2 y2 x3 y3
+x4 y4 x5 y5 x6 y6 x7 y7
+
+x0    x1    x2    x3
+   y0    y1    y2    y3
+
+x4    x5    x6    x7
+   y4    y5    y6    y7
+
+x0    x1    x2    x3
+y0    y1    y2    y3
+
+   x4    x5    x6    x7
+   y4    y5    y6    y7
+
+x0 x4 x1 x5 x2 x6 x3 x7
+y0 y4 y1 y5 y2 y6 y3 y7
+
+x0 y0 x1 y1 x2 y2 x3 y3
+x4 y4 x5 y5 x6 y6 x7 y7
+
+x0 x1 x2 x3 x4 x5 x6 x7
+y0 y1 y2 y3 y4 y5 y6 y7
+
+x0 y0 x1 y1 x2 y2 x3 y3
+x4 y4 x5 y5 x6 y6 x7 y7
+
+x0 x2 x4 x6 y0 y2 y4 y6
+x1 x3 x5 x7 y1 y3 y5 y7
+-> deinterleave ->
+x0 x1 x2 x3 x4 x5 x6 x7
+y0 y1 y2 y3 y4 y5 y6 y7
+
+instead of doing a gather:
+just store point *type* and xy location. ids no longer matter. access pattern will be ideal since writes after accumulation will be localized.
+
+It may be possible to embed type in the point itself (trade mem with compute).
+An open question now is if AoS or SoA should be used. => num points and point types can be dynamic.
+
+IEEE-754 32 bit floats:
+1 bit sign
+8 bit exponent
+23 bit fraction
+
+only one time bounds check calculations care about the actual play-field.
+
+sign, exponent:
+in 0-1:
+0, [0, 127] -> 2 bits unused
+
+in 1-2:
+0, [127, 128] -> 8 bits of information unused, 7 relatively packed.
+
+in 2-4:
+0, [128, 129] -> 6 packed unused bits -> 32 point types, 12 total -> 4096 types.
+
+
+16-bit fixed point:
+0.0 (0) <-> 1.0 (65535)
+This produces 512 possible points within a cell in a 128x128 grid.
+
+expand/compress to f32?
+fast sqrt needed for distance calc.
 
 
 
+spatial hash -> linear:
+
+struct IterationInfo {
+    neighborhood: &[(T;T)],
+    this: &[(T;T)]
+}
 
 
+hash table strategies:
+
+I want to scale to 65536 points, with a 128x128 grid.
+assume 8 bytes per point/object (2 floats).
+
+naive preallocate:
+2d linear array where each cell has a 65536 element vector => 1 GiB + a bunch of associativity conflicts.
+
+paper 1: https://www.researchgate.net/publication/277870601
+A Hash Table Construction Algorithm for Spatial Hashing Based on Linear
+Memory
+
+calc cell for each point.
+struct Cell {
+    points: usize,
+    start: usize,
+    end: usize,
+}
+
+all point data is then stored in an array.
+
+
+improvement to paper 1:
+use a Csr
+
+struct SpaceHash {
+    counts: Vec<usize>, // # = |cells|
+    indexes: Vec<usize> // # = |cells|
+    data: Vec<T>,
+}
+// given original constraints
+struct SpaceHash {
+    counts: Vec<u16>, // # = |cells|
+    indexes: Vec<u16> // # = |cells|
+    data: Vec<(f32, f32)>,
+}
+MEM(n) = cells * 4 + points * 8
+scratch(n) = points * 10
+
+this can be improved by replacing counts with indexes in a single pass
+struct SpaceHash {
+    counts_or_indexes: Vec<u16>, // # = |cells|
+    data: Vec<(f32, f32)>,
+}
+MEM(n) = cells * 2 + points * 8
+scratch(n) = points * 10
+
+
+still need a 2 step process though.
+
+benefit of a Csr style is that SIMD ops can be more linear
+
+dumping all of this into a linearly processable array is trivial
+
+(aaaaaBBBBcccccc
+ddd(EEE)fffff
+ggggHHHiiiii)
+kkkkLLLLmmmm
+
+the linearly processable array will use 3x the memory though
+
+
+problem: linear processable array wastes memory
+solution: write backwards if enough space
+
+aaaAAAaaa
+bbbBBBbbb // clear and start writing eeee backwards
+cccCCCccc
+dddDDDddd
+
+
+TODO: persistent counts and use same count for both pairs of the iteration? - do later maybe
+
+
+the buffer would need to be |points| * 4 length, but that should be fine.
+
+
+Store separate buffers for x and y, deinterleave requires a ton of needless instructions.
+It may be beneficial to offset the allocations of the x and y buffers so there are no cache conflicts between them when iterating linearly.
+
+TODO: need previous position somehow
 
  * */
 //
-struct VerletRepr {
-    v0: Vec<f32>, // x | y
-    v1: Vec<f32>, // x | y
+//
+// TODO: maybe merge position and kind for ideal cache properties.
+// TODO: make this allocation clever and external.
+/*
+// spacehash_indexes -> tmpstate -> spacehash_counts -> spacehash_indexes
+struct SpaceHash {
+    counts_or_indexes: Vec<u16>, // |cells|
+    data_x: Vec<f32>,            // |points|
+    data_y: Vec<f32>,            // |points|
+    data_prev_x: Vec<f32>,       // |points|
+    data_prev_y: Vec<f32>,       // |points|
+    kind: Vec<u8>,               // |points|
+}
+struct TmpState {
+    cell: Vec<u16>,              // |points|
+    data_x: Vec<f32>,            // |points|
+    data_y: Vec<f32>,            // |points|
+    data_prev_x: Vec<f32>,       // |points|
+    data_prev_y: Vec<f32>,       // |points|
+    kind: Vec<u8>,               // |points|
+}
+*/
+
+// if we keep indexes into the previous iteration instead:
+struct SpaceHash {
+    counts_or_indexes: Vec<u16>, // |cells|
+    data_x: Vec<f32>,            // |points|
+    data_y: Vec<f32>,            // |points|
+    prev_data_x: Vec<f32>,       // |points|
+    prev_data_y: Vec<f32>,       // |points|
+    kind: Vec<u8>,               // |points|
+}
+struct TmpState {
+    cell: Vec<u16>, // |points|
 }
 
-//fn euler_to_verlet(euler: &EulerRepr, dt: f32) -> VerletRepr {
-//    let mut x0 = Vec::new();
-//    let mut y0 = Vec::new();
-//    let mut x1 = Vec::new();
-//    let mut y1 = Vec::new();
-//    for point in &euler.points {
-//        x0.push(point.x);
-//        y0.push(point.y);
-//        x1.push(point.x + point.vx * dt);
-//        y1.push(point.y + point.vy * dt);
-//    }
-//    VerletRepr { x0, y0, x1, y1 }
-//}
-//fn verlet_to_euler(verlet: &VerletRepr, dt: f32) -> EulerRepr {
-//    let mut points = Vec::new();
-//    for (((&x0, &y0), &x1), &y1) in verlet
-//        .x0
-//        .iter()
-//        .zip(verlet.y0.iter())
-//        .zip(verlet.x1.iter())
-//        .zip(verlet.y1.iter())
-//    {
-//        points.push(EulerPoint {
-//            x: x0,
-//            y: y0,
-//            vx: (x1 - x0) / dt,
-//            vy: (y1 - y0) / dt,
-//        });
-//    }
-//    EulerRepr { points }
-//}
+// the randomly generated parts of the simulation
+struct SimulationInputEuler {
+    x: Pbox<f32>,
+    y: Pbox<f32>,
+    vx: Pbox<f32>,
+    vy: Pbox<f32>,
+    k: Pbox<u8>,
+    relation_table: Box<[f32; KINDS2]>,
+}
+struct SimulationInputVerlet {
+    x0: Pbox<f32>,
+    y0: Pbox<f32>,
+    x1: Pbox<f32>,
+    y1: Pbox<f32>,
+    k: Pbox<u8>,
+    relation_table: Box<[f32; KINDS2]>,
+}
+impl SimulationInputEuler {
+    fn new() -> SimulationInputEuler {
+        let mut rng = Prng(3141592);
+        let xy_range = 0.0..1.0;
+        let v_range = -1.0..1.0;
+        fn iter_alloc<T: std::fmt::Debug, const SIZE: usize, F: FnMut() -> T>(
+            mut f: F,
+        ) -> Box<[T; SIZE]> {
+            (0..SIZE)
+                .map(|_| f())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap()
+        }
 
-unsafe impl bytemuck::Zeroable for EulerPoint {}
-unsafe impl bytemuck::Pod for EulerPoint {}
+        SimulationInputEuler {
+            x: iter_alloc(|| rng.f32(xy_range.clone())).into(),
+            y: iter_alloc(|| rng.f32(xy_range.clone())).into(),
+            vx: iter_alloc(|| rng.f32(v_range.clone())).into(),
+            vy: iter_alloc(|| rng.f32(v_range.clone())).into(),
+            k: iter_alloc(|| rng.u8(NUM_KINDS as u8)).into(),
+            relation_table: iter_alloc(|| rng.f32(-1.0..1.0)),
+        }
+    }
+    fn verlet(self) -> SimulationInputVerlet {
+        let x1 = self.x;
+        let y1 = self.y;
+        let mut x0 = self.vx;
+        let mut y0 = self.vy;
+        for (((x0, y0), x1), y1) in x1
+            .iter()
+            .zip(y1.iter())
+            .zip(x0.iter_mut())
+            .zip(y0.iter_mut())
+        {
+            (*x1, *y1) = (x0 + *x1 * DT, y0 + *y1 * DT);
+        }
+        SimulationInputVerlet {
+            x0,
+            y0,
+            x1,
+            y1,
+            k: self.k,
+            relation_table: self.relation_table,
+        }
+    }
+}
+
+macro_rules! index_wrap {
+    ($name:ident, $index:ty, $doc:expr) => {
+        #[doc = $doc]
+        #[derive(Copy, Clone, Default, Debug)]
+        struct $name($index);
+        impl From<$name> for usize {
+            fn from(value: $name) -> usize {
+                value.0 as _
+            }
+        }
+        impl From<usize> for $name {
+            fn from(value: usize) -> $name {
+                $name(value as _)
+            }
+        }
+        impl AddAssign<$name> for $name {
+            fn add_assign(&mut self, other: Self) {
+                self.0 += other.0;
+            }
+        }
+        impl Add<$name> for $name {
+            type Output = Self;
+            fn add(self, rhs: Self) -> Self {
+                Self(self.0 + rhs.0)
+            }
+        }
+    };
+}
+index_wrap!(Pid, u16, "Point index");
+index_wrap!(Cid, u16, "Cell index");
+#[derive(Debug)]
+struct Tb<I, T, const SIZE: usize>(Box<[T; SIZE]>, PhantomData<I>);
+impl<I, T, const SIZE: usize> From<Box<[T; SIZE]>> for Tb<I, T, SIZE> {
+    fn from(value: Box<[T; SIZE]>) -> Tb<I, T, SIZE> {
+        Tb(value, PhantomData)
+    }
+}
+
+impl<I, T, const SIZE: usize> Deref for Tb<I, T, SIZE> {
+    type Target = Box<[T; SIZE]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<I, T, const SIZE: usize> DerefMut for Tb<I, T, SIZE> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl<I: Into<usize>, T, const SIZE: usize> Index<I> for Tb<I, T, SIZE> {
+    type Output = T;
+    fn index(&self, index: I) -> &Self::Output {
+        &self.0[index.into()]
+    }
+}
+impl<I: Into<usize>, T, const SIZE: usize> IndexMut<I> for Tb<I, T, SIZE> {
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        &mut self.0[index.into()]
+    }
+}
+type Pbox<T> = Tb<Pid, T, NUM_POINTS_U>;
+type Cbox<T> = Tb<Cid, T, CELLS_PLUS_1_U>;
+
+const NUM_POINTS_U: usize = NUM_POINTS as usize;
+const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
+const KINDS2: usize = NUM_KINDS as usize * NUM_KINDS as usize;
+/// Entire state of the simulation
+struct SimulationState {
+    /// x value for previous position (shuffled)
+    /// overwritten during update.
+    x_old: Pbox<f32>,
+    /// y value for previous position (shuffled)
+    /// overwritten during update.
+    y_old: Pbox<f32>,
+
+    /// x value for new position
+    x_new: Pbox<f32>,
+    /// y value for new position
+    y_new: Pbox<f32>,
+
+    /// scratch space for x position
+    x_tmp: Pbox<f32>,
+    /// scratch space for y position
+    y_tmp: Pbox<f32>,
+
+    /// point kind (not shuffled)
+    k_old: Pbox<u8>,
+    /// New point kind scratch space.
+    k_new: Pbox<u8>,
+
+    /// Map new indexes to old indexes.
+    back: Pbox<Pid>,
+
+    /// Scratch space for x position of surrounding points.
+    surround_buffer_x: Vec<f32>,
+    /// Scratch space for y position of surrounding points.
+    surround_buffer_y: Vec<f32>,
+    /// Scratch space for kind of surrounding points.
+    surround_buffer_k: Vec<u8>,
+
+    /// What cell the new points belong to.
+    point_cell_location: Pbox<Cid>,
+    /// What number the point has in the cell.
+    point_cell_offset: Pbox<Pid>,
+    /// How many old points are in a cell OR
+    /// what index into the old point buffer this cell has.
+    cell_count_or_index: Cbox<Pid>,
+    /// How many new points are in a cell OR
+    /// what index into the new point buffer this cell has.
+    cell_count_or_index_new: Cbox<Pid>,
+    /// Mapping kinds to amount of attraction.
+    relation_table: Box<[f32; KINDS2]>,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct GpuPoint {
+    x: f32,
+    y: f32,
+    k: u32,
+    _unused: u32,
+}
+unsafe impl bytemuck::Zeroable for GpuPoint {}
+unsafe impl bytemuck::Pod for GpuPoint {}
+
+fn calloc<T: Default, const SIZE: usize, O>() -> O
+where
+    O: From<Box<[T; SIZE]>>,
+{
+    O::from(unsafe {
+        (0..SIZE)
+            .map(|_| T::default())
+            .collect::<Vec<T>>()
+            .try_into()
+            .unwrap_unchecked()
+    })
+}
+impl SimulationState {
+    fn new(input: SimulationInputVerlet) -> Self {
+        let SimulationInputVerlet {
+            x0,
+            y0,
+            x1,
+            y1,
+            k,
+            relation_table,
+        } = input;
+        let mut this = Self {
+            x_old: x0,
+            y_old: y0,
+            x_new: calloc(),
+            y_new: calloc(),
+            x_tmp: calloc(),
+            y_tmp: calloc(),
+            k_old: k,
+            k_new: calloc(),
+            back: calloc(),
+            surround_buffer_x: Vec::new(),
+            surround_buffer_y: Vec::new(),
+            surround_buffer_k: Vec::new(),
+            point_cell_location: calloc(),
+            point_cell_offset: calloc(),
+            cell_count_or_index: calloc(),
+            cell_count_or_index_new: calloc(),
+            relation_table,
+        };
+        for i in (0..NUM_POINTS_U).map(Into::into) {
+            let x_next = x1[i];
+            let y_next = y1[i];
+            let new_cell = compute_cell(x_next, y_next);
+            this.point_cell_location[i] = new_cell;
+            let new_offset = this.cell_count_or_index_new[new_cell];
+            this.cell_count_or_index_new[new_cell] += 1.into();
+            this.point_cell_offset[i] = new_offset;
+            this.x_tmp[i] = x_next;
+            this.y_tmp[i] = y_next;
+        }
+        this
+    }
+    // update starts right after previous physics update to reduce construction size.
+    fn update(&mut self) {
+        // PPA
+        ppa_offset_1(&mut self.cell_count_or_index_new);
+        // Insertion.
+        {
+            for i_old in (0..NUM_POINTS_U).map(Into::into) {
+                let i_new = self.cell_count_or_index_new[self.point_cell_location[i_old]]
+                    + self.point_cell_offset[i_old];
+                self.x_old[i_new] = self.x_tmp[i_old];
+                self.y_old[i_new] = self.y_tmp[i_old];
+                self.k_new[i_new] = self.k_old[i_old];
+                self.back[i_new] = i_old as _;
+            }
+        };
+        // Swapping vectors.
+        swap(&mut self.x_old, &mut self.x_new);
+        swap(&mut self.y_old, &mut self.y_new);
+        swap(&mut self.k_old, &mut self.k_new);
+        swap(
+            &mut self.cell_count_or_index,
+            &mut self.cell_count_or_index_new,
+        );
+
+        // <- at this point state is valid
+
+        self.cell_count_or_index_new
+            .iter_mut()
+            .for_each(|e| *e = 0.into());
+        for cell_y in 0..CELLS_Y {
+            for cell_x in 0..CELLS_X {
+                let cell = Cid(cell_y * CELLS_Y + cell_x);
+                self.surround_buffer_x.clear();
+                self.surround_buffer_y.clear();
+                self.surround_buffer_k.clear();
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let cell = ((((cell_y as i32 + dy + CELLS_Y as i32) % CELLS_Y as i32)
+                            * CELLS_X as i32
+                            + ((cell_x as i32 + dx + CELLS_X as i32) % CELLS_X as i32))
+                            as usize)
+                            .into();
+                        for i in (usize::from(self.cell_count_or_index[cell])
+                            ..usize::from(self.cell_count_or_index[cell + 1.into()]))
+                            .map(Into::into)
+                        {
+                            self.surround_buffer_x.push(self.x_new[i]);
+                            self.surround_buffer_y.push(self.y_new[i]);
+                            self.surround_buffer_k.push(self.k_old[i]);
+                        }
+                    }
+                }
+                for i in (usize::from(self.cell_count_or_index[cell])
+                    ..usize::from(self.cell_count_or_index[cell + 1.into()]))
+                    .map(Into::into)
+                {
+                    let x = self.x_new[i];
+                    let y = self.y_new[i];
+                    let k = self.k_new[i];
+                    let x_prev = self.x_old[self.back[i]];
+                    let y_prev = self.y_old[self.back[i]];
+                    let mut acc_x = 0.0;
+                    let mut acc_y = 0.0;
+                    for ((other_x, other_y), &other_k) in self
+                        .surround_buffer_x
+                        .iter()
+                        .zip(self.surround_buffer_y.iter())
+                        .zip(self.surround_buffer_k.iter())
+                    {
+                        let diff_x = x - other_x;
+                        let diff_y = y - other_y;
+                        let r2 = diff_x * diff_x + diff_y * diff_y;
+
+                        let invr = 1.0 / r2.sqrt();
+
+                        let dx = diff_x * invr;
+                        let dy = diff_y * invr;
+
+                        let force = self.relation_table
+                        [(k as u16 + NUM_KINDS as u16 * other_k as u16) as usize]
+                        * 0.01 // TODO: move DT, this factor into relation table.
+                        * invr
+                        * invr;
+
+                        if dx.is_finite() && dy.is_finite() && force.is_finite() {
+                            acc_x += dx * force;
+                            acc_y += dy * force;
+                        }
+                    }
+                    if !acc_x.is_finite() {
+                        acc_x = 0.0;
+                    }
+                    if !acc_y.is_finite() {
+                        acc_x = 0.0;
+                    }
+                    let x_next = (x + (x - x_prev) * 0.95 + acc_x * DT * DT).rem_euclid(1.0);
+                    let y_next = (y + (y - y_prev) * 0.95 + acc_y * DT * DT).rem_euclid(1.0);
+
+                    {
+                        let new_cell = compute_cell(x_next, y_next);
+                        self.point_cell_location[i] = new_cell;
+                        let new_offset = self.cell_count_or_index_new[new_cell];
+                        self.cell_count_or_index_new[new_cell] += 1.into();
+                        self.point_cell_offset[i] = new_offset;
+                        self.x_tmp[i] = x_next;
+                        self.y_tmp[i] = y_next;
+                    };
+                }
+            }
+        }
+    }
+    fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
+        data.clear();
+        data.extend(
+            self.x_old
+                .iter()
+                .zip(self.y_old.iter())
+                .zip(self.k_old.iter())
+                .map(|((&x, &y), &k)| GpuPoint {
+                    x,
+                    y,
+                    k: k as _,
+                    _unused: 0,
+                }),
+        )
+    }
+}
+
+/// PPA and offset by 1.
+fn ppa_offset_1(cell_count_or_index_new: &mut Cbox<Pid>) {
+    let mut acc: Pid = 0.into();
+    for i in (0..CELLS_PLUS_1_U).map(Into::into) {
+        let curr = cell_count_or_index_new[i];
+        cell_count_or_index_new[i] = acc;
+        acc += curr;
+    }
+}
+
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -128,9 +686,9 @@ use vertex::{Vertex, VERTICES};
 mod prng;
 mod vertex;
 
-const NUM_POINTS: u32 = 2048; 
+const NUM_POINTS: u32 = 2048;
 const NUM_KINDS: usize = 8;
-const HASH_TEXTURE_SIZE: u32 = 256; 
+const HASH_TEXTURE_SIZE: u32 = 256;
 const RANGE_INDEX: u32 = 8;
 const BETA: f64 = 0.4;
 const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
@@ -200,6 +758,8 @@ impl SimParams {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub async fn run() {
+    SimulationState::new(SimulationInputEuler::new().verlet()).update();
+
     let (event_loop, window) = window_setup();
 
     let mut state = State::new(window).await;
@@ -261,11 +821,11 @@ fn window_setup() -> (EventLoop<()>, Window) {
     }
 
     let event_loop = EventLoop::new();
-    
+
     let window_size = winit::dpi::LogicalSize {
-            width: 540,
-            height: 540,
-        };
+        width: 540,
+        height: 540,
+    };
     let window = WindowBuilder::new()
         .with_inner_size(window_size)
         .with_max_inner_size(window_size)
@@ -450,7 +1010,9 @@ impl State {
             .try_into()
             .unwrap();
 
-        let shader_source: String = include_str!("shader.wgsl").to_owned();
+        let shader_source: String = std::fs::read_to_string("src/shader.wgsl").unwrap().replace("{NUM_POINTS}", &format!("{NUM_POINTS}"));
+
+
         dbgc!(RADIUS_CLIP_SPACE);
 
         let render_pipeline;

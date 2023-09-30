@@ -12,5 +12,8 @@ impl Prng {
     pub fn f32(&mut self, r: Range<f32>) -> f32 {
         ((self.next() as u32) as f32 / u32::MAX as f32) * (r.end - r.start) + r.start
     }
+    pub fn u8(&mut self, max: u8) -> u8 {
+        (self.next() % (max as u64)) as u8
+    }
 }
 

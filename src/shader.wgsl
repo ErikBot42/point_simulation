@@ -2,6 +2,16 @@
 @group(0) @binding(0) 
 var compute_texture: texture_2d<f32>;
 
+const NUM_POINTS: f32 = {NUM_POINTS}.0;
+
+struct GpuPoint {
+    x: f32,
+    y: f32,
+    k: u32,
+    _unused: u32,
+}
+
+
 struct FillVertexInput {
     @location(0) position: vec2<f32>,
 }
@@ -24,20 +34,14 @@ fn vs_fill(
 fn fs_fill(
     in: FillVertexOuput,
 ) -> @location(0) vec4<f32> {
-    let num_points: f32 = 2048.0;
     let c: f32 = in.pos.x;
-    return vec4<f32>(c, sin(c * (num_points + 1.9008)), 0.0, 0.0);
+    return vec4<f32>(c, sin(c * (NUM_POINTS + 1.9008)), 0.0, 0.0);
 }
 
 struct VertexInput {
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
 }
-
-//struct VertexOutput {
-//    @builtin(position) clip_position: vec4<f32>,
-//    @location(0) group: u32,
-//};
 
 struct VertexOutputMain {
     @builtin(position) clip_position: vec4<f32>,
