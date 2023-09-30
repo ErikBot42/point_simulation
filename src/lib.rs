@@ -19,14 +19,18 @@ use winit::{
 const CELLS_X: u16 = 128;
 const CELLS_Y: u16 = 128;
 const CELLS: u16 = CELLS_X * CELLS_Y;
-const DT: f32 = 0.05; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.00000; // TODO: define max speed/max dt from cell size.
 fn compute_cell(x: f32, y: f32) -> Cid {
     // x in 0_f32..1_f32
     // y in 0_f32..1_f32
-
     let cell_x = ((x * CELLS_X as f32) as u16).min(CELLS_X);
     let cell_y = ((y * CELLS_Y as f32) as u16).min(CELLS_Y);
-    Cid(cell_x + cell_y * CELLS_X)
+    let cell = cell_x + cell_y * CELLS_X;
+    debug_assert!(
+        cell < CELLS,
+        "{cell} >= CEllS, cell_x: {cell_x}, cell_y: {cell_y}, x: {x}, y: {y}"
+    );
+    Cid(cell)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -428,19 +432,19 @@ const KINDS2: usize = NUM_KINDS as usize * NUM_KINDS as usize;
 struct SimulationState {
     /// x value for previous position (shuffled)
     /// overwritten during update.
-    x_old: Pbox<f32>,
+    x0: Pbox<f32>,
     /// y value for previous position (shuffled)
     /// overwritten during update.
-    y_old: Pbox<f32>,
+    y0: Pbox<f32>,
 
     /// x value for new position
-    x_new: Pbox<f32>,
+    x1: Pbox<f32>,
     /// y value for new position
-    y_new: Pbox<f32>,
+    y1: Pbox<f32>,
 
-    /// scratch space for x position
+    /// scratch space for x position before being put in right spot
     x_tmp: Pbox<f32>,
-    /// scratch space for y position
+    /// scratch space for y position before being put in right spot
     y_tmp: Pbox<f32>,
 
     /// point kind (not shuffled)
@@ -505,10 +509,10 @@ impl SimulationState {
             relation_table,
         } = input;
         let mut this = Self {
-            x_old: x0,
-            y_old: y0,
-            x_new: calloc(),
-            y_new: calloc(),
+            x0,
+            y0,
+            x1: calloc(),
+            y1: calloc(),
             x_tmp: calloc(),
             y_tmp: calloc(),
             k_old: k,
@@ -545,15 +549,15 @@ impl SimulationState {
             for i_old in (0..NUM_POINTS_U).map(Into::into) {
                 let i_new = self.cell_count_or_index_new[self.point_cell_location[i_old]]
                     + self.point_cell_offset[i_old];
-                self.x_old[i_new] = self.x_tmp[i_old];
-                self.y_old[i_new] = self.y_tmp[i_old];
+                self.x0[i_new] = self.x_tmp[i_old];
+                self.y0[i_new] = self.y_tmp[i_old];
                 self.k_new[i_new] = self.k_old[i_old];
                 self.back[i_new] = i_old as _;
             }
         };
         // Swapping vectors.
-        swap(&mut self.x_old, &mut self.x_new);
-        swap(&mut self.y_old, &mut self.y_new);
+        swap(&mut self.x0, &mut self.x1);
+        swap(&mut self.y0, &mut self.y1);
         swap(&mut self.k_old, &mut self.k_new);
         swap(
             &mut self.cell_count_or_index,
@@ -582,8 +586,8 @@ impl SimulationState {
                             ..usize::from(self.cell_count_or_index[cell + 1.into()]))
                             .map(Into::into)
                         {
-                            self.surround_buffer_x.push(self.x_new[i]);
-                            self.surround_buffer_y.push(self.y_new[i]);
+                            self.surround_buffer_x.push(self.x1[i]);
+                            self.surround_buffer_y.push(self.y1[i]);
                             self.surround_buffer_k.push(self.k_old[i]);
                         }
                     }
@@ -592,11 +596,11 @@ impl SimulationState {
                     ..usize::from(self.cell_count_or_index[cell + 1.into()]))
                     .map(Into::into)
                 {
-                    let x = self.x_new[i];
-                    let y = self.y_new[i];
+                    let x = self.x1[i];
+                    let y = self.y1[i];
                     let k = self.k_new[i];
-                    let x_prev = self.x_old[self.back[i]];
-                    let y_prev = self.y_old[self.back[i]];
+                    let x_prev = self.x0[self.back[i]];
+                    let y_prev = self.y0[self.back[i]];
                     let mut acc_x = 0.0;
                     let mut acc_y = 0.0;
                     for ((other_x, other_y), &other_k) in self
@@ -631,8 +635,8 @@ impl SimulationState {
                     if !acc_y.is_finite() {
                         acc_x = 0.0;
                     }
-                    let x_next = (x + (x - x_prev) * 0.95 + acc_x * DT * DT).rem_euclid(1.0);
-                    let y_next = (y + (y - y_prev) * 0.95 + acc_y * DT * DT).rem_euclid(1.0);
+                    let x_next = x_prev.rem_euclid(0.999); //(x+acc_x*0.00001).rem_euclid(0.9999);//let x_next = (x + (x - x_prev) * 0.95 + acc_x * DT * DT).rem_euclid(0.9999);
+                    let y_next = y_prev.rem_euclid(0.999); //(y+acc_y*0.00001).rem_euclid(0.9999);//let y_next = (y + (y - y_prev) * 0.95 + acc_y * DT * DT).rem_euclid(0.9999);
 
                     {
                         let new_cell = compute_cell(x_next, y_next);
@@ -650,9 +654,9 @@ impl SimulationState {
     fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
         data.clear();
         data.extend(
-            self.x_old
+            self.x0
                 .iter()
-                .zip(self.y_old.iter())
+                .zip(self.y0.iter())
                 .zip(self.k_old.iter())
                 .map(|((&x, &y), &k)| GpuPoint {
                     x,
@@ -673,7 +677,6 @@ fn ppa_offset_1(cell_count_or_index_new: &mut Cbox<Pid>) {
         acc += curr;
     }
 }
-
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -758,8 +761,6 @@ impl SimParams {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub async fn run() {
-    SimulationState::new(SimulationInputEuler::new().verlet()).update();
-
     let (event_loop, window) = window_setup();
 
     let mut state = State::new(window).await;
@@ -875,10 +876,16 @@ struct State {
 
     point_read_buffer: wgpu::Buffer,
     point_write_buffer: wgpu::Buffer,
+    simulation_state: SimulationState,
+
+    point_transfer_buffer: Vec<GpuPoint>,
+    gpu_point_buffer: wgpu::Buffer,
 }
 
 impl State {
     async fn new(window: Window) -> Self {
+        let simulation_state = SimulationState::new(SimulationInputEuler::new().verlet());
+
         let size: winit::dpi::PhysicalSize<u32> = window.inner_size();
         let instance: wgpu::Instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -895,7 +902,7 @@ impl State {
         dbgc!(adapter.features());
         dbgc!(adapter.limits());
 
-        let limits = wgpu::Limits::downlevel_webgl2_defaults();
+        let limits = wgpu::Limits::downlevel_defaults(); //downlevel_webgl2_defaults();
 
         let (device, queue) = adapter
             .request_device(
@@ -953,6 +960,14 @@ impl State {
             })
         });
 
+        let mut point_transfer_buffer = Vec::new();
+        simulation_state.serialize_gpu(&mut point_transfer_buffer);
+        let gpu_point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&point_transfer_buffer),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+        });
+
         let point_read_buffer = {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Point Buffer"),
@@ -982,16 +997,28 @@ impl State {
         let bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Bind group layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: Default::default(),
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let bind_groups: [_; 2] = point_texture_views
@@ -1000,18 +1027,28 @@ impl State {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Bind group"),
                     layout: &bind_group_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(point_texture_view),
-                    }],
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(point_texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(
+                                gpu_point_buffer.as_entire_buffer_binding(),
+                            ),
+                        },
+                    ],
                 })
             })
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
 
-        let shader_source: String = std::fs::read_to_string("src/shader.wgsl").unwrap().replace("{NUM_POINTS}", &format!("{NUM_POINTS}"));
-
+        let shader_source: String = std::fs::read_to_string("src/shader.wgsl")
+            .unwrap()
+            .replace("{NUM_POINTS}", &format!("{}", NUM_POINTS))
+            .replace("{NUM_KINDS}", &format!("{}", NUM_KINDS));
 
         dbgc!(RADIUS_CLIP_SPACE);
 
@@ -1140,6 +1177,9 @@ impl State {
             point_write_buffer,
             point_textures,
             use_simd: true,
+            simulation_state,
+            point_transfer_buffer,
+            gpu_point_buffer,
         }
     }
 
@@ -1184,6 +1224,20 @@ impl State {
             );
 
             self.queue.submit(Some(encoder.finish()));
+            self.queue.write_buffer(
+                &self.gpu_point_buffer,
+                0,
+                bytemuck::cast_slice(&self.point_transfer_buffer),
+            );
+            static mut FOO: u8 = 0;
+            if unsafe {
+                FOO = (FOO + 1) % 30;
+                FOO == 0
+            } {
+                self.simulation_state.update();
+            }
+            self.simulation_state
+                .serialize_gpu(&mut self.point_transfer_buffer);
             encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
