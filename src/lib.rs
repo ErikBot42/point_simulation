@@ -478,10 +478,10 @@ struct SimulationState {
 
     point_cell_offset: Pbox<Pid>,
 
+    
     cell_count: Cbox<Pid>,
-
-    cell_index_start: Cbox<Pid>,
-    cell_index_end: Cbox<Pid>,
+    cell_index: Cbox<Pid>,
+    //cell_index_end: Cbox<Pid>,
 
 
     relation_table: Box<[f32; KINDS2]>,
@@ -536,8 +536,7 @@ impl SimulationState {
             point_cell: calloc(),
             point_cell_offset: calloc(),
             cell_count: calloc(),
-            cell_index_start: calloc(),
-            cell_index_end: calloc(),
+            cell_index: calloc(),
             relation_table,
         };
         this.cell_count.iter_mut().for_each(|e| *e = 0.into());
@@ -551,14 +550,13 @@ impl SimulationState {
         }
         let mut acc: Pid = 0.into();
         for i in (0..CELLS_PLUS_1_U).map(Into::into) {
-            this.cell_index_start[i] = acc;
+            this.cell_index[i] = acc;
             let count = this.cell_count[i];
             acc += count;
-            this.cell_index_end[i] = acc;
         }
         for i in (0..NUM_POINTS_U).map(Into::into) {
             let cell = this.point_cell[i];
-            let index = this.cell_index_start[cell] + this.point_cell_offset[i];
+            let index = this.cell_index[cell] + this.point_cell_offset[i];
             this.x0[index] = this.x0_tmp[i];
             this.y0[index] = this.y0_tmp[i];
             this.x1[index] = this.x1_tmp[i];
@@ -597,8 +595,8 @@ impl SimulationState {
                         };
                         let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
 
-                        let range = usize::from(self.cell_index_start[cell])
-                            ..usize::from(self.cell_index_end[cell]);
+                        let range = usize::from(self.cell_index[cell])
+                            ..usize::from(self.cell_index[cell+1.into()]);
                         for i in range.map(Into::into) {
                             self.surround_buffer_x.push(self.x1[i] + offset_x);
                             self.surround_buffer_y.push(self.y1[i] + offset_y);
@@ -606,8 +604,8 @@ impl SimulationState {
                         }
                     }
                 }
-                for i in (usize::from(self.cell_index_start[cell])
-                    ..usize::from(self.cell_index_end[cell]))
+                for i in (usize::from(self.cell_index[cell])
+                    ..usize::from(self.cell_index[cell+1.into()]))
                     .map(Into::into)
                 {
                     let x0 = self.x0[i];
@@ -698,14 +696,13 @@ impl SimulationState {
         }
         let mut acc: Pid = 0.into();
         for i in (0..CELLS_PLUS_1_U).map(Into::into) {
-            self.cell_index_start[i] = acc;
+            self.cell_index[i] = acc;
             let count = self.cell_count[i];
             acc += count;
-            self.cell_index_end[i] = acc;
         }
         for i in (0..NUM_POINTS_U).map(Into::into) {
             let cell = self.point_cell[i];
-            let index = self.cell_index_start[cell] + self.point_cell_offset[i];
+            let index = self.cell_index[cell] + self.point_cell_offset[i];
             self.x0[index] = self.x0_tmp[i];
             self.y0[index] = self.y0_tmp[i];
             self.x1[index] = self.x1_tmp[i];
@@ -1076,12 +1073,14 @@ impl State {
         dbgc!(adapter.limits());
 
         let limits = wgpu::Limits::downlevel_defaults(); //downlevel_webgl2_defaults();
-
+        
+        dbgc!(&limits);
+        println!("Expected points per cell: {}", NUM_POINTS as f32 / CELLS as f32);
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     features: wgpu::Features::empty(),
-                    limits: dbgc!(limits),
+                    limits,
                     label: None,
                 },
                 None,
