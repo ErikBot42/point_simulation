@@ -1,4 +1,5 @@
 #![feature(portable_simd)]
+use std::array::from_fn;
 use std::marker::PhantomData;
 use std::mem::{replace, size_of, swap};
 use std::ops::Add;
@@ -7,6 +8,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ops::Index;
 use std::ops::IndexMut;
+use std::time::Duration;
 use wgpu::util::DeviceExt;
 use wgpu::SurfaceError;
 use winit::window::Window;
@@ -16,10 +18,36 @@ use winit::{
     window::WindowBuilder,
 };
 
-const CELLS_X: u16 = 32;
-const CELLS_Y: u16 = 32;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+use prng::Prng;
+//use vertex::{Vertex, VERTICES};
+
+mod prng;
+mod vertex;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Instant, SystemTime};
+
+const CELLS_X: u16 = 128;
+const CELLS_Y: u16 = 128;
 const CELLS: u16 = CELLS_X * CELLS_Y;
-const DT: f32 = 0.005; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.002; // TODO: define max speed/max dt from cell size.
+const NUM_POINTS_U: usize = NUM_POINTS as usize;
+const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
+const KINDS2: usize = NUM_KINDS as usize * NUM_KINDS as usize;
+const GRID_SIZE: usize = 24;
+const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
+const GRID_RADIUS: f32 = GRID_LEN / 2.0;
+const NUM_POINTS: u32 = 8192;
+const NUM_KINDS: usize = 8;
+const HASH_TEXTURE_SIZE: u32 = 256;
+const RANGE_INDEX: u32 = 8;
+const BETA: f64 = 0.4;
+const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
+const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
+
 fn compute_cell(x: f32, y: f32) -> Cid {
     // x in 0_f32..1_f32
     // y in 0_f32..1_f32
@@ -429,9 +457,6 @@ impl<I: Into<usize>, T, const SIZE: usize> IndexMut<I> for Tb<I, T, SIZE> {
 type Pbox<T> = Tb<Pid, T, NUM_POINTS_U>;
 type Cbox<T> = Tb<Cid, T, CELLS_PLUS_1_U>;
 
-const NUM_POINTS_U: usize = NUM_POINTS as usize;
-const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const KINDS2: usize = NUM_KINDS as usize * NUM_KINDS as usize;
 /// Entire state of the simulation
 struct SimulationState {
     x0: Pbox<f32>,
@@ -554,19 +579,31 @@ impl SimulationState {
                 let cell: Cid = usize::from(cx + cy * CELLS_X).into();
                 self.surround_buffer_x.clear();
                 self.surround_buffer_y.clear();
-                for dx in -1..1 {
-                    for dy in -1..1 {
-                        let cell: Cid = (((CELLS_X as i32 + cx as i32 + dx as i32)
-                            .rem_euclid(CELLS_X as i32)
-                            + ((CELLS_Y as i32 + cy as i32 + dy as i32).rem_euclid(CELLS_Y as i32))
-                                * CELLS_X as i32)
-                            as usize)
-                            .into();
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let cell_x = cx as i32 + dx as i32;
+                        let cell_y = cy as i32 + dy as i32;
+                        let (offset_x, cell_x) = if cell_x == -1 {
+                            (-1.0, CELLS_X as i32 - 1)
+                        } else if cell_x == CELLS_X as i32 {
+                            (1.0, 0)
+                        } else {
+                            (0.0, cell_x)
+                        };
+                        let (offset_y, cell_y) = if cell_y == -1 {
+                            (-1.0, CELLS_Y as i32 - 1)
+                        } else if cell_y == CELLS_Y as i32 {
+                            (1.0, 0)
+                        } else {
+                            (0.0, cell_y)
+                        };
+                        let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
+
                         let range = usize::from(self.cell_index_start[cell])
                             ..usize::from(self.cell_index_end[cell]);
                         for i in range.map(Into::into) {
-                            self.surround_buffer_x.push(self.x1[i]);
-                            self.surround_buffer_y.push(self.y1[i]);
+                            self.surround_buffer_x.push(self.x1[i] + offset_x);
+                            self.surround_buffer_y.push(self.y1[i] + offset_y);
                         }
                     }
                 }
@@ -591,7 +628,7 @@ impl SimulationState {
                         let r = dot.sqrt();
                         let dir_x = dx / r;
                         let dir_y = dy / r;
-                        let f: f32 = 0.01*0.01 / (r*r);
+                        let f: f32 = 0.001 / (r * r);
                         if f.is_finite() && dir_x.is_finite() && dir_y.is_finite() {
                             acc_x += dir_x * f;
                             acc_y += dir_y * f;
@@ -612,11 +649,12 @@ impl SimulationState {
                             vy = c
                         }
                     }
-
-                    acc_x -= 100.0 * vx * vx * vx / (vx.abs() * DT * DT);
-                    acc_y -= 100.0 * vy * vy * vy / (vy.abs() * DT * DT);
-                    //acc_x += 1.0 * vx * (1.0/DT) * (1.0/DT);
-                    //acc_y += 1.0 * vy * (1.0/DT) * (1.0/DT);
+                    let v2 = vx * vx + vy * vy;
+                    let vx_norm = vx / v2.sqrt();
+                    let vy_norm = vy / v2.sqrt();
+                    let friction_force = v2 * (20.0 / (DT * DT));
+                    acc_x += friction_force * (-vx_norm);
+                    acc_y += friction_force * (-vy_norm);
 
                     let new_x = (x1 + vx + acc_x * DT * DT).rem_euclid(0.99999);
                     let new_y = (y1 + vy + acc_y * DT * DT).rem_euclid(0.99999);
@@ -795,28 +833,6 @@ fn ppa_offset_1(cell_count_or_index_new: &mut Cbox<Pid>) {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
-
-use std::array::from_fn;
-
-use prng::Prng;
-use vertex::{Vertex, VERTICES};
-
-mod prng;
-mod vertex;
-
-const NUM_POINTS: u32 = 2048;
-const NUM_KINDS: usize = 8;
-const HASH_TEXTURE_SIZE: u32 = 256;
-const RANGE_INDEX: u32 = 8;
-const BETA: f64 = 0.4;
-const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
-const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
-
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::{Instant, SystemTime};
-
 macro_rules! printlnc {
     ($aa:expr, $bb:expr) => {
         #[cfg(target_arch = "wasm32")]
@@ -941,8 +957,8 @@ fn window_setup() -> (EventLoop<()>, Window) {
     let event_loop = EventLoop::new();
 
     let window_size = winit::dpi::LogicalSize {
-        width: 540,
-        height: 540,
+        width: 512,
+        height: 512,
     };
     let window = WindowBuilder::new()
         .with_inner_size(window_size)
@@ -979,24 +995,47 @@ struct State {
 
     render_pipeline: wgpu::RenderPipeline,
 
-    bind_groups: [wgpu::BindGroup; 2],
-
-    point_textures: [wgpu::Texture; 2],
+    bind_group: wgpu::BindGroup,
 
     #[cfg(not(target_arch = "wasm32"))]
     last_print: Instant,
     frame: usize,
 
-    sim_params: SimParams,
-
     use_simd: bool,
 
-    point_read_buffer: wgpu::Buffer,
-    point_write_buffer: wgpu::Buffer,
     simulation_state: SimulationState,
 
     point_transfer_buffer: Vec<GpuPoint>,
     gpu_point_buffer: wgpu::Buffer,
+}
+
+macro_rules! timed {
+    ($name:expr, $code:block) => {{
+        static mut COUNT: u8 = 0;
+        static mut TIME: Duration = Duration::ZERO;
+        if unsafe {
+            COUNT += 1;
+            COUNT == 120
+        } {
+            println!(
+                "{}: {:?} potential fps, {:?} seconds/update",
+                $name,
+                120.0 / unsafe { TIME }.as_secs_f64(),
+                unsafe { TIME }.as_secs_f64() / 120.0
+            );
+            unsafe {
+                TIME = Duration::ZERO;
+                COUNT = 0;
+            }
+        }
+        let _time_pre: Instant = Instant::now();
+        {
+            $code
+        }
+        unsafe {
+            TIME += Instant::now().duration_since(_time_pre);
+        }
+    }};
 }
 
 impl State {
@@ -1050,32 +1089,6 @@ impl State {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let num_vertices = VERTICES.len() as u32;
-
-        let point_textures: [wgpu::Texture; 2] = from_fn(|_| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Point Texture"),
-                size: wgpu::Extent3d {
-                    width: NUM_POINTS,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba32Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[wgpu::TextureFormat::Rgba32Float],
-            })
-        });
 
         let mut point_transfer_buffer = Vec::new();
         simulation_state.serialize_gpu(&mut point_transfer_buffer);
@@ -1085,82 +1098,31 @@ impl State {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
         });
 
-        let point_read_buffer = {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Point Buffer"),
-                size: NUM_POINTS as u64 * (4 * size_of::<f32>() as u64),
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let point_write_buffer = {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Point Buffer"),
-                size: NUM_POINTS as u64 * (4 * size_of::<f32>() as u64),
-                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
-
-        let point_texture_views: [wgpu::TextureView; 2] = point_textures
-            .iter()
-            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()))
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-
-        let sim_params = SimParams::new();
-
         let bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: Default::default(),
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: Default::default(),
-                        },
-                        count: None,
-                    },
-                ],
+                    count: None,
+                }],
             });
 
-        let bind_groups: [_; 2] = point_texture_views
-            .iter()
-            .map(|point_texture_view| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bind group"),
-                    layout: &bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(point_texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(
-                                gpu_point_buffer.as_entire_buffer_binding(),
-                            ),
-                        },
-                    ],
-                })
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bind group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(
+                    gpu_point_buffer.as_entire_buffer_binding(),
+                ),
+            }],
+        });
 
         let shader_source: String = std::fs::read_to_string("src/shader.wgsl")
             .unwrap()
@@ -1170,7 +1132,6 @@ impl State {
         dbgc!(RADIUS_CLIP_SPACE);
 
         let render_pipeline;
-        let fill_pipeline;
         {
             let fragment_vertex_shader: wgpu::ShaderModule =
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1198,11 +1159,6 @@ impl State {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             };
-            let vertex_fill = wgpu::VertexState {
-                module: &fragment_vertex_shader,
-                entry_point: "vs_fill",
-                buffers: &[Vertex::desc()],
-            };
 
             render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Render Pipeline"),
@@ -1226,55 +1182,6 @@ impl State {
                 multisample,
                 multiview: None,
             });
-            fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Fill Pipeline"),
-                layout,
-                vertex: vertex_fill.clone(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_vertex_shader,
-                    entry_point: "fs_fill",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba32Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
-                depth_stencil: None,
-                multisample,
-                multiview: None,
-            });
-        }
-
-        // init state
-        {
-            let mut fill_encoder: wgpu::CommandEncoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Fill Encoder"),
-                });
-            let mut fill_pass = fill_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Fill Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &point_texture_views[0],
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-            fill_pass.set_pipeline(&fill_pipeline);
-            fill_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            fill_pass.set_bind_group(0, &bind_groups[1], &[]);
-            fill_pass.draw(0..num_vertices, 0..1);
-            drop(fill_pass);
-            queue.submit(Some(fill_encoder.finish()));
         }
 
         Self {
@@ -1285,14 +1192,10 @@ impl State {
             size,
             window,
             render_pipeline,
-            bind_groups,
+            bind_group,
             #[cfg(not(target_arch = "wasm32"))]
             last_print: Instant::now(),
             frame: 0,
-            sim_params,
-            point_read_buffer,
-            point_write_buffer,
-            point_textures,
             use_simd: true,
             simulation_state,
             point_transfer_buffer,
@@ -1315,80 +1218,23 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder: wgpu::CommandEncoder =
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Encoder"),
-                });
-
-        {
-            encoder.copy_texture_to_buffer(
-                self.point_textures[0].as_image_copy(),
-                wgpu::ImageCopyBuffer {
-                    buffer: &self.point_read_buffer,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(size_of::<[f32; 4]>() as u32 * NUM_POINTS),
-                        rows_per_image: Some(1),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: NUM_POINTS,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            self.queue.submit(Some(encoder.finish()));
+        timed!("Update with overhead:", {
             self.queue.write_buffer(
                 &self.gpu_point_buffer,
                 0,
                 bytemuck::cast_slice(&self.point_transfer_buffer),
             );
-            self.simulation_state.update();
+            timed!("Core update", {
+                self.simulation_state.update();
+            });
             self.simulation_state
                 .serialize_gpu(&mut self.point_transfer_buffer);
-            encoder = self
-                .device
+        });
+        let mut encoder: wgpu::CommandEncoder =
+            self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Encoder"),
                 });
-
-            let read_buffer_slice = self.point_read_buffer.slice(..);
-            read_buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
-            self.device.poll(wgpu::Maintain::Wait);
-            let mut data: Vec<EulerPoint> =
-                bytemuck::cast_slice(&read_buffer_slice.get_mapped_range()).to_vec();
-
-            update_points(&mut data, &self.sim_params);
-
-            let write_buffer_slice = self.point_write_buffer.slice(..);
-            write_buffer_slice.map_async(wgpu::MapMode::Write, |_| ());
-            self.device.poll(wgpu::Maintain::Wait);
-            bytemuck::cast_slice_mut(&mut write_buffer_slice.get_mapped_range_mut())
-                .copy_from_slice(&data);
-
-            self.point_read_buffer.unmap();
-            self.point_write_buffer.unmap();
-
-            encoder.copy_buffer_to_texture(
-                wgpu::ImageCopyBuffer {
-                    buffer: &self.point_write_buffer,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(size_of::<[f32; 4]>() as u32 * NUM_POINTS),
-                        rows_per_image: Some(1),
-                    },
-                },
-                self.point_textures[0].as_image_copy(),
-                wgpu::Extent3d {
-                    width: NUM_POINTS,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
@@ -1408,7 +1254,7 @@ impl State {
             depth_stencil_attachment: None,
         });
         render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.bind_groups[0], &[]);
+        render_pass.set_bind_group(0, &self.bind_group, &[]);
         render_pass.draw(0..(3 * NUM_POINTS), 0..1);
         drop(render_pass);
 
@@ -1433,257 +1279,6 @@ impl State {
 
     pub fn window(&self) -> &Window {
         &self.window
-    }
-}
-
-const GRID_SIZE: usize = 24;
-const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
-const GRID_RADIUS: f32 = GRID_LEN / 2.0;
-
-#[inline(never)]
-fn update_points(points: &mut [EulerPoint], params: &SimParams) {
-    #[inline(always)]
-    fn hash_point_pos(px: f32, py: f32) -> (isize, isize) {
-        let px = ((px + 1.0) / 2.0).rem_euclid(1.0);
-        let py = ((py + 1.0) / 2.0).rem_euclid(1.0);
-        ((px * GRID_SIZE as f32) as _, (py * GRID_SIZE as f32) as _)
-    }
-    #[inline(always)]
-    fn join_coords((px, py): (isize, isize)) -> usize {
-        ((px.rem_euclid(GRID_SIZE as isize))
-            + (py.rem_euclid(GRID_SIZE as isize)) * GRID_SIZE as isize) as usize
-    }
-
-    let relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS] =
-        from_fn(|i| from_fn(|j| params.forces[i + NUM_KINDS * j] * -0.1));
-
-    let mut spatial_hash: Vec<Vec<u32>> =
-        (0..(GRID_SIZE * GRID_SIZE)).map(|_| Vec::new()).collect();
-
-    let mut outer_group: Vec<u32> = Vec::with_capacity(NUM_POINTS as _);
-
-    for _ in 0..5 {
-        for e in spatial_hash.iter_mut() {
-            e.clear();
-        }
-
-        for i in 0..NUM_POINTS as usize {
-            let p = &points[i];
-            let key = join_coords(hash_point_pos(p.x, p.y));
-            spatial_hash[key].push(i as u32);
-        }
-
-        let dt = 0.05;
-
-        let grid_size = GRID_SIZE as isize;
-        for (hash_index, inner_group) in spatial_hash.iter().enumerate() {
-            outer_group.clear();
-
-            for jj in [
-                -grid_size - 1,
-                -grid_size,
-                -grid_size + 1,
-                -1,
-                0,
-                1,
-                grid_size - 1,
-                grid_size,
-                grid_size + 1,
-            ]
-            .into_iter()
-            .map(|d| {
-                &spatial_hash[(d + hash_index as isize).rem_euclid(grid_size * grid_size) as usize]
-            }) {
-                outer_group.extend_from_slice(jj);
-            }
-
-            evaluate_groups(inner_group, &outer_group, points, relation_lookup, dt);
-        }
-    }
-}
-
-fn evaluate_groups(
-    inner_group: &[u32],
-    outer_group: &[u32],
-    points: &mut [EulerPoint],
-    relation_lookup: [[f32; NUM_KINDS]; NUM_KINDS],
-    dt: f32,
-) {
-    let (outer_remaining, outer_chunks) = as_rchunks::<_, NUM_KINDS>(outer_group);
-    for &i in inner_group {
-        if true {
-            unsafe {
-                let p_x = points.get_unchecked(i as usize).x;
-                let p_y = points.get_unchecked(i as usize).y;
-
-                let mut p_vx = points.get_unchecked(i as usize).vx;
-                let mut p_vy = points.get_unchecked(i as usize).vy;
-
-                let mut p_vx_s = _mm256_setzero_ps();
-                let mut p_vy_s = _mm256_setzero_ps();
-
-                for outer_chunk in outer_chunks {
-                    let j_s: __m256i = _mm256_loadu_si256(outer_chunk.as_ptr() as _);
-
-                    let points_ptr: *const f32 = points.as_ptr() as _;
-
-                    let x2_s: __m256 = gather::<4>(points_ptr.offset(0), slli::<2>(j_s));
-                    let y2_s: __m256 = gather::<4>(points_ptr.offset(1), slli::<2>(j_s));
-
-                    let dix_s: __m256 = sub(splat(p_x), x2_s);
-                    let diy_s: __m256 = sub(splat(p_y), y2_s);
-
-                    let r2_s = fmadd(dix_s, dix_s, mul(diy_s, diy_s));
-                    let r_inv_s = rsqrt(r2_s);
-                    let r_s = mul(r2_s, r_inv_s);
-
-                    let dixn_s = mul(r_inv_s, dix_s);
-                    let diyn_s = mul(r_inv_s, diy_s);
-
-                    let x_s = mul(r_s, splat(1.0 / GRID_RADIUS));
-                    let beta = 0.3;
-                    let relation_force_s = gather::<4>(
-                        (relation_lookup.as_ptr() as *const f32)
-                            .add((i as usize % NUM_KINDS) * NUM_KINDS),
-                        andi(j_s, splati(0b111)),
-                    );
-                    assert_eq!(NUM_KINDS, 8, "0x111");
-                    let f_s = relation_force_s;
-                    let fac_dt_s = mul(
-                        max(
-                            mul(
-                                max(min(sub(x_s, splat(beta)), sub(splat(1.0), x_s)), splat(0.0)),
-                                f_s,
-                            ),
-                            sub(splat(1.0), mul(x_s, splat(1.0 / beta))),
-                            //fmsub(x_s, splat(1.0 / beta), splat(1.0))
-                        ),
-                        splat(dt),
-                    );
-                    let ok_mask = _mm256_cmp_ps::<0x8>(fac_dt_s, splat(0.0));
-                    let fac_dt_masked_s = andn(ok_mask, fac_dt_s);
-
-                    let fac_dt_s = fac_dt_masked_s;
-
-                    let final_vx = mul(dixn_s, fac_dt_s);
-                    let final_vy = mul(diyn_s, fac_dt_s);
-                    let ok_mask_x = _mm256_cmp_ps::<0x8>(final_vx, splat(0.0));
-                    let ok_mask_y = _mm256_cmp_ps::<0x8>(final_vy, splat(0.0));
-                    let final_vx = andn(ok_mask_x, final_vx);
-                    let final_vy = andn(ok_mask_y, final_vy);
-
-                    p_vx_s = add(final_vx, p_vx_s);
-                    p_vy_s = add(final_vy, p_vy_s);
-                }
-
-                {
-                    let mut buffer: [f32; 8] = [0.0; 8];
-                    _mm256_storeu_ps(buffer.as_mut_ptr() as _, p_vx_s);
-                    let diff = buffer.into_iter().sum::<f32>();
-                    p_vx += diff;
-
-                    let mut buffer: [f32; 8] = [0.0; 8];
-                    _mm256_storeu_ps(buffer.as_mut_ptr() as _, p_vy_s);
-                    let diff = buffer.into_iter().sum::<f32>();
-                    p_vy += diff;
-                }
-
-                for &j in outer_remaining {
-                    let p2 = points[j as usize];
-                    let p = points[i as usize];
-
-                    let (dix, diy) = (p.x - p2.x, p.y - p2.y);
-                    let r2 = dix * dix + diy * diy;
-                    let r = r2.sqrt();
-                    let (dixn, diyn) = (dix / r, diy / r);
-                    let fac = {
-                        let x = r / GRID_RADIUS;
-                        let beta = 0.3;
-                        let relation_force =
-                            relation_lookup[i as usize % NUM_KINDS][j as usize % NUM_KINDS];
-                        let f = relation_force;
-
-                        f32::max(
-                            f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
-                            1.0 - x / beta,
-                        )
-                    };
-
-                    let dx = fac * dixn * dt;
-                    let dy = fac * diyn * dt;
-                    p_vx += if dx.is_nan() { 0.0 } else { dx };
-                    p_vy += if dy.is_nan() { 0.0 } else { dy };
-                }
-                points[i as usize].vx = p_vx;
-                points[i as usize].vy = p_vy;
-            }
-        } else {
-            for &j in outer_group {
-                // !0: we know that i != j here and that positions are distinct
-                // 0: i may equal j, r may equal zero
-
-                let p2 = points[j as usize];
-                let p = &mut points[i as usize];
-
-                let (dix, diy) = (p.x - p2.x, p.y - p2.y);
-                let r2 = dix * dix + diy * diy;
-                let r = r2.sqrt();
-                let (dixn, diyn) = (dix / r, diy / r);
-                let fac = {
-                    let x = r / GRID_RADIUS;
-                    let beta = 0.3;
-                    let relation_force =
-                        relation_lookup[i as usize % NUM_KINDS][j as usize % NUM_KINDS];
-                    let f = relation_force;
-
-                    f32::max(
-                        f32::max(f32::min(x - beta, -x + 1.0), 0.0) * f,
-                        1.0 - x / beta,
-                    )
-                };
-
-                let dx = fac * dixn * dt;
-                let dy = fac * diyn * dt;
-                p.vx += if dx.is_nan() {
-                    //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                    0.0
-                } else {
-                    dx
-                };
-                p.vy += if dy.is_nan() {
-                    //(i as f32 / NUM_POINTS as f32 * 0.5) * 0.0001
-                    0.0
-                } else {
-                    dy
-                };
-            }
-        }
-
-        let p = &mut points[i as usize];
-
-        if p.x > 1.0 {
-            p.x = -1.0;
-            //p.vx = -p.vx.abs() - dt;
-        } else if p.x < -1.0 {
-            p.x = 1.0;
-            //p.vx = p.vx.abs() - dt;
-        }
-        if p.y > 1.0 {
-            p.y = -1.0;
-            //p.vy = -p.vy.abs() - dt;
-        } else if p.y < -1.0 {
-            p.y = 1.0;
-            //p.vy = p.vy.abs() + dt;
-        }
-
-        p.vx *= 0.01_f32.powf(dt);
-        p.vy *= 0.01_f32.powf(dt);
-
-        p.vx -= p.x * (dt * 0.001);
-        p.vy -= p.y * (dt * 0.001);
-
-        p.x += p.vx * dt;
-        p.y += p.vy * dt;
     }
 }
 

@@ -1,7 +1,5 @@
 
 @group(0) @binding(0) 
-var compute_texture: texture_2d<f32>;
-@group(0) @binding(1) 
 var<storage, read> points: array<GpuPoint>;
 
 const NUM_POINTS: f32 = {NUM_POINTS}.0;
@@ -79,45 +77,25 @@ fn vs_main(
     let radius_clip_space = (range_index) * 1.0 / hash_texture_size;
     let inner_radius_clip_space: f32 = beta * radius_clip_space;
 
-    offset *= 0.8 * inner_radius_clip_space;
+    offset *= 0.5 * inner_radius_clip_space;
     
-    let a = textureLoad(compute_texture, vec2<u32>(group, 0u), 0);
     let qqq = points[group];
-    if (false) {
-        offset += a.xy;
+    offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
 
-        let num_kinds: f32 = NUM_KINDS;
+    let num_kinds: f32 = NUM_KINDS;
 
-        let q = fract(f32(group) / num_kinds);
-        let u = q * 1.0 * 3.141592;
-        let w = (1.0 / 3.0) * 2.0 * 3.241592;
-        let color = vec4<f32>(
-            pow(sin(u + 0.0 * w), 4.0),
-            pow(sin(u + 1.0 * w), 4.0),
-            pow(sin(u + 2.0 * w), 4.0),
-            1.0
-        );
-        out.color = color;
+    let q = fract(f32(qqq.k) / num_kinds);//fract(f32(group) / num_kinds);
+    let u = q * 1.0 * 3.141592;
+    let w = (1.0 / 3.0) * 2.0 * 3.241592;
+    let color = vec4<f32>(
+        pow(sin(u + 0.0 * w), 4.0),
+        pow(sin(u + 1.0 * w), 4.0),
+        pow(sin(u + 2.0 * w), 4.0),
+        1.0
+    );
+    out.color = color;
 
-        out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
-    } else {
-        offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
-
-        let num_kinds: f32 = NUM_KINDS;
-
-        let q = 0.0;//fract(f32(group) / num_kinds);
-        let u = q * 1.0 * 3.141592;
-        let w = (1.0 / 3.0) * 2.0 * 3.241592;
-        let color = vec4<f32>(
-            pow(sin(u + 0.0 * w), 4.0),
-            pow(sin(u + 1.0 * w), 4.0),
-            pow(sin(u + 2.0 * w), 4.0),
-            1.0
-        );
-        out.color = color;
-
-        out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
-    }
+    out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
     return out;   
 }
 @fragment
