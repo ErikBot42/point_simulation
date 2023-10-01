@@ -101,7 +101,7 @@ fn vs_main(
 
         out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
     } else {
-        offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0) * 0.5; // 0..1 -> -1..1
+        offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
 
         let num_kinds: f32 = NUM_KINDS;
 

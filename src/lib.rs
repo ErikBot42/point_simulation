@@ -16,10 +16,10 @@ use winit::{
     window::WindowBuilder,
 };
 
-const CELLS_X: u16 = 128;
-const CELLS_Y: u16 = 128;
+const CELLS_X: u16 = 32;
+const CELLS_Y: u16 = 32;
 const CELLS: u16 = CELLS_X * CELLS_Y;
-const DT: f32 = 0.00000; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.005; // TODO: define max speed/max dt from cell size.
 fn compute_cell(x: f32, y: f32) -> Cid {
     // x in 0_f32..1_f32
     // y in 0_f32..1_f32
@@ -338,17 +338,18 @@ impl SimulationInputEuler {
         }
     }
     fn verlet(self) -> SimulationInputVerlet {
-        let x1 = self.x;
-        let y1 = self.y;
-        let mut x0 = self.vx;
-        let mut y0 = self.vy;
-        for (((x0, y0), x1), y1) in x1
+        let x0 = self.x;
+        let y0 = self.y;
+        let mut x1 = self.vx;
+        let mut y1 = self.vy;
+        for (((x0, y0), x1), y1) in x0
             .iter()
-            .zip(y1.iter())
-            .zip(x0.iter_mut())
-            .zip(y0.iter_mut())
+            .zip(y0.iter())
+            .zip(x1.iter_mut())
+            .zip(y1.iter_mut())
         {
-            (*x1, *y1) = (x0 + *x1 * DT, y0 + *y1 * DT);
+            *x1 = (x0 + *x1 * DT).rem_euclid(0.999);
+            *y1 = (y0 + *y1 * DT).rem_euclid(0.999);
         }
         SimulationInputVerlet {
             x0,
@@ -364,8 +365,11 @@ impl SimulationInputEuler {
 macro_rules! index_wrap {
     ($name:ident, $index:ty, $doc:expr) => {
         #[doc = $doc]
+        #[repr(transparent)]
         #[derive(Copy, Clone, Default, Debug)]
         struct $name($index);
+        unsafe impl bytemuck::Zeroable for $name {}
+        unsafe impl bytemuck::Pod for $name {}
         impl From<$name> for usize {
             fn from(value: $name) -> usize {
                 value.0 as _
@@ -430,49 +434,34 @@ const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
 const KINDS2: usize = NUM_KINDS as usize * NUM_KINDS as usize;
 /// Entire state of the simulation
 struct SimulationState {
-    /// x value for previous position (shuffled)
-    /// overwritten during update.
     x0: Pbox<f32>,
-    /// y value for previous position (shuffled)
-    /// overwritten during update.
     y0: Pbox<f32>,
-
-    /// x value for new position
     x1: Pbox<f32>,
-    /// y value for new position
     y1: Pbox<f32>,
 
-    /// scratch space for x position before being put in right spot
-    x_tmp: Pbox<f32>,
-    /// scratch space for y position before being put in right spot
-    y_tmp: Pbox<f32>,
+    x0_tmp: Pbox<f32>,
+    y0_tmp: Pbox<f32>,
+    x1_tmp: Pbox<f32>,
+    y1_tmp: Pbox<f32>,
 
-    /// point kind (not shuffled)
-    k_old: Pbox<u8>,
-    /// New point kind scratch space.
-    k_new: Pbox<u8>,
-
-    /// Map new indexes to old indexes.
-    back: Pbox<Pid>,
-
-    /// Scratch space for x position of surrounding points.
     surround_buffer_x: Vec<f32>,
-    /// Scratch space for y position of surrounding points.
     surround_buffer_y: Vec<f32>,
-    /// Scratch space for kind of surrounding points.
-    surround_buffer_k: Vec<u8>,
 
-    /// What cell the new points belong to.
-    point_cell_location: Pbox<Cid>,
-    /// What number the point has in the cell.
+    point_cell: Pbox<Cid>,
+    point_cell_tmp: Pbox<Cid>,
+
     point_cell_offset: Pbox<Pid>,
-    /// How many old points are in a cell OR
-    /// what index into the old point buffer this cell has.
-    cell_count_or_index: Cbox<Pid>,
-    /// How many new points are in a cell OR
-    /// what index into the new point buffer this cell has.
-    cell_count_or_index_new: Cbox<Pid>,
-    /// Mapping kinds to amount of attraction.
+    point_cell_offset_tmp: Pbox<Pid>,
+
+    cell_count: Cbox<Pid>,
+    cell_count_new: Cbox<Pid>,
+
+    cell_index_start: Cbox<Pid>,
+    cell_index_end: Cbox<Pid>,
+
+    cell_index_start_new: Cbox<Pid>,
+    cell_index_end_new: Cbox<Pid>,
+
     relation_table: Box<[f32; KINDS2]>,
 }
 #[repr(C)]
@@ -509,39 +498,165 @@ impl SimulationState {
             relation_table,
         } = input;
         let mut this = Self {
-            x0,
-            y0,
+            x0: calloc(),
+            y0: calloc(),
             x1: calloc(),
             y1: calloc(),
-            x_tmp: calloc(),
-            y_tmp: calloc(),
-            k_old: k,
-            k_new: calloc(),
-            back: calloc(),
+            x0_tmp: x0,
+            y0_tmp: y0,
+            x1_tmp: x1,
+            y1_tmp: y1,
             surround_buffer_x: Vec::new(),
             surround_buffer_y: Vec::new(),
-            surround_buffer_k: Vec::new(),
-            point_cell_location: calloc(),
+            point_cell: calloc(),
+            point_cell_tmp: calloc(),
             point_cell_offset: calloc(),
-            cell_count_or_index: calloc(),
-            cell_count_or_index_new: calloc(),
+            point_cell_offset_tmp: calloc(),
+            cell_count: calloc(),
+            cell_count_new: calloc(),
+            cell_index_start: calloc(),
+            cell_index_end: calloc(),
+            cell_index_start_new: calloc(),
+            cell_index_end_new: calloc(),
             relation_table,
         };
+        this.cell_count.iter_mut().for_each(|e| *e = 0.into());
         for i in (0..NUM_POINTS_U).map(Into::into) {
-            let x_next = x1[i];
-            let y_next = y1[i];
-            let new_cell = compute_cell(x_next, y_next);
-            this.point_cell_location[i] = new_cell;
-            let new_offset = this.cell_count_or_index_new[new_cell];
-            this.cell_count_or_index_new[new_cell] += 1.into();
-            this.point_cell_offset[i] = new_offset;
-            this.x_tmp[i] = x_next;
-            this.y_tmp[i] = y_next;
+            let new_x = this.x1_tmp[i];
+            let new_y = this.y1_tmp[i];
+            let cell = compute_cell(new_x, new_y);
+            this.point_cell[i] = cell;
+            this.point_cell_offset[i] = this.cell_count[cell];
+            this.cell_count[cell] += 1.into();
+        }
+        let mut acc: Pid = 0.into();
+        for i in (0..CELLS_PLUS_1_U).map(Into::into) {
+            this.cell_index_start[i] = acc;
+            let count = this.cell_count[i];
+            acc += count;
+            this.cell_index_end[i] = acc;
+        }
+        for i in (0..NUM_POINTS_U).map(Into::into) {
+            let cell = this.point_cell[i];
+            let index = this.cell_index_start[cell] + this.point_cell_offset[i];
+            this.x0[index] = this.x0_tmp[i];
+            this.y0[index] = this.y0_tmp[i];
+            this.x1[index] = this.x1_tmp[i];
+            this.y1[index] = this.y1_tmp[i];
         }
         this
     }
     // update starts right after previous physics update to reduce construction size.
     fn update(&mut self) {
+        for cx in 0..CELLS_X {
+            for cy in 0..CELLS_Y {
+                //for i in (0..NUM_POINTS_U).map(Into::into) {
+                let cell: Cid = usize::from(cx + cy * CELLS_X).into();
+                self.surround_buffer_x.clear();
+                self.surround_buffer_y.clear();
+                for dx in -1..1 {
+                    for dy in -1..1 {
+                        let cell: Cid = (((CELLS_X as i32 + cx as i32 + dx as i32)
+                            .rem_euclid(CELLS_X as i32)
+                            + ((CELLS_Y as i32 + cy as i32 + dy as i32).rem_euclid(CELLS_Y as i32))
+                                * CELLS_X as i32)
+                            as usize)
+                            .into();
+                        let range = usize::from(self.cell_index_start[cell])
+                            ..usize::from(self.cell_index_end[cell]);
+                        for i in range.map(Into::into) {
+                            self.surround_buffer_x.push(self.x1[i]);
+                            self.surround_buffer_y.push(self.y1[i]);
+                        }
+                    }
+                }
+                for i in (usize::from(self.cell_index_start[cell])
+                    ..usize::from(self.cell_index_end[cell]))
+                    .map(Into::into)
+                {
+                    let x0 = self.x0[i];
+                    let y0 = self.y0[i];
+                    let x1 = self.x1[i];
+                    let y1 = self.y1[i];
+                    let mut acc_x = 0.0;
+                    let mut acc_y = 0.0;
+                    for (&x_other, &y_other) in self
+                        .surround_buffer_x
+                        .iter()
+                        .zip(self.surround_buffer_y.iter())
+                    {
+                        let dx = x1 - x_other;
+                        let dy = y1 - y_other;
+                        let dot = dx * dx + dy * dy;
+                        let r = dot.sqrt();
+                        let dir_x = dx / r;
+                        let dir_y = dy / r;
+                        let f: f32 = 0.01*0.01 / (r*r);
+                        if f.is_finite() && dir_x.is_finite() && dir_y.is_finite() {
+                            acc_x += dir_x * f;
+                            acc_y += dir_y * f;
+                        }
+                    }
+                    let mut vx = x1 - x0;
+                    let mut vy = y1 - y0;
+
+                    for dx in [-1.0, 0.0, 1.0] {
+                        let c = x1 - x0 + dx;
+                        if c.abs() < vx.abs() {
+                            vx = c
+                        }
+                    }
+                    for dy in [-1.0, 0.0, 1.0] {
+                        let c = y1 - y0 + dy;
+                        if c.abs() < vy.abs() {
+                            vy = c
+                        }
+                    }
+
+                    acc_x -= 100.0 * vx * vx * vx / (vx.abs() * DT * DT);
+                    acc_y -= 100.0 * vy * vy * vy / (vy.abs() * DT * DT);
+                    //acc_x += 1.0 * vx * (1.0/DT) * (1.0/DT);
+                    //acc_y += 1.0 * vy * (1.0/DT) * (1.0/DT);
+
+                    let new_x = (x1 + vx + acc_x * DT * DT).rem_euclid(0.99999);
+                    let new_y = (y1 + vy + acc_y * DT * DT).rem_euclid(0.99999);
+                    self.x0[i] = x1;
+                    self.x1[i] = new_x;
+                    self.y0[i] = y1;
+                    self.y1[i] = new_y;
+
+                    self.x0_tmp[i] = self.x0[i];
+                    self.y0_tmp[i] = self.y0[i];
+                    self.x1_tmp[i] = self.x1[i];
+                    self.y1_tmp[i] = self.y1[i];
+                }
+            }
+        }
+        self.cell_count.iter_mut().for_each(|e| *e = 0.into());
+        for i in (0..NUM_POINTS_U).map(Into::into) {
+            let new_x = self.x1_tmp[i];
+            let new_y = self.y1_tmp[i];
+            let cell = compute_cell(new_x, new_y);
+            self.point_cell[i] = cell;
+            self.point_cell_offset[i] = self.cell_count[cell];
+            self.cell_count[cell] += 1.into();
+        }
+        let mut acc: Pid = 0.into();
+        for i in (0..CELLS_PLUS_1_U).map(Into::into) {
+            self.cell_index_start[i] = acc;
+            let count = self.cell_count[i];
+            acc += count;
+            self.cell_index_end[i] = acc;
+        }
+        for i in (0..NUM_POINTS_U).map(Into::into) {
+            let cell = self.point_cell[i];
+            let index = self.cell_index_start[cell] + self.point_cell_offset[i];
+            self.x0[index] = self.x0_tmp[i];
+            self.y0[index] = self.y0_tmp[i];
+            self.x1[index] = self.x1_tmp[i];
+            self.y1[index] = self.y1_tmp[i];
+        }
+        /*
         // PPA
         ppa_offset_1(&mut self.cell_count_or_index_new);
         // Insertion.
@@ -549,16 +664,16 @@ impl SimulationState {
             for i_old in (0..NUM_POINTS_U).map(Into::into) {
                 let i_new = self.cell_count_or_index_new[self.point_cell_location[i_old]]
                     + self.point_cell_offset[i_old];
-                self.x0[i_new] = self.x_tmp[i_old];
-                self.y0[i_new] = self.y_tmp[i_old];
-                self.k_new[i_new] = self.k_old[i_old];
-                self.back[i_new] = i_old as _;
+                self.x0[i_new] = self.x0_tmp[i_old];
+                self.y0[i_new] = self.y0_tmp[i_old];
+                //self.k_new[i_new] = self.k[i_old];
+                //self.back[i_new] = i_old as _;
             }
         };
         // Swapping vectors.
         swap(&mut self.x0, &mut self.x1);
         swap(&mut self.y0, &mut self.y1);
-        swap(&mut self.k_old, &mut self.k_new);
+        //swap(&mut self.k, &mut self.k_new);
         swap(
             &mut self.cell_count_or_index,
             &mut self.cell_count_or_index_new,
@@ -588,7 +703,7 @@ impl SimulationState {
                         {
                             self.surround_buffer_x.push(self.x1[i]);
                             self.surround_buffer_y.push(self.y1[i]);
-                            self.surround_buffer_k.push(self.k_old[i]);
+                            //self.surround_buffer_k.push(self.k[i]);
                         }
                     }
                 }
@@ -598,9 +713,9 @@ impl SimulationState {
                 {
                     let x = self.x1[i];
                     let y = self.y1[i];
-                    let k = self.k_new[i];
-                    let x_prev = self.x0[self.back[i]];
-                    let y_prev = self.y0[self.back[i]];
+                    //let k = self.k_new[i];
+                    let x_prev: f32 = todo!();//self.x0[self.back[i]];
+                    let y_prev: f32 = todo!();//self.y0[self.back[i]];
                     let mut acc_x = 0.0;
                     let mut acc_y = 0.0;
                     for ((other_x, other_y), &other_k) in self
@@ -618,8 +733,8 @@ impl SimulationState {
                         let dx = diff_x * invr;
                         let dy = diff_y * invr;
 
-                        let force = self.relation_table
-                        [(k as u16 + NUM_KINDS as u16 * other_k as u16) as usize]
+                        let force = 1.0//self.relation_table
+                        //[(k as u16 + NUM_KINDS as u16 * other_k as u16) as usize]
                         * 0.01 // TODO: move DT, this factor into relation table.
                         * invr
                         * invr;
@@ -644,12 +759,13 @@ impl SimulationState {
                         let new_offset = self.cell_count_or_index_new[new_cell];
                         self.cell_count_or_index_new[new_cell] += 1.into();
                         self.point_cell_offset[i] = new_offset;
-                        self.x_tmp[i] = x_next;
-                        self.y_tmp[i] = y_next;
+                        self.x0_tmp[i] = x_next;
+                        self.y0_tmp[i] = y_next;
                     };
                 }
             }
         }
+        */
     }
     fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
         data.clear();
@@ -657,11 +773,12 @@ impl SimulationState {
             self.x0
                 .iter()
                 .zip(self.y0.iter())
-                .zip(self.k_old.iter())
-                .map(|((&x, &y), &k)| GpuPoint {
+                //.zip(self.k.iter())
+                .map(|(&x, &y)| GpuPoint {
                     x,
                     y,
-                    k: k as _,
+                    k: 0,
+                    //k: k as _,
                     _unused: 0,
                 }),
         )
@@ -1229,13 +1346,7 @@ impl State {
                 0,
                 bytemuck::cast_slice(&self.point_transfer_buffer),
             );
-            static mut FOO: u8 = 0;
-            if unsafe {
-                FOO = (FOO + 1) % 30;
-                FOO == 0
-            } {
-                self.simulation_state.update();
-            }
+            self.simulation_state.update();
             self.simulation_state
                 .serialize_gpu(&mut self.point_transfer_buffer);
             encoder = self
