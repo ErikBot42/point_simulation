@@ -22,7 +22,6 @@ use winit::{
 use wasm_bindgen::prelude::*;
 
 use prng::Prng;
-//use vertex::{Vertex, VERTICES};
 
 mod prng;
 mod vertex;
@@ -30,23 +29,18 @@ mod vertex;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime};
 
-const CELLS_X: u16 = 128;
-const CELLS_Y: u16 = 128;
+const CELLS_X: u16 = 64;
+const CELLS_Y: u16 = 64;
+const CELLS_MAX_DIM: u16 = if CELLS_X > CELLS_Y { CELLS_X } else { CELLS_Y };
 const CELLS: u16 = CELLS_X * CELLS_Y;
-const DT: f32 = 0.002; // TODO: define max speed/max dt from cell size.
+const POINT_MAX_RADIUS: f32 = 1.0 / (CELLS_MAX_DIM as f32);
+
+const DT: f32 = 0.004; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
 const KINDS2: usize = NUM_KINDS as usize * NUM_KINDS as usize;
-const GRID_SIZE: usize = 24;
-const GRID_LEN: f32 = 2.0 / GRID_SIZE as f32;
-const GRID_RADIUS: f32 = GRID_LEN / 2.0;
-const NUM_POINTS: u32 = 8192;
+const NUM_POINTS: u32 = 8192; //16384;
 const NUM_KINDS: usize = 8;
-const HASH_TEXTURE_SIZE: u32 = 256;
-const RANGE_INDEX: u32 = 8;
-const BETA: f64 = 0.4;
-const RADIUS_CLIP_SPACE: f64 = (RANGE_INDEX as f64) * 1.0 / (HASH_TEXTURE_SIZE as f64);
-const INNER_RADIUS_CLIP_SPACE: f64 = BETA * RADIUS_CLIP_SPACE;
 
 fn compute_cell(x: f32, y: f32) -> Cid {
     // x in 0_f32..1_f32
@@ -343,7 +337,12 @@ struct SimulationInputVerlet {
 }
 impl SimulationInputEuler {
     fn new() -> SimulationInputEuler {
-        let mut rng = Prng(3141592);
+        let mut rng = Prng(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64,
+        );
         let xy_range = 0.0..1.0;
         let v_range = -1.0..1.0;
         fn iter_alloc<T: std::fmt::Debug, const SIZE: usize, F: FnMut() -> T>(
@@ -463,29 +462,27 @@ struct SimulationState {
     y0: Pbox<f32>,
     x1: Pbox<f32>,
     y1: Pbox<f32>,
+    k: Pbox<u8>,
 
     x0_tmp: Pbox<f32>,
     y0_tmp: Pbox<f32>,
     x1_tmp: Pbox<f32>,
     y1_tmp: Pbox<f32>,
+    k_tmp: Pbox<u8>,
 
     surround_buffer_x: Vec<f32>,
     surround_buffer_y: Vec<f32>,
+    surround_buffer_k: Vec<u8>,
 
     point_cell: Pbox<Cid>,
-    point_cell_tmp: Pbox<Cid>,
 
     point_cell_offset: Pbox<Pid>,
-    point_cell_offset_tmp: Pbox<Pid>,
 
     cell_count: Cbox<Pid>,
-    cell_count_new: Cbox<Pid>,
 
     cell_index_start: Cbox<Pid>,
     cell_index_end: Cbox<Pid>,
 
-    cell_index_start_new: Cbox<Pid>,
-    cell_index_end_new: Cbox<Pid>,
 
     relation_table: Box<[f32; KINDS2]>,
 }
@@ -527,22 +524,20 @@ impl SimulationState {
             y0: calloc(),
             x1: calloc(),
             y1: calloc(),
+            k: calloc(),
             x0_tmp: x0,
             y0_tmp: y0,
             x1_tmp: x1,
             y1_tmp: y1,
+            k_tmp: k,
             surround_buffer_x: Vec::new(),
             surround_buffer_y: Vec::new(),
+            surround_buffer_k: Vec::new(),
             point_cell: calloc(),
-            point_cell_tmp: calloc(),
             point_cell_offset: calloc(),
-            point_cell_offset_tmp: calloc(),
             cell_count: calloc(),
-            cell_count_new: calloc(),
             cell_index_start: calloc(),
             cell_index_end: calloc(),
-            cell_index_start_new: calloc(),
-            cell_index_end_new: calloc(),
             relation_table,
         };
         this.cell_count.iter_mut().for_each(|e| *e = 0.into());
@@ -568,9 +563,11 @@ impl SimulationState {
             this.y0[index] = this.y0_tmp[i];
             this.x1[index] = this.x1_tmp[i];
             this.y1[index] = this.y1_tmp[i];
+            this.k[index] = this.k_tmp[i];
         }
         this
     }
+    #[inline(never)]
     // update starts right after previous physics update to reduce construction size.
     fn update(&mut self) {
         for cx in 0..CELLS_X {
@@ -579,6 +576,7 @@ impl SimulationState {
                 let cell: Cid = usize::from(cx + cy * CELLS_X).into();
                 self.surround_buffer_x.clear();
                 self.surround_buffer_y.clear();
+                self.surround_buffer_k.clear();
                 for dx in -1..=1 {
                     for dy in -1..=1 {
                         let cell_x = cx as i32 + dx as i32;
@@ -604,6 +602,7 @@ impl SimulationState {
                         for i in range.map(Into::into) {
                             self.surround_buffer_x.push(self.x1[i] + offset_x);
                             self.surround_buffer_y.push(self.y1[i] + offset_y);
+                            self.surround_buffer_k.push(self.k[i]);
                         }
                     }
                 }
@@ -615,20 +614,37 @@ impl SimulationState {
                     let y0 = self.y0[i];
                     let x1 = self.x1[i];
                     let y1 = self.y1[i];
+                    let k = self.k[i];
                     let mut acc_x = 0.0;
                     let mut acc_y = 0.0;
-                    for (&x_other, &y_other) in self
+                    for ((&x_other, &y_other), k_other) in self
                         .surround_buffer_x
                         .iter()
                         .zip(self.surround_buffer_y.iter())
+                        .zip(self.surround_buffer_k.iter())
                     {
+                        // https://www.desmos.com/calculator/yos22615bv
+                        //
+
                         let dx = x1 - x_other;
                         let dy = y1 - y_other;
                         let dot = dx * dx + dy * dy;
                         let r = dot.sqrt();
+
+                        const BETA: f32 = 0.3;
+                        let f = {
+                            let x = r * (1.0 / POINT_MAX_RADIUS);
+                            let k: f32 =
+                                0.2 * self.relation_table[(k_other + k * NUM_KINDS as u8) as usize];
+                            //let c = 1.0 - x / BETA;
+                            let c = 0.1 * (1.0 / (x * x) - 1.0 / (BETA * BETA));
+                            ((2.0 * k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c)
+                        };
                         let dir_x = dx / r;
                         let dir_y = dy / r;
-                        let f: f32 = 0.001 / (r * r);
+                        //let f: f32 = 0.001
+                        //    * (1.0 / (r * r) - 1.0 / (POINT_MAX_RADIUS * POINT_MAX_RADIUS))
+                        //        .max(0.0);
                         if f.is_finite() && dir_x.is_finite() && dir_y.is_finite() {
                             acc_x += dir_x * f;
                             acc_y += dir_y * f;
@@ -652,7 +668,7 @@ impl SimulationState {
                     let v2 = vx * vx + vy * vy;
                     let vx_norm = vx / v2.sqrt();
                     let vy_norm = vy / v2.sqrt();
-                    let friction_force = v2 * (20.0 / (DT * DT));
+                    let friction_force = v2 * (100.0 / (DT * DT));
                     acc_x += friction_force * (-vx_norm);
                     acc_y += friction_force * (-vy_norm);
 
@@ -667,6 +683,7 @@ impl SimulationState {
                     self.y0_tmp[i] = self.y0[i];
                     self.x1_tmp[i] = self.x1[i];
                     self.y1_tmp[i] = self.y1[i];
+                    self.k_tmp[i] = k;
                 }
             }
         }
@@ -693,6 +710,7 @@ impl SimulationState {
             self.y0[index] = self.y0_tmp[i];
             self.x1[index] = self.x1_tmp[i];
             self.y1[index] = self.y1_tmp[i];
+            self.k[index] = self.k_tmp[i];
         }
         /*
         // PPA
@@ -811,12 +829,11 @@ impl SimulationState {
             self.x0
                 .iter()
                 .zip(self.y0.iter())
-                //.zip(self.k.iter())
-                .map(|(&x, &y)| GpuPoint {
+                .zip(self.k.iter())
+                .map(|((&x, &y), &k)| GpuPoint {
                     x,
                     y,
-                    k: 0,
-                    //k: k as _,
+                    k: k as _,
                     _unused: 0,
                 }),
         )
@@ -1129,8 +1146,6 @@ impl State {
             .replace("{NUM_POINTS}", &format!("{}", NUM_POINTS))
             .replace("{NUM_KINDS}", &format!("{}", NUM_KINDS));
 
-        dbgc!(RADIUS_CLIP_SPACE);
-
         let render_pipeline;
         {
             let fragment_vertex_shader: wgpu::ShaderModule =
@@ -1218,14 +1233,16 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        timed!("Update with overhead:", {
+        timed!("Update with overhead", {
             self.queue.write_buffer(
                 &self.gpu_point_buffer,
                 0,
                 bytemuck::cast_slice(&self.point_transfer_buffer),
             );
             timed!("Core update", {
-                self.simulation_state.update();
+                for _ in 0..3 {
+                    self.simulation_state.update();
+                }
             });
             self.simulation_state
                 .serialize_gpu(&mut self.point_transfer_buffer);
