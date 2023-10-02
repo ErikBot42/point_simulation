@@ -18,6 +18,34 @@ use winit::{
     window::WindowBuilder,
 };
 
+macro_rules! timed {
+    ($name:expr, $code:block) => {{
+        static mut COUNT: u8 = 0;
+        static mut TIME: Duration = Duration::ZERO;
+        if unsafe {
+            COUNT += 1;
+            COUNT == 120
+        } {
+            println!(
+                "{}: {:?} potential fps, {:?} seconds/update",
+                $name,
+                120.0 / unsafe { TIME }.as_secs_f64(),
+                unsafe { TIME }.as_secs_f64() / 120.0
+            );
+            unsafe {
+                TIME = Duration::ZERO;
+                COUNT = 0;
+            }
+        }
+        let _time_pre: Instant = Instant::now();
+        {
+            $code
+        }
+        unsafe {
+            TIME += Instant::now().duration_since(_time_pre);
+        }
+    }};
+}
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -35,18 +63,53 @@ const CELLS_MAX_DIM: u16 = if CELLS_X > CELLS_Y { CELLS_X } else { CELLS_Y };
 const CELLS: u16 = CELLS_X * CELLS_Y;
 const POINT_MAX_RADIUS: f32 = 1.0 / (CELLS_MAX_DIM as f32);
 
-const DT: f32 = 0.004; // TODO: define max speed/max dt from cell size.
+// in SIMULATION space, not view space
+// exclusive upper bound
+const MIN_X: f32 = 0.2;
+const MAX_X: f32 = 0.8;
+const MIN_Y: f32 = 0.2;
+const MAX_Y: f32 = 0.8;
+
+const WIDTH_X: f32 = MAX_X - MIN_X;
+const WIDTH_Y: f32 = MAX_Y - MIN_Y;
+
+const MIN_WIDTH: f32 = if WIDTH_X > WIDTH_Y { WIDTH_Y } else { WIDTH_X };
+
+const K_FAC: f32 = 2.0 * 0.2;
+const BETA: f32 = 0.3;
+const DT: f32 = 0.005; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const KINDS2: usize = NUM_KINDS as usize * NUM_KINDS as usize;
-const NUM_POINTS: u32 = 8192; //16384;
+const NUM_POINTS: u32 = 2048; //16384;
 const NUM_KINDS: usize = 8;
 
+fn scale_simulation_x(f: f32) -> f32 {
+    MIN_X + (MAX_X - MIN_X) * f
+}
+fn scale_simulation_y(f: f32) -> f32 {
+    MIN_Y + (MAX_Y - MIN_Y) * f
+}
+fn inv_scale_simulation_x(f: f32) -> f32 {
+    (f - MIN_X) / (MAX_X - MIN_X)
+}
+fn inv_scale_simulation_y(f: f32) -> f32 {
+    (f - MIN_Y) / (MAX_Y - MIN_Y)
+}
+fn mod_simulation_x(f: f32) -> f32 {
+    (f - MIN_X).rem_euclid(MAX_X - MIN_X) + MIN_X
+}
+fn mod_simulation_y(f: f32) -> f32 {
+    (f - MIN_Y).rem_euclid(MAX_Y - MIN_Y) + MIN_Y
+}
+
 fn compute_cell(x: f32, y: f32) -> Cid {
+    let x = inv_scale_simulation_x(x);
+    let y = inv_scale_simulation_y(y);
     // x in 0_f32..1_f32
     // y in 0_f32..1_f32
-    let cell_x = ((x * CELLS_X as f32) as u16).min(CELLS_X);
-    let cell_y = ((y * CELLS_Y as f32) as u16).min(CELLS_Y);
+
+    let cell_x = ((x * CELLS_X as f32) as u16).min(CELLS_X - 1);
+    let cell_y = ((y * CELLS_Y as f32) as u16).min(CELLS_Y - 1);
     let cell = cell_x + cell_y * CELLS_X;
     debug_assert!(
         cell < CELLS,
@@ -73,7 +136,7 @@ struct SimulationInputEuler {
     vx: Pbox<f32>,
     vy: Pbox<f32>,
     k: Pbox<u8>,
-    relation_table: Box<[f32; KINDS2]>,
+    relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]>,
 }
 struct SimulationInputVerlet {
     x0: Pbox<f32>,
@@ -81,18 +144,46 @@ struct SimulationInputVerlet {
     x1: Pbox<f32>,
     y1: Pbox<f32>,
     k: Pbox<u8>,
-    relation_table: Box<[f32; KINDS2]>,
+    relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]>,
+}
+#[derive(Copy, Clone)]
+struct Params {
+    zoom_x: f32,
+    zoom_y: f32,
+    offset_x: f32,
+    offset_y: f32,
+}
+unsafe impl bytemuck::Zeroable for Params {}
+unsafe impl bytemuck::Pod for Params {}
+impl Params {
+    fn new() -> Self {
+        Self {
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }
+    }
+}
+struct KeyState {
+    up: f32,
+    down: f32,
+}
+impl KeyState {
+    fn new() -> Self {
+        Self { up: 0.0, down: 0.0 }
+    }
 }
 impl SimulationInputEuler {
     fn new() -> SimulationInputEuler {
         let mut rng = Prng(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as u64,
+            34898, //SystemTime::now()
+                  //    .duration_since(SystemTime::UNIX_EPOCH)
+                  //    .unwrap()
+                  //    .as_micros() as u64,
         );
         let xy_range = 0.0..1.0;
-        let v_range = -1.0..1.0;
+        let v_range = -0.1..0.1; //-1.0..1.0;
         fn iter_alloc<T: std::fmt::Debug, const SIZE: usize, F: FnMut() -> T>(
             mut f: F,
         ) -> Box<[T; SIZE]> {
@@ -109,7 +200,7 @@ impl SimulationInputEuler {
             vx: iter_alloc(|| rng.f32(v_range.clone())).into(),
             vy: iter_alloc(|| rng.f32(v_range.clone())).into(),
             k: iter_alloc(|| rng.u8(NUM_KINDS as u8)).into(),
-            relation_table: iter_alloc(|| rng.f32(-1.0..1.0)),
+            relation_table: Box::new(from_fn(|_| from_fn(|_| K_FAC * rng.f32(-1.0..1.0)))),
         }
     }
     fn verlet(self) -> SimulationInputVerlet {
@@ -123,8 +214,8 @@ impl SimulationInputEuler {
             .zip(x1.iter_mut())
             .zip(y1.iter_mut())
         {
-            *x1 = (x0 + *x1 * DT).rem_euclid(0.999);
-            *y1 = (y0 + *y1 * DT).rem_euclid(0.999);
+            *x1 = (x0 + *x1 * DT).rem_euclid(1.0);
+            *y1 = (y0 + *y1 * DT).rem_euclid(1.0);
         }
         SimulationInputVerlet {
             x0,
@@ -170,6 +261,29 @@ macro_rules! index_wrap {
 }
 index_wrap!(Pid, u16, "Point index");
 index_wrap!(Cid, u16, "Cell index");
+/// Packed "float" and 4 bit value, exploiting unused bits in a float to save some memory.
+#[repr(transparent)]
+#[derive(Copy, Clone, Default, Debug)]
+struct Packed(u32);
+impl Packed {
+    fn pack(float: f32, val: u8) -> u32 {
+        // float needs to be in the range 64.0_f32..128.0_f32
+        // 0b10111101000000000000000000000000
+        let mask: u32 = 0b00111100000000000000000000000000;
+        let shift = mask.trailing_zeros();
+        float.to_bits() | ((val as u32) << shift)
+    }
+    fn unpack(self) -> (f32, u8) {
+        // float needs to be in the range 64.0_f32..128.0_f32
+        // 0b10111101000000000000000000000000
+        let packed = self.0;
+        let mask: u32 = 0b00111100000000000000000000000000;
+        let shift = mask.trailing_zeros();
+        let float = f32::from_bits(packed & (!mask));
+        let val = ((packed & mask) >> shift) as u8;
+        (float, val)
+    }
+}
 #[derive(Debug)]
 struct Tb<I, T, const SIZE: usize>(Box<[T; SIZE]>, PhantomData<I>);
 impl<I, T, const SIZE: usize> From<Box<[T; SIZE]>> for Tb<I, T, SIZE> {
@@ -226,13 +340,10 @@ struct SimulationState {
 
     point_cell_offset: Pbox<Pid>,
 
-    
     cell_count: Cbox<Pid>,
     cell_index: Cbox<Pid>,
-    //cell_index_end: Cbox<Pid>,
 
-
-    relation_table: Box<[f32; KINDS2]>,
+    relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]>,
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -260,13 +371,17 @@ where
 impl SimulationState {
     fn new(input: SimulationInputVerlet) -> Self {
         let SimulationInputVerlet {
-            x0,
-            y0,
-            x1,
-            y1,
+            mut x0,
+            mut y0,
+            mut x1,
+            mut y1,
             k,
             relation_table,
         } = input;
+        x0.iter_mut().for_each(|e| *e = scale_simulation_x(*e));
+        y0.iter_mut().for_each(|e| *e = scale_simulation_y(*e));
+        x1.iter_mut().for_each(|e| *e = scale_simulation_x(*e));
+        y1.iter_mut().for_each(|e| *e = scale_simulation_y(*e));
         let mut this = Self {
             x0: calloc(),
             y0: calloc(),
@@ -316,147 +431,142 @@ impl SimulationState {
     #[inline(never)]
     // update starts right after previous physics update to reduce construction size.
     fn update(&mut self) {
-        for cx in 0..CELLS_X {
-            for cy in 0..CELLS_Y {
-                //for i in (0..NUM_POINTS_U).map(Into::into) {
-                let cell: Cid = usize::from(cx + cy * CELLS_X).into();
-                self.surround_buffer_x.clear();
-                self.surround_buffer_y.clear();
-                self.surround_buffer_k.clear();
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        let cell_x = cx as i32 + dx as i32;
-                        let cell_y = cy as i32 + dy as i32;
-                        let (offset_x, cell_x) = if cell_x == -1 {
-                            (-1.0, CELLS_X as i32 - 1)
-                        } else if cell_x == CELLS_X as i32 {
-                            (1.0, 0)
-                        } else {
-                            (0.0, cell_x)
-                        };
-                        let (offset_y, cell_y) = if cell_y == -1 {
-                            (-1.0, CELLS_Y as i32 - 1)
-                        } else if cell_y == CELLS_Y as i32 {
-                            (1.0, 0)
-                        } else {
-                            (0.0, cell_y)
-                        };
-                        let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
+        timed!("Physics", {
+            self.cell_count.iter_mut().for_each(|e| *e = 0.into());
+            for cx in 0..CELLS_X {
+                for cy in 0..CELLS_Y {
+                    //for i in (0..NUM_POINTS_U).map(Into::into) {
+                    let cell: Cid = usize::from(cx + cy * CELLS_X).into();
+                    self.surround_buffer_x.clear();
+                    self.surround_buffer_y.clear();
+                    self.surround_buffer_k.clear();
+                    for dx in -1..=1 {
+                        for dy in -1..=1 {
+                            let cell_x = cx as i32 + dx as i32;
+                            let cell_y = cy as i32 + dy as i32;
+                            let (offset_x, cell_x) = if cell_x == -1 {
+                                (-WIDTH_X, CELLS_X as i32 - 1)
+                            } else if cell_x == CELLS_X as i32 {
+                                (WIDTH_X, 0)
+                            } else {
+                                (0.0, cell_x)
+                            };
+                            let (offset_y, cell_y) = if cell_y == -1 {
+                                (-WIDTH_Y, CELLS_Y as i32 - 1)
+                            } else if cell_y == CELLS_Y as i32 {
+                                (WIDTH_Y, 0)
+                            } else {
+                                (0.0, cell_y)
+                            };
+                            let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
 
-                        let range = usize::from(self.cell_index[cell])
-                            ..usize::from(self.cell_index[cell+1.into()]);
-                        for i in range.map(Into::into) {
-                            self.surround_buffer_x.push(self.x1[i] + offset_x);
-                            self.surround_buffer_y.push(self.y1[i] + offset_y);
-                            self.surround_buffer_k.push(self.k[i]);
+                            let range = usize::from(self.cell_index[cell])
+                                ..usize::from(self.cell_index[cell + 1.into()]);
+                            for i in range.map(Into::into) {
+                                self.surround_buffer_x.push(self.x1[i] + offset_x);
+                                self.surround_buffer_y.push(self.y1[i] + offset_y);
+                                self.surround_buffer_k.push(self.k[i]);
+                            }
                         }
                     }
-                }
-                for i in (usize::from(self.cell_index[cell])
-                    ..usize::from(self.cell_index[cell+1.into()]))
-                    .map(Into::into)
-                {
-                    let x0 = self.x0[i];
-                    let y0 = self.y0[i];
-                    let x1 = self.x1[i];
-                    let y1 = self.y1[i];
-                    let k = self.k[i];
-                    let mut acc_x = 0.0;
-                    let mut acc_y = 0.0;
-                    for ((&x_other, &y_other), k_other) in self
-                        .surround_buffer_x
-                        .iter()
-                        .zip(self.surround_buffer_y.iter())
-                        .zip(self.surround_buffer_k.iter())
+                    for i in (usize::from(self.cell_index[cell])
+                        ..usize::from(self.cell_index[cell + 1.into()]))
+                        .map(Into::into)
                     {
-                        // https://www.desmos.com/calculator/yos22615bv
-                        //
+                        let x0 = self.x0[i];
+                        let y0 = self.y0[i];
+                        let x1 = self.x1[i];
+                        let y1 = self.y1[i];
+                        let k = self.k[i];
+                        let mut acc_x = 0.0;
+                        let mut acc_y = 0.0;
+                        let local_k_arr: [f32; NUM_KINDS] =
+                            *unsafe { self.relation_table.get_unchecked(k as usize) };
+                        for ((&x_other, &y_other), &k_other) in self
+                            .surround_buffer_x
+                            .iter()
+                            .zip(self.surround_buffer_y.iter())
+                            .zip(self.surround_buffer_k.iter())
+                        {
+                            // https://www.desmos.com/calculator/yos22615bv
 
-                        let dx = x1 - x_other;
-                        let dy = y1 - y_other;
-                        let dot = dx * dx + dy * dy;
-                        let r = dot.sqrt();
+                            let dx = x1 - x_other;
+                            let dy = y1 - y_other;
+                            let dot = dx * dx + dy * dy;
+                            let r = dot.sqrt();
 
-                        const BETA: f32 = 0.3;
-                        let f = {
-                            let x = r * (1.0 / POINT_MAX_RADIUS);
-                            let k: f32 =
-                                0.2 * self.relation_table[(k_other + k * NUM_KINDS as u8) as usize];
-                            //let c = 1.0 - x / BETA;
-                            let c = 0.1 * (1.0 / (x * x) - 1.0 / (BETA * BETA));
-                            ((2.0 * k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c)
-                        };
-                        let dir_x = dx / r;
-                        let dir_y = dy / r;
-                        //let f: f32 = 0.001
-                        //    * (1.0 / (r * r) - 1.0 / (POINT_MAX_RADIUS * POINT_MAX_RADIUS))
-                        //        .max(0.0);
-                        if f.is_finite() && dir_x.is_finite() && dir_y.is_finite() {
-                            acc_x += dir_x * f;
-                            acc_y += dir_y * f;
+                            let x = r * (MIN_WIDTH / POINT_MAX_RADIUS);
+                            let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
+                            //let c = 4.0 * (1.0 - x / BETA);
+                            let c = 10.0 * (1.0 / x - 1.0 / (BETA));
+
+                            let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
+                            let dir_x = dx / r;
+                            let dir_y = dy / r;
+                            if dot != 0.0 {
+                                acc_x += dir_x * f;
+                                acc_y += dir_y * f;
+                            }
                         }
-                    }
-                    let mut vx = x1 - x0;
-                    let mut vy = y1 - y0;
+                        let mut vx = x1 - x0;
+                        let mut vy = y1 - y0;
 
-                    for dx in [-1.0, 0.0, 1.0] {
-                        let c = x1 - x0 + dx;
-                        if c.abs() < vx.abs() {
-                            vx = c
+                        for dx in [-WIDTH_X, WIDTH_X] {
+                            let c = x1 - x0 + dx;
+                            if c.abs() < vx.abs() {
+                                vx = c
+                            }
                         }
-                    }
-                    for dy in [-1.0, 0.0, 1.0] {
-                        let c = y1 - y0 + dy;
-                        if c.abs() < vy.abs() {
-                            vy = c
+                        for dy in [-WIDTH_Y, WIDTH_Y] {
+                            let c = y1 - y0 + dy;
+                            if c.abs() < vy.abs() {
+                                vy = c
+                            }
                         }
+                        let v2 = vx * vx + vy * vy;
+                        let vx_norm = vx / v2.sqrt();
+                        let vy_norm = vy / v2.sqrt();
+                        let friction_force = v2 * (50.0 / (DT * DT));
+                        acc_x += friction_force * (-vx_norm);
+                        acc_y += friction_force * (-vy_norm);
+
+                        let new_x = mod_simulation_x(x1 + vx + acc_x * DT * DT); //.rem_euclid(1.0);
+                        let new_y = mod_simulation_y(y1 + vy + acc_y * DT * DT); //.rem_euclid(1.0);
+
+                        self.x1_tmp[i] = new_x;
+                        self.y1_tmp[i] = new_y;
+
+                        self.x0_tmp[i] = x1;
+                        self.y0_tmp[i] = y1;
+
+                        let new_cell = compute_cell(new_x, new_y);
+                        self.point_cell[i] = new_cell;
+                        self.point_cell_offset[i] = self.cell_count[new_cell];
+                        self.cell_count[new_cell] += 1.into();
                     }
-                    let v2 = vx * vx + vy * vy;
-                    let vx_norm = vx / v2.sqrt();
-                    let vy_norm = vy / v2.sqrt();
-                    let friction_force = v2 * (100.0 / (DT * DT));
-                    acc_x += friction_force * (-vx_norm);
-                    acc_y += friction_force * (-vy_norm);
-
-                    let new_x = (x1 + vx + acc_x * DT * DT).rem_euclid(0.99999);
-                    let new_y = (y1 + vy + acc_y * DT * DT).rem_euclid(0.99999);
-                    self.x0[i] = x1;
-                    self.x1[i] = new_x;
-                    self.y0[i] = y1;
-                    self.y1[i] = new_y;
-
-                    self.x0_tmp[i] = self.x0[i];
-                    self.y0_tmp[i] = self.y0[i];
-                    self.x1_tmp[i] = self.x1[i];
-                    self.y1_tmp[i] = self.y1[i];
-                    self.k_tmp[i] = k;
                 }
             }
-        }
-        self.cell_count.iter_mut().for_each(|e| *e = 0.into());
-        for i in (0..NUM_POINTS_U).map(Into::into) {
-            let new_x = self.x1_tmp[i];
-            let new_y = self.y1_tmp[i];
-            let cell = compute_cell(new_x, new_y);
-            self.point_cell[i] = cell;
-            self.point_cell_offset[i] = self.cell_count[cell];
-            self.cell_count[cell] += 1.into();
-        }
-        let mut acc: Pid = 0.into();
-        for i in (0..CELLS_PLUS_1_U).map(Into::into) {
-            self.cell_index[i] = acc;
-            let count = self.cell_count[i];
-            acc += count;
-        }
-        for i in (0..NUM_POINTS_U).map(Into::into) {
-            let cell = self.point_cell[i];
-            let index = self.cell_index[cell] + self.point_cell_offset[i];
-            self.x0[index] = self.x0_tmp[i];
-            self.y0[index] = self.y0_tmp[i];
-            self.x1[index] = self.x1_tmp[i];
-            self.y1[index] = self.y1_tmp[i];
-            self.k[index] = self.k_tmp[i];
-        }
+        });
+        timed!("PPA", {
+            let mut acc: Pid = 0.into();
+            for i in (0..CELLS_PLUS_1_U).map(Into::into) {
+                self.cell_index[i] = acc;
+                let count = self.cell_count[i];
+                acc += count;
+            }
+        });
+        timed!("Insert", {
+            for i in (0..NUM_POINTS_U).map(Into::into) {
+                let cell = self.point_cell[i];
+                let index = self.cell_index[cell] + self.point_cell_offset[i];
+                self.x0[index] = self.x0_tmp[i];
+                self.y0[index] = self.y0_tmp[i];
+                self.x1[index] = self.x1_tmp[i];
+                self.y1[index] = self.y1_tmp[i];
+                self.k_tmp[index] = self.k[i];
+            }
+            swap(&mut self.k, &mut self.k_tmp);
+        });
     }
     fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
         data.clear();
@@ -512,36 +622,6 @@ macro_rules! dbgc {
             }
         }
     }};
-}
-
-#[derive(Debug)]
-struct SimParams {
-    forces: Vec<f32>,
-}
-
-impl SimParams {
-    fn new() -> SimParams {
-        let mut rng;
-        //rng = Prng(13);
-        cfg_if::cfg_if! {
-            if #[cfg(target_arch = "wasm32")] {
-                rng = Prng(13);
-            } else {
-                rng = Prng(SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64);
-            }
-        }
-
-        printlnc!("seed: {}", rng.0);
-
-        SimParams {
-            forces: (0..NUM_KINDS * NUM_KINDS)
-                .map(|_| rng.f32(-1.0..1.0))
-                .collect(),
-        }
-    }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
@@ -638,6 +718,8 @@ fn window_setup() -> (EventLoop<()>, Window) {
     (event_loop, window)
 }
 struct State {
+    params: Params,
+
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -659,35 +741,8 @@ struct State {
 
     point_transfer_buffer: Vec<GpuPoint>,
     gpu_point_buffer: wgpu::Buffer,
-}
 
-macro_rules! timed {
-    ($name:expr, $code:block) => {{
-        static mut COUNT: u8 = 0;
-        static mut TIME: Duration = Duration::ZERO;
-        if unsafe {
-            COUNT += 1;
-            COUNT == 120
-        } {
-            println!(
-                "{}: {:?} potential fps, {:?} seconds/update",
-                $name,
-                120.0 / unsafe { TIME }.as_secs_f64(),
-                unsafe { TIME }.as_secs_f64() / 120.0
-            );
-            unsafe {
-                TIME = Duration::ZERO;
-                COUNT = 0;
-            }
-        }
-        let _time_pre: Instant = Instant::now();
-        {
-            $code
-        }
-        unsafe {
-            TIME += Instant::now().duration_since(_time_pre);
-        }
-    }};
+    params_buffer: wgpu::Buffer,
 }
 
 impl State {
@@ -711,9 +766,12 @@ impl State {
         dbgc!(adapter.limits());
 
         let limits = wgpu::Limits::downlevel_defaults(); //downlevel_webgl2_defaults();
-        
+
         dbgc!(&limits);
-        println!("Expected points per cell: {}", NUM_POINTS as f32 / CELLS as f32);
+        println!(
+            "Expected points per cell: {}",
+            NUM_POINTS as f32 / CELLS as f32
+        );
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -747,41 +805,70 @@ impl State {
         let mut point_transfer_buffer = Vec::new();
         simulation_state.serialize_gpu(&mut point_transfer_buffer);
         let gpu_point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
+            label: Some("Point Buffer"),
             contents: bytemuck::cast_slice(&point_transfer_buffer),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+        });
+
+        let params = Params::new();
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Param Buffer"),
+            contents: bytemuck::cast_slice(&bytemuck::cast::<_, [u8; size_of::<Params>()]>(params)),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
         });
 
         let bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Bind group layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: Default::default(),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: Default::default(),
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: Default::default(),
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Bind group"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(
-                    gpu_point_buffer.as_entire_buffer_binding(),
-                ),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        gpu_point_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        params_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+            ],
         });
 
         let shader_source: String = std::fs::read_to_string("src/shader.wgsl")
             .unwrap()
             .replace("{NUM_POINTS}", &format!("{}", NUM_POINTS))
-            .replace("{NUM_KINDS}", &format!("{}", NUM_KINDS));
+            .replace("{NUM_KINDS}", &format!("{}", NUM_KINDS))
+            .replace("{WIDTH_X}", &format!("{}", WIDTH_X))
+            .replace("{WIDTH_Y}", &format!("{}", WIDTH_Y));
 
         let render_pipeline;
         {
@@ -852,6 +939,8 @@ impl State {
             simulation_state,
             point_transfer_buffer,
             gpu_point_buffer,
+            params,
+            params_buffer,
         }
     }
 
@@ -877,13 +966,18 @@ impl State {
                 bytemuck::cast_slice(&self.point_transfer_buffer),
             );
             timed!("Core update", {
-                for _ in 0..3 {
+                for _ in 0..5 {
                     self.simulation_state.update();
                 }
             });
             self.simulation_state
                 .serialize_gpu(&mut self.point_transfer_buffer);
         });
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&bytemuck::cast::<_, [u8; size_of::<Params>()]>(self.params)),
+        );
         let mut encoder: wgpu::CommandEncoder =
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -909,7 +1003,7 @@ impl State {
         });
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.draw(0..(3 * NUM_POINTS), 0..1);
+        render_pass.draw(0..(3 * NUM_POINTS * 9), 0..1);
         drop(render_pass);
 
         self.queue.submit(Some(encoder.finish()));

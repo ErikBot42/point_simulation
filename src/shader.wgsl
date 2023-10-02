@@ -54,11 +54,19 @@ fn vs_main(
     in: VertexInput,
 ) -> VertexOutputMain {
     var out: VertexOutputMain;
+    
 
-    let group = in.vertex_index / 3u;
-    let member = in.vertex_index % 3u;
+    var remaining = in.vertex_index;
+    let tile = in.vertex_index / (3u * {NUM_POINTS}u);
+    remaining = remaining % (3u * {NUM_POINTS}u);
+    let group = remaining / 3u; // 0..NUM_POINTS
+    let member = remaining % 3u; // 0..3
+
+    let tile_x = tile % 3u; // 0..3
+    let tile_y = tile / 3u; // 0..3
     
     var offset: vec2<f32>;
+
 
     switch member {
         case 0u: {
@@ -79,7 +87,11 @@ fn vs_main(
 
     offset *= 0.5 * inner_radius_clip_space;
     
+
     let qqq = points[group];
+
+    offset += vec2<f32>(f32(tile_x) - 1.0, f32(tile_y) - 1.0) * vec2<f32>({WIDTH_X}, {WIDTH_Y}) * 2.0;
+
     offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
 
     let num_kinds: f32 = NUM_KINDS;
@@ -87,12 +99,15 @@ fn vs_main(
     let q = fract(f32(qqq.k) / num_kinds);//fract(f32(group) / num_kinds);
     let u = q * 1.0 * 3.141592;
     let w = (1.0 / 3.0) * 2.0 * 3.241592;
-    let color = vec4<f32>(
+    var color = vec4<f32>(
         pow(sin(u + 0.0 * w), 4.0),
         pow(sin(u + 1.0 * w), 4.0),
         pow(sin(u + 2.0 * w), 4.0),
         1.0
     );
+    if (tile_x != 1u || tile_y != 1u) {
+        color *= .2;
+    }
     out.color = color;
 
     out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
