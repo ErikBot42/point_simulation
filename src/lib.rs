@@ -49,23 +49,29 @@ const WIDTH_X: f32 = MAX_X - MIN_X;
 const WIDTH_Y: f32 = MAX_Y - MIN_Y;
 
 const MIN_WIDTH: f32 = if WIDTH_X > WIDTH_Y { WIDTH_Y } else { WIDTH_X };
-
+#[cfg(not(feature = "simd"))]
 const K_FAC: f32 = 2.0 * 0.2;
+#[cfg(feature = "simd")]
+const K_FAC: f32 = 2.0 * 0.2 * (1.0 / (1.0 - BETA));
 const BETA: f32 = 0.3; //0.3;
-const DT: f32 = 0.004; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
 const NUM_POINTS: u32 = 8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 
-fn check_valid_pos(f: f32) -> bool {
-    f >= MIN_X && f <= MAX_X
+fn debug_check_valid_pos(f: f32) -> bool {
+    #[cfg(debug_assertions)]
+    let r = f >= MIN_X && f <= MAX_X;
+    #[cfg(not(debug_assertions))]
+    let r = true;
+    r
 }
 
-macro_rules! assert_float {
+macro_rules! debug_assert_float {
     ($e:expr) => {{
-        let f = $e;
-        assert!(!f.is_nan(), "{f}");
+        let f: f32 = $e;
+        debug_assert!(!f.is_nan(), "{f}");
     }};
 }
 fn scale_simulation_x(f: f32) -> f32 {
@@ -391,6 +397,19 @@ impl<T, const SIZE: usize> From<Box<[T; SIZE]>> for UnsafeVec<T, SIZE> {
     }
 }
 
+impl<T, const SIZE: usize> Deref for UnsafeVec<T, SIZE> {
+    type Target = Box<[T; SIZE]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl<T, const SIZE: usize> DerefMut for UnsafeVec<T, SIZE> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 impl<T, const SIZE: usize> UnsafeVec<T, SIZE> {
     #[inline(always)]
     fn clear(&mut self) {
@@ -557,8 +576,58 @@ impl SimulationState {
                 self.surround_buffer_x.clear();
                 self.surround_buffer_y.clear();
                 self.surround_buffer_k.clear();
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
+                for dy in -1..=1 {
+                    let cell_y = cy as i32 + dy as i32;
+                    let (offset_y, cell_y) = if cell_y == -1 {
+                        (-WIDTH_Y, CELLS_Y as i32 - 1)
+                    } else if cell_y == CELLS_Y as i32 {
+                        (WIDTH_Y, 0)
+                    } else {
+                        (0.0, cell_y)
+                    };
+
+                    let cell_x_min = cx as i32 - 1;
+                    let cell_x_max = cx as i32 + 1;
+                    let cell_x_min_cropped = (cell_x_min as i32 - 1).max(0);
+                    let cell_x_max_cropped = (cell_x_max as i32 + 1).min(CELLS_X as i32 - 1);
+
+                    let cell_min_cropped: Cid = ((cell_x_min_cropped + cell_y * CELLS_X as i32) as usize).into();
+                    let cell_max_cropped: Cid = ((cell_x_max_cropped + cell_y * CELLS_X as i32) as usize).into();
+
+                    let range_middle = usize::from(self.cell_index[cell_min_cropped])
+                        ..usize::from(self.cell_index[cell_max_cropped + 1.into()]);
+                    
+
+                    for i in range_middle.map(Into::into) {
+                        unsafe {
+                            self.surround_buffer_x.push(self.x1[i]);
+                            self.surround_buffer_y.push(self.y1[i] + offset_y);
+                            self.surround_buffer_k.push(self.k[i]);
+                        }
+                    }
+                    //for dx in -1..=1 {
+                    //    let cell_x = cx as i32 + dx as i32;
+                    //    let (offset_x, cell_x) = if cell_x == -1 {
+                    //        (-WIDTH_X, CELLS_X as i32 - 1)
+                    //    } else if cell_x == CELLS_X as i32 {
+                    //        (WIDTH_X, 0)
+                    //    } else {
+                    //        (0.0, cell_x)
+                    //    };
+                    //    let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
+
+                    //    let range = usize::from(self.cell_index[cell])
+                    //        ..usize::from(self.cell_index[cell + 1.into()]);
+                    //    for i in range.map(Into::into) {
+                    //        unsafe {
+                    //            self.surround_buffer_x.push(self.x1[i] + offset_x);
+                    //            self.surround_buffer_y.push(self.y1[i] + offset_y);
+                    //            self.surround_buffer_k.push(self.k[i]);
+                    //        }
+                    //    }
+                    //}
+
+                    /*for dx in -1..=1 {
                         let cell_x = cx as i32 + dx as i32;
                         let cell_y = cy as i32 + dy as i32;
                         let (offset_x, cell_x) = if cell_x == -1 {
@@ -586,21 +655,19 @@ impl SimulationState {
                                 self.surround_buffer_k.push(self.k[i]);
                             }
                         }
-                        //for _ in 0..8 {
-                            //unsafe {
-                            //    self.surround_buffer_x.push(0.0);
-                            //    self.surround_buffer_y.push(0.0);
-                            //    self.surround_buffer_k.push(0);
-                            //}
-                        //}
+                    }*/
+                }
+                #[cfg(feature = "simd")]
+                {
+                    for _ in 0..EXTRA_ELEMS {
+                        unsafe {
+                            self.surround_buffer_x.push(0.0);
+                            self.surround_buffer_y.push(0.0);
+                        }
                     }
                 }
-                //println!(
-                //    "{}\t{}",
-                //    self.surround_buffer_x.len,
-                //    usize::from(self.cell_index[cell + 1.into()])
-                //        - usize::from(self.cell_index[cell])
-                //);
+                #[cfg(feature = "simd")]
+                const EXTRA_ELEMS: usize = 7; // round down num iterations to (hopefully?) skip these.
                 for i in (usize::from(self.cell_index[cell])
                     ..usize::from(self.cell_index[cell + 1.into()]))
                     .map(Into::into)
@@ -610,45 +677,117 @@ impl SimulationState {
                     let x1 = self.x1[i];
                     let y1 = self.y1[i];
                     let k = self.k[i];
-                    let mut acc_x = 0.0;
-                    let mut acc_y = 0.0;
-                    let local_k_arr: [f32; NUM_KINDS] =
-                        *unsafe { self.relation_table.get_unchecked(k as usize) };
-                    for ((&x_other, &y_other), &k_other) in self
-                        .surround_buffer_x
-                        .slice()
-                        .iter()
-                        .zip(self.surround_buffer_y.slice().iter())
-                        .zip(self.surround_buffer_k.slice().iter())
+                    let mut acc_x;
+                    let mut acc_y;
+
+                    // about 42 % faster
+                    #[cfg(feature = "simd")]
+                    unsafe {
+                        use simd::*;
+                        use std::arch::x86_64::*;
+                        let mut acc_x_s = set1(0.0);
+                        let mut acc_y_s = set1(0.0);
+
+                        let x1 = set1(x1);
+                        let y1 = set1(y1);
+                        // 256 = 8xf32 => 8 iterations
+                        // step_by rounds down
+                        let elements = self.surround_buffer_x.len;
+                        let k_base: __m256 =
+                            _mm256_load_ps(self.relation_table.as_ptr().add(k as _) as _);
+                        for i in (0..elements).step_by(8) {
+                            // load ks, zero extend, and index into base
+                            let k: __m256 = _mm256_permutevar8x32_ps(
+                                k_base,
+                                _mm256_cvtepu8_epi32(_mm256_castsi256_si128(loadiu(
+                                    self.surround_buffer_k.inner.as_mut_ptr().add(i)
+                                        as *const __m256i,
+                                ))),
+                            );
+                            let x_other = load(self.surround_buffer_x.as_ptr().add(i));
+                            let y_other = load(self.surround_buffer_y.as_ptr().add(i));
+
+                            // TODO: FMA/fast inv sqrt tricks
+                            let dx = sub(x1, x_other);
+                            let dy = sub(y1, y_other);
+                            let dot = fmadd(dx, dx, mul(dy, dy));
+                            let rsqrt = rsqrt_fast(dot);
+
+                            // NOTE: also test _mm256_rcp_ps
+                            let r = mul(rsqrt, dot); //sqrt(dot);
+                            let r_inv = mul(rsqrt, rsqrt);
+                            let x = mul(r, set1(1.0 / POINT_MAX_RADIUS));
+
+                            // do not inline, will change later
+                            // 4.0 * (1.0 - (x * (1.0 / BETA))) = (4.0 - (x * (4.0 / BETA)))
+                            //let c = mul(set1(4.0), sub(set1(1.0), mul(x, set1(1.0 / BETA))));
+                            //let c = fnmadd(x, set1(4.0 / BETA), set1(4.0));
+                            let c =
+                                fnmadd(r, set1((4.0 / BETA) * (1.0 / POINT_MAX_RADIUS)), set1(4.0));
+                            let f = max(
+                                mul(
+                                    k,
+                                    max(min(sub(x, set1(BETA)), sub(set1(1.0), x)), set1(0.0)),
+                                ),
+                                c,
+                            );
+                            // > 0.0 will also test for Nan
+                            //let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_GT_OQ);
+                            let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_NEQ_OQ);
+
+                            // f / r
+                            let f_div_r = and(mul(f, rsqrt), mask_ok);
+
+                            acc_x_s = fmadd(dx, f_div_r, acc_x_s);
+                            acc_y_s = fmadd(dy, f_div_r, acc_y_s);
+                        }
+                        acc_x = hadd(acc_x_s);
+                        acc_y = hadd(acc_y_s);
+                    }
+
+                    // about 52 % of execution time is spent here
+                    #[cfg(not(feature = "simd"))]
                     {
-                        // https://www.desmos.com/calculator/yos22615bv
+                        acc_x = 0.0;
+                        acc_y = 0.0;
+                        let local_k_arr: [f32; NUM_KINDS] =
+                            *unsafe { self.relation_table.get_unchecked(k as usize) };
+                        for ((&x_other, &y_other), &k_other) in self
+                            .surround_buffer_x
+                            .slice()
+                            .iter()
+                            .zip(self.surround_buffer_y.slice().iter())
+                            .zip(self.surround_buffer_k.slice().iter())
+                        {
+                            // https://www.desmos.com/calculator/yos22615bv
 
-                        let dx = x1 - x_other;
-                        let dy = y1 - y_other;
-                        let dot = dx * dx + dy * dy;
-                        let r = dot.sqrt();
+                            let dx = x1 - x_other;
+                            let dy = y1 - y_other;
+                            let dot = dx * dx + dy * dy;
+                            let r = dot.sqrt();
 
-                        let x = r * (1.0 / POINT_MAX_RADIUS);
-                        let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
-                        let c = 4.0 * (1.0 - x / BETA);
-                        //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
+                            let x = r * (1.0 / POINT_MAX_RADIUS);
+                            let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
+                            let c = 4.0 * (1.0 - x / BETA);
+                            //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
 
-                        let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
-                        let dir_x = dx / r;
-                        let dir_y = dy / r;
-                        if dot != 0.0 {
-                            acc_x += dir_x * f;
-                            acc_y += dir_y * f;
-                            assert_float!(acc_x);
-                            assert_float!(acc_y);
+                            let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
+                            let dir_x = dx / r;
+                            let dir_y = dy / r;
+                            if dot != 0.0 {
+                                acc_x += dir_x * f;
+                                acc_y += dir_y * f;
+                                debug_assert_float!(acc_x);
+                                debug_assert_float!(acc_y);
+                            }
                         }
                     }
-                    assert_float!(acc_x);
-                    assert_float!(acc_y);
+                    debug_assert_float!(acc_x);
+                    debug_assert_float!(acc_y);
                     acc_x *= MIN_WIDTH;
                     acc_y *= MIN_WIDTH;
-                    assert_float!(acc_x);
-                    assert_float!(acc_y);
+                    debug_assert_float!(acc_x);
+                    debug_assert_float!(acc_y);
                     let mut vx = x1 - x0;
                     let mut vy = y1 - y0;
 
@@ -675,10 +814,10 @@ impl SimulationState {
 
                     let new_x = mod_simulation_x(x1 + vx + acc_x * DT * DT); //.rem_euclid(1.0);
                     let new_y = mod_simulation_y(y1 + vy + acc_y * DT * DT); //.rem_euclid(1.0);
-                    if !(check_valid_pos(x1)
-                        && check_valid_pos(y1)
-                        && check_valid_pos(new_x)
-                        && check_valid_pos(new_y))
+                    if !(debug_check_valid_pos(x1)
+                        && debug_check_valid_pos(y1)
+                        && debug_check_valid_pos(new_x)
+                        && debug_check_valid_pos(new_y))
                     {
                         panic!("ERR: x1: {x1}, y1: {y1}, vx: {vx}, vy: {vy}, acc_x: {acc_x}, acc_y: {acc_y} new_x: {new_x}, new_y: {new_y}");
                     }
@@ -696,6 +835,10 @@ impl SimulationState {
                 }
             }
         }
+
+        // The last passes are very serial, but is fast enough
+        // that it basically does not matter
+
         let mut acc: Pid = 0.into();
         for i in (0..CELLS_PLUS_1_U).map(Into::into) {
             self.cell_index[i] = acc;
@@ -1197,10 +1340,22 @@ impl State {
     }
 }
 
-use core::arch::x86_64::*;
-use simd::*;
 mod simd {
+    #![allow(dead_code)]
     use core::arch::x86_64::*;
+    #[inline(always)]
+    pub unsafe fn load(a: *const f32) -> __m256 {
+        _mm256_load_ps(a)
+    }
+    pub unsafe fn loadu(a: *const f32) -> __m256 {
+        _mm256_loadu_ps(a)
+    }
+    pub unsafe fn loadi(a: *const __m256i) -> __m256i {
+        _mm256_load_si256(a)
+    }
+    pub unsafe fn loadiu(a: *const __m256i) -> __m256i {
+        _mm256_loadu_si256(a)
+    }
     #[inline(always)]
     pub unsafe fn mul(a: __m256, b: __m256) -> __m256 {
         _mm256_mul_ps(a, b)
@@ -1212,6 +1367,10 @@ mod simd {
     #[inline(always)]
     pub unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
         _mm256_and_si256(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn and(a: __m256, b: __m256) -> __m256 {
+        _mm256_and_ps(a, b)
     }
     #[inline(always)]
     pub unsafe fn andn(a: __m256, b: __m256) -> __m256 {
@@ -1226,15 +1385,35 @@ mod simd {
         _mm256_fmadd_ps(a, b, c)
     }
     #[inline(always)]
+    pub unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fmadd_ps(a, b, c)
+    }
+    #[inline(always)]
+    pub unsafe fn fnmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fnmadd_ps(a, b, c)
+    }
+    #[inline(always)]
+    pub unsafe fn fnmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fnmsub_ps(a, b, c)
+    }
+    #[inline(always)]
     pub unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
         _mm256_i32gather_ps::<SCALE>(p, indexes)
     }
     #[inline(always)]
-    pub unsafe fn rsqrt(a: __m256) -> __m256 {
+    pub unsafe fn sqrt(a: __m256) -> __m256 {
+        _mm256_sqrt_ps(a)
+    }
+    #[inline(always)]
+    pub unsafe fn div(a: __m256, b: __m256) -> __m256 {
+        _mm256_div_ps(a, b)
+    }
+    #[inline(always)]
+    pub unsafe fn rsqrt_fast(a: __m256) -> __m256 {
         _mm256_rsqrt_ps(a)
     }
     #[inline(always)]
-    pub unsafe fn splat(a: f32) -> __m256 {
+    pub unsafe fn set1(a: f32) -> __m256 {
         _mm256_set1_ps(a)
     }
     #[inline(always)]
@@ -1252,6 +1431,12 @@ mod simd {
     #[inline(always)]
     pub unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i {
         _mm256_slli_epi32::<IMM>(a)
+    }
+    #[inline(always)]
+    pub unsafe fn hadd(a: __m256) -> f32 {
+        let mut b: [f32; 8] = [0.0; 8];
+        _mm256_storeu_ps(b.as_mut_ptr(), a);
+        ((b[0] + b[1]) + (b[2] + b[3])) + ((b[4] + b[5]) + (b[6] + b[7]))
     }
 
     pub fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
