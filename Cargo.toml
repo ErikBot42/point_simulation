@@ -2,6 +2,7 @@
 name = "point_simulation"
 version = "0.1.0"
 edition = "2021"
+default-run = "point_simulation"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -21,6 +22,8 @@ log = "0.4.19"
 naga = "0.12.2"
 nohash = "0.2.0"
 
+[rust]
+debuginfo-level = 1
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.6"

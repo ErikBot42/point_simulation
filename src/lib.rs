@@ -1,6 +1,9 @@
 #![feature(portable_simd)]
+
 use std::array::from_fn;
+use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::mem::{replace, size_of, swap};
 use std::ops::Add;
 use std::ops::AddAssign;
@@ -18,34 +21,6 @@ use winit::{
     window::WindowBuilder,
 };
 
-macro_rules! timed {
-    ($name:expr, $code:block) => {{
-        static mut COUNT: u8 = 0;
-        static mut TIME: Duration = Duration::ZERO;
-        if unsafe {
-            COUNT += 1;
-            COUNT == 120
-        } {
-            println!(
-                "{}: {:?} potential fps, {:?} seconds/update",
-                $name,
-                120.0 / unsafe { TIME }.as_secs_f64(),
-                unsafe { TIME }.as_secs_f64() / 120.0
-            );
-            unsafe {
-                TIME = Duration::ZERO;
-                COUNT = 0;
-            }
-        }
-        let _time_pre: Instant = Instant::now();
-        {
-            $code
-        }
-        unsafe {
-            TIME += Instant::now().duration_since(_time_pre);
-        }
-    }};
-}
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -61,14 +36,14 @@ const CELLS_X: u16 = 64;
 const CELLS_Y: u16 = 64;
 const CELLS_MAX_DIM: u16 = if CELLS_X > CELLS_Y { CELLS_X } else { CELLS_Y };
 const CELLS: u16 = CELLS_X * CELLS_Y;
-const POINT_MAX_RADIUS: f32 = 1.0 / (CELLS_MAX_DIM as f32);
+const POINT_MAX_RADIUS: f32 = MIN_WIDTH / (CELLS_MAX_DIM as f32);
 
 // in SIMULATION space, not view space
 // exclusive upper bound
-const MIN_X: f32 = 0.2;
-const MAX_X: f32 = 0.8;
-const MIN_Y: f32 = 0.2;
-const MAX_Y: f32 = 0.8;
+const MIN_X: f32 = 0.0;
+const MAX_X: f32 = 1.0;
+const MIN_Y: f32 = 0.0;
+const MAX_Y: f32 = 1.0;
 
 const WIDTH_X: f32 = MAX_X - MIN_X;
 const WIDTH_Y: f32 = MAX_Y - MIN_Y;
@@ -76,13 +51,23 @@ const WIDTH_Y: f32 = MAX_Y - MIN_Y;
 const MIN_WIDTH: f32 = if WIDTH_X > WIDTH_Y { WIDTH_Y } else { WIDTH_X };
 
 const K_FAC: f32 = 2.0 * 0.2;
-const BETA: f32 = 0.3;
-const DT: f32 = 0.005; // TODO: define max speed/max dt from cell size.
+const BETA: f32 = 0.3; //0.3;
+const DT: f32 = 0.004; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const NUM_POINTS: u32 = 2048; //16384;
+const NUM_POINTS: u32 = 8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 
+fn check_valid_pos(f: f32) -> bool {
+    f >= MIN_X && f <= MAX_X
+}
+
+macro_rules! assert_float {
+    ($e:expr) => {{
+        let f = $e;
+        assert!(!f.is_nan(), "{f}");
+    }};
+}
 fn scale_simulation_x(f: f32) -> f32 {
     MIN_X + (MAX_X - MIN_X) * f
 }
@@ -147,6 +132,7 @@ struct SimulationInputVerlet {
     relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]>,
 }
 #[derive(Copy, Clone)]
+#[repr(C)]
 struct Params {
     zoom_x: f32,
     zoom_y: f32,
@@ -165,23 +151,31 @@ impl Params {
         }
     }
 }
+#[derive(Default)]
 struct KeyState {
-    up: f32,
-    down: f32,
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    zoom_in: bool,
+    zoom_out: bool,
 }
 impl KeyState {
     fn new() -> Self {
-        Self { up: 0.0, down: 0.0 }
+        Self::default()
     }
 }
 impl SimulationInputEuler {
-    fn new() -> SimulationInputEuler {
-        let mut rng = Prng(
-            34898, //SystemTime::now()
-                  //    .duration_since(SystemTime::UNIX_EPOCH)
-                  //    .unwrap()
-                  //    .as_micros() as u64,
-        );
+    fn new() -> Self {
+        Self::from_seed(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64,
+        )
+    }
+    fn from_seed(seed: u64) -> SimulationInputEuler {
+        let mut rng = Prng(seed);
         let xy_range = 0.0..1.0;
         let v_range = -0.1..0.1; //-1.0..1.0;
         fn iter_alloc<T: std::fmt::Debug, const SIZE: usize, F: FnMut() -> T>(
@@ -307,19 +301,148 @@ impl<I, T, const SIZE: usize> DerefMut for Tb<I, T, SIZE> {
 impl<I: Into<usize>, T, const SIZE: usize> Index<I> for Tb<I, T, SIZE> {
     type Output = T;
     fn index(&self, index: I) -> &Self::Output {
-        &self.0[index.into()]
+        //&self.0[index.into()]
+        unsafe { self.0.get_unchecked(index.into()) }
     }
 }
 impl<I: Into<usize>, T, const SIZE: usize> IndexMut<I> for Tb<I, T, SIZE> {
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        &mut self.0[index.into()]
+        //&mut self.0[index.into()]
+        unsafe { self.0.get_unchecked_mut(index.into()) }
     }
 }
 type Pbox<T> = Tb<Pid, T, NUM_POINTS_U>;
 type Cbox<T> = Tb<Cid, T, CELLS_PLUS_1_U>;
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
+use std::thread;
+
+struct SimThreadController {
+    recv: Receiver<Vec<GpuPoint>>,
+    counter: Arc<AtomicUsize>,
+}
+impl SimThreadController {
+    fn get_state(&mut self, v: &mut Vec<GpuPoint>) {
+        *v = self.recv.recv().unwrap();
+    }
+    fn try_get_state(&mut self, v: &mut Vec<GpuPoint>) {
+        let _ = self.recv.try_recv().map(|r| {
+            self.counter.fetch_sub(1, Relaxed);
+            *v = r
+        });
+    }
+    fn new() -> Self {
+        let (send, recv) = channel();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let their_counter = counter.clone();
+        thread::spawn(|| {
+            let send = send;
+            let counter = their_counter;
+            let mut simulation_state = SimulationState::new();
+            let mut delta = Instant::now();
+            let mut updates = 0;
+            loop {
+                simulation_state.update();
+                updates += 1;
+                let mut v = Vec::new();
+                if counter.load(Relaxed) < 5 {
+                    simulation_state.serialize_gpu(&mut v);
+                    counter.fetch_add(1, Relaxed);
+                    send.send(v).unwrap();
+                }
+                let elapsed = delta.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    let ups = updates as f64 / elapsed.as_secs_f64();
+                    println!("ups: {ups}");
+                    updates = 0;
+                    delta = Instant::now();
+                }
+            }
+        });
+
+        SimThreadController { recv, counter }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct GpuPoint {
+    x: f32,
+    y: f32,
+    k: u32,
+    _unused: u32,
+}
+unsafe impl bytemuck::Zeroable for GpuPoint {}
+unsafe impl bytemuck::Pod for GpuPoint {}
+
+type UnsafePointVec<T> = UnsafeVec<T, NUM_POINTS_U>;
+
+struct UnsafeVec<T, const SIZE: usize> {
+    inner: Box<[T; SIZE]>,
+    len: usize,
+}
+
+impl<T, const SIZE: usize> From<Box<[T; SIZE]>> for UnsafeVec<T, SIZE> {
+    fn from(inner: Box<[T; SIZE]>) -> Self {
+        UnsafeVec { inner, len: 0 }
+    }
+}
+
+impl<T, const SIZE: usize> UnsafeVec<T, SIZE> {
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+    #[inline(always)]
+    unsafe fn push(&mut self, element: T) {
+        *self.inner.get_unchecked_mut(self.len) = element;
+        self.len += 1;
+    }
+    #[inline(always)]
+    fn slice(&self) -> &[T] {
+        &unsafe { self.inner.get_unchecked(0..self.len) }
+    }
+}
+
+fn calloc<T: Default + Debug + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize, O>() -> O
+where
+    O: From<Box<[T; SIZE]>>,
+{
+    //let b: Box<[T; SIZE]> = (0..SIZE)
+    //    .map(|_| T::default())
+    //    .collect::<Vec<T>>()
+    //    .try_into()
+    //    .unwrap();
+    let b = aligned_alloc();
+    let alignment = 1 << (b.as_ptr() as usize).trailing_zeros();
+    println!(
+        "ALIGNMENT: {}, LEN: {} {}",
+        alignment,
+        b.len(),
+        if alignment >= 64 { "(OK)" } else { "" }
+    );
+    O::from(b)
+}
+
+fn aligned_alloc<T: Default + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize>(
+) -> Box<[T; SIZE]> {
+    #[repr(align(64), C)]
+    struct AlignedBytes([u8; 64]);
+
+    let mut v = ManuallyDrop::new(
+        (0..((SIZE * size_of::<T>()) / size_of::<AlignedBytes>()))
+            .map(|_| AlignedBytes([0; 64]))
+            .collect::<Vec<AlignedBytes>>(),
+    );
+    v.shrink_to_fit();
+    unsafe { Box::from_raw(v.as_mut_ptr() as *mut [T; SIZE]) }
+}
+
 /// Entire state of the simulation
-struct SimulationState {
+pub struct SimulationState {
     x0: Pbox<f32>,
     y0: Pbox<f32>,
     x1: Pbox<f32>,
@@ -332,9 +455,9 @@ struct SimulationState {
     y1_tmp: Pbox<f32>,
     k_tmp: Pbox<u8>,
 
-    surround_buffer_x: Vec<f32>,
-    surround_buffer_y: Vec<f32>,
-    surround_buffer_k: Vec<u8>,
+    surround_buffer_x: UnsafePointVec<f32>,
+    surround_buffer_y: UnsafePointVec<f32>,
+    surround_buffer_k: UnsafePointVec<u8>,
 
     point_cell: Pbox<Cid>,
 
@@ -345,31 +468,14 @@ struct SimulationState {
 
     relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]>,
 }
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct GpuPoint {
-    x: f32,
-    y: f32,
-    k: u32,
-    _unused: u32,
-}
-unsafe impl bytemuck::Zeroable for GpuPoint {}
-unsafe impl bytemuck::Pod for GpuPoint {}
-
-fn calloc<T: Default, const SIZE: usize, O>() -> O
-where
-    O: From<Box<[T; SIZE]>>,
-{
-    O::from(unsafe {
-        (0..SIZE)
-            .map(|_| T::default())
-            .collect::<Vec<T>>()
-            .try_into()
-            .unwrap_unchecked()
-    })
-}
 impl SimulationState {
-    fn new(input: SimulationInputVerlet) -> Self {
+    pub fn new() -> Self {
+        Self::from_verlet(SimulationInputEuler::new().verlet())
+    }
+    pub fn from_seed(seed: u64) -> Self {
+        Self::from_verlet(SimulationInputEuler::from_seed(seed).verlet())
+    }
+    fn from_verlet(input: SimulationInputVerlet) -> Self {
         let SimulationInputVerlet {
             mut x0,
             mut y0,
@@ -388,20 +494,32 @@ impl SimulationState {
             x1: calloc(),
             y1: calloc(),
             k: calloc(),
-            x0_tmp: x0,
-            y0_tmp: y0,
-            x1_tmp: x1,
-            y1_tmp: y1,
-            k_tmp: k,
-            surround_buffer_x: Vec::new(),
-            surround_buffer_y: Vec::new(),
-            surround_buffer_k: Vec::new(),
+            x0_tmp: calloc(),
+            y0_tmp: calloc(),
+            x1_tmp: calloc(),
+            y1_tmp: calloc(),
+            k_tmp: calloc(),
+            surround_buffer_x: calloc(),
+            surround_buffer_y: calloc(),
+            surround_buffer_k: calloc(),
             point_cell: calloc(),
             point_cell_offset: calloc(),
             cell_count: calloc(),
             cell_index: calloc(),
-            relation_table,
+            relation_table: calloc(),
         };
+        this.x0_tmp.copy_from_slice(&**x0);
+        this.y0_tmp.copy_from_slice(&**y0);
+        this.x1_tmp.copy_from_slice(&**x1);
+        this.y1_tmp.copy_from_slice(&**y1);
+        this.k_tmp.copy_from_slice(&**k);
+        this.relation_table.copy_from_slice(&*relation_table);
+        drop(x0);
+        drop(y0);
+        drop(x1);
+        drop(y1);
+        drop(k);
+
         this.cell_count.iter_mut().for_each(|e| *e = 0.into());
         for i in (0..NUM_POINTS_U).map(Into::into) {
             let new_x = this.x1_tmp[i];
@@ -426,147 +544,175 @@ impl SimulationState {
             this.y1[index] = this.y1_tmp[i];
             this.k[index] = this.k_tmp[i];
         }
+        this.cell_count.iter_mut().for_each(|e| *e = 0.into());
         this
     }
     #[inline(never)]
-    // update starts right after previous physics update to reduce construction size.
-    fn update(&mut self) {
-        timed!("Physics", {
-            self.cell_count.iter_mut().for_each(|e| *e = 0.into());
-            for cx in 0..CELLS_X {
-                for cy in 0..CELLS_Y {
-                    //for i in (0..NUM_POINTS_U).map(Into::into) {
-                    let cell: Cid = usize::from(cx + cy * CELLS_X).into();
-                    self.surround_buffer_x.clear();
-                    self.surround_buffer_y.clear();
-                    self.surround_buffer_k.clear();
-                    for dx in -1..=1 {
-                        for dy in -1..=1 {
-                            let cell_x = cx as i32 + dx as i32;
-                            let cell_y = cy as i32 + dy as i32;
-                            let (offset_x, cell_x) = if cell_x == -1 {
-                                (-WIDTH_X, CELLS_X as i32 - 1)
-                            } else if cell_x == CELLS_X as i32 {
-                                (WIDTH_X, 0)
-                            } else {
-                                (0.0, cell_x)
-                            };
-                            let (offset_y, cell_y) = if cell_y == -1 {
-                                (-WIDTH_Y, CELLS_Y as i32 - 1)
-                            } else if cell_y == CELLS_Y as i32 {
-                                (WIDTH_Y, 0)
-                            } else {
-                                (0.0, cell_y)
-                            };
-                            let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
+    pub fn update(&mut self) {
+        // core physics
+        for cx in 0..CELLS_X {
+            for cy in 0..CELLS_Y {
+                //for i in (0..NUM_POINTS_U).map(Into::into) {
+                let cell: Cid = usize::from(cx + cy * CELLS_X).into();
+                self.surround_buffer_x.clear();
+                self.surround_buffer_y.clear();
+                self.surround_buffer_k.clear();
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let cell_x = cx as i32 + dx as i32;
+                        let cell_y = cy as i32 + dy as i32;
+                        let (offset_x, cell_x) = if cell_x == -1 {
+                            (-WIDTH_X, CELLS_X as i32 - 1)
+                        } else if cell_x == CELLS_X as i32 {
+                            (WIDTH_X, 0)
+                        } else {
+                            (0.0, cell_x)
+                        };
+                        let (offset_y, cell_y) = if cell_y == -1 {
+                            (-WIDTH_Y, CELLS_Y as i32 - 1)
+                        } else if cell_y == CELLS_Y as i32 {
+                            (WIDTH_Y, 0)
+                        } else {
+                            (0.0, cell_y)
+                        };
+                        let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
 
-                            let range = usize::from(self.cell_index[cell])
-                                ..usize::from(self.cell_index[cell + 1.into()]);
-                            for i in range.map(Into::into) {
+                        let range = usize::from(self.cell_index[cell])
+                            ..usize::from(self.cell_index[cell + 1.into()]);
+                        for i in range.map(Into::into) {
+                            unsafe {
                                 self.surround_buffer_x.push(self.x1[i] + offset_x);
                                 self.surround_buffer_y.push(self.y1[i] + offset_y);
                                 self.surround_buffer_k.push(self.k[i]);
                             }
                         }
-                    }
-                    for i in (usize::from(self.cell_index[cell])
-                        ..usize::from(self.cell_index[cell + 1.into()]))
-                        .map(Into::into)
-                    {
-                        let x0 = self.x0[i];
-                        let y0 = self.y0[i];
-                        let x1 = self.x1[i];
-                        let y1 = self.y1[i];
-                        let k = self.k[i];
-                        let mut acc_x = 0.0;
-                        let mut acc_y = 0.0;
-                        let local_k_arr: [f32; NUM_KINDS] =
-                            *unsafe { self.relation_table.get_unchecked(k as usize) };
-                        for ((&x_other, &y_other), &k_other) in self
-                            .surround_buffer_x
-                            .iter()
-                            .zip(self.surround_buffer_y.iter())
-                            .zip(self.surround_buffer_k.iter())
-                        {
-                            // https://www.desmos.com/calculator/yos22615bv
-
-                            let dx = x1 - x_other;
-                            let dy = y1 - y_other;
-                            let dot = dx * dx + dy * dy;
-                            let r = dot.sqrt();
-
-                            let x = r * (MIN_WIDTH / POINT_MAX_RADIUS);
-                            let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
-                            //let c = 4.0 * (1.0 - x / BETA);
-                            let c = 10.0 * (1.0 / x - 1.0 / (BETA));
-
-                            let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
-                            let dir_x = dx / r;
-                            let dir_y = dy / r;
-                            if dot != 0.0 {
-                                acc_x += dir_x * f;
-                                acc_y += dir_y * f;
-                            }
-                        }
-                        let mut vx = x1 - x0;
-                        let mut vy = y1 - y0;
-
-                        for dx in [-WIDTH_X, WIDTH_X] {
-                            let c = x1 - x0 + dx;
-                            if c.abs() < vx.abs() {
-                                vx = c
-                            }
-                        }
-                        for dy in [-WIDTH_Y, WIDTH_Y] {
-                            let c = y1 - y0 + dy;
-                            if c.abs() < vy.abs() {
-                                vy = c
-                            }
-                        }
-                        let v2 = vx * vx + vy * vy;
-                        let vx_norm = vx / v2.sqrt();
-                        let vy_norm = vy / v2.sqrt();
-                        let friction_force = v2 * (50.0 / (DT * DT));
-                        acc_x += friction_force * (-vx_norm);
-                        acc_y += friction_force * (-vy_norm);
-
-                        let new_x = mod_simulation_x(x1 + vx + acc_x * DT * DT); //.rem_euclid(1.0);
-                        let new_y = mod_simulation_y(y1 + vy + acc_y * DT * DT); //.rem_euclid(1.0);
-
-                        self.x1_tmp[i] = new_x;
-                        self.y1_tmp[i] = new_y;
-
-                        self.x0_tmp[i] = x1;
-                        self.y0_tmp[i] = y1;
-
-                        let new_cell = compute_cell(new_x, new_y);
-                        self.point_cell[i] = new_cell;
-                        self.point_cell_offset[i] = self.cell_count[new_cell];
-                        self.cell_count[new_cell] += 1.into();
+                        //for _ in 0..8 {
+                            //unsafe {
+                            //    self.surround_buffer_x.push(0.0);
+                            //    self.surround_buffer_y.push(0.0);
+                            //    self.surround_buffer_k.push(0);
+                            //}
+                        //}
                     }
                 }
+                //println!(
+                //    "{}\t{}",
+                //    self.surround_buffer_x.len,
+                //    usize::from(self.cell_index[cell + 1.into()])
+                //        - usize::from(self.cell_index[cell])
+                //);
+                for i in (usize::from(self.cell_index[cell])
+                    ..usize::from(self.cell_index[cell + 1.into()]))
+                    .map(Into::into)
+                {
+                    let x0 = self.x0[i];
+                    let y0 = self.y0[i];
+                    let x1 = self.x1[i];
+                    let y1 = self.y1[i];
+                    let k = self.k[i];
+                    let mut acc_x = 0.0;
+                    let mut acc_y = 0.0;
+                    let local_k_arr: [f32; NUM_KINDS] =
+                        *unsafe { self.relation_table.get_unchecked(k as usize) };
+                    for ((&x_other, &y_other), &k_other) in self
+                        .surround_buffer_x
+                        .slice()
+                        .iter()
+                        .zip(self.surround_buffer_y.slice().iter())
+                        .zip(self.surround_buffer_k.slice().iter())
+                    {
+                        // https://www.desmos.com/calculator/yos22615bv
+
+                        let dx = x1 - x_other;
+                        let dy = y1 - y_other;
+                        let dot = dx * dx + dy * dy;
+                        let r = dot.sqrt();
+
+                        let x = r * (1.0 / POINT_MAX_RADIUS);
+                        let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
+                        let c = 4.0 * (1.0 - x / BETA);
+                        //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
+
+                        let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
+                        let dir_x = dx / r;
+                        let dir_y = dy / r;
+                        if dot != 0.0 {
+                            acc_x += dir_x * f;
+                            acc_y += dir_y * f;
+                            assert_float!(acc_x);
+                            assert_float!(acc_y);
+                        }
+                    }
+                    assert_float!(acc_x);
+                    assert_float!(acc_y);
+                    acc_x *= MIN_WIDTH;
+                    acc_y *= MIN_WIDTH;
+                    assert_float!(acc_x);
+                    assert_float!(acc_y);
+                    let mut vx = x1 - x0;
+                    let mut vy = y1 - y0;
+
+                    for dx in [-WIDTH_X, WIDTH_X] {
+                        let c = x1 - x0 + dx;
+                        if c.abs() < vx.abs() {
+                            vx = c
+                        }
+                    }
+                    for dy in [-WIDTH_Y, WIDTH_Y] {
+                        let c = y1 - y0 + dy;
+                        if c.abs() < vy.abs() {
+                            vy = c
+                        }
+                    }
+                    let v2 = vx * vx + vy * vy;
+                    let vx_norm = vx / v2.sqrt();
+                    let vy_norm = vy / v2.sqrt();
+                    let friction_force = v2 * (50.0 / (DT * DT));
+                    if !(vx_norm.is_nan() || vy_norm.is_nan()) {
+                        acc_x += friction_force * (-vx_norm);
+                        acc_y += friction_force * (-vy_norm);
+                    }
+
+                    let new_x = mod_simulation_x(x1 + vx + acc_x * DT * DT); //.rem_euclid(1.0);
+                    let new_y = mod_simulation_y(y1 + vy + acc_y * DT * DT); //.rem_euclid(1.0);
+                    if !(check_valid_pos(x1)
+                        && check_valid_pos(y1)
+                        && check_valid_pos(new_x)
+                        && check_valid_pos(new_y))
+                    {
+                        panic!("ERR: x1: {x1}, y1: {y1}, vx: {vx}, vy: {vy}, acc_x: {acc_x}, acc_y: {acc_y} new_x: {new_x}, new_y: {new_y}");
+                    }
+
+                    self.x1_tmp[i] = new_x;
+                    self.y1_tmp[i] = new_y;
+
+                    self.x0_tmp[i] = x1;
+                    self.y0_tmp[i] = y1;
+
+                    let new_cell = compute_cell(new_x, new_y);
+                    self.point_cell[i] = new_cell;
+                    self.point_cell_offset[i] = self.cell_count[new_cell];
+                    self.cell_count[new_cell] += 1.into();
+                }
             }
-        });
-        timed!("PPA", {
-            let mut acc: Pid = 0.into();
-            for i in (0..CELLS_PLUS_1_U).map(Into::into) {
-                self.cell_index[i] = acc;
-                let count = self.cell_count[i];
-                acc += count;
-            }
-        });
-        timed!("Insert", {
-            for i in (0..NUM_POINTS_U).map(Into::into) {
-                let cell = self.point_cell[i];
-                let index = self.cell_index[cell] + self.point_cell_offset[i];
-                self.x0[index] = self.x0_tmp[i];
-                self.y0[index] = self.y0_tmp[i];
-                self.x1[index] = self.x1_tmp[i];
-                self.y1[index] = self.y1_tmp[i];
-                self.k_tmp[index] = self.k[i];
-            }
-            swap(&mut self.k, &mut self.k_tmp);
-        });
+        }
+        let mut acc: Pid = 0.into();
+        for i in (0..CELLS_PLUS_1_U).map(Into::into) {
+            self.cell_index[i] = acc;
+            let count = replace(&mut self.cell_count[i], 0.into());
+            acc += count;
+        }
+
+        for i in (0..NUM_POINTS_U).map(Into::into) {
+            let cell = self.point_cell[i];
+            let index = self.cell_index[cell] + self.point_cell_offset[i];
+            self.x0[index] = self.x0_tmp[i];
+            self.y0[index] = self.y0_tmp[i];
+            self.x1[index] = self.x1_tmp[i];
+            self.y1[index] = self.y1_tmp[i];
+            self.k_tmp[index] = self.k[i];
+        }
+        swap(&mut self.k, &mut self.k_tmp);
     }
     fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
         data.clear();
@@ -644,17 +790,28 @@ pub async fn run() {
             WindowEvent::KeyboardInput {
                 input:
                     KeyboardInput {
-                        state: ElementState::Pressed,
+                        state: k,
                         virtual_keycode: Some(keycode),
                         ..
                     },
                 ..
             } => {
+                let p = match k {
+                    ElementState::Pressed => true,
+                    ElementState::Released => false,
+                };
                 use VirtualKeyCode::*;
+
                 match keycode {
-                    U => state.use_simd = dbgc!(!state.use_simd),
-                    _ => (),
+                    W => Some(&mut state.keystate.up),
+                    S => Some(&mut state.keystate.down),
+                    A => Some(&mut state.keystate.left),
+                    D => Some(&mut state.keystate.right),
+                    Space => Some(&mut state.keystate.zoom_out),
+                    LShift => Some(&mut state.keystate.zoom_in),
+                    _ => None,
                 }
+                .map(|e| *e = p);
             }
             WindowEvent::Resized(physical_size) => state.resize(physical_size),
             WindowEvent::ScaleFactorChanged { new_inner_size, .. } => state.resize(*new_inner_size),
@@ -693,9 +850,9 @@ fn window_setup() -> (EventLoop<()>, Window) {
         height: 512,
     };
     let window = WindowBuilder::new()
-        .with_inner_size(window_size)
-        .with_max_inner_size(window_size)
-        .with_min_inner_size(window_size)
+        //.with_inner_size(window_size)
+        //.with_max_inner_size(window_size)
+        //.with_min_inner_size(window_size)
         .build(&event_loop)
         .unwrap();
 
@@ -719,6 +876,7 @@ fn window_setup() -> (EventLoop<()>, Window) {
 }
 struct State {
     params: Params,
+    keystate: KeyState,
 
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -735,9 +893,8 @@ struct State {
     last_print: Instant,
     frame: usize,
 
-    use_simd: bool,
-
-    simulation_state: SimulationState,
+    //simulation_state: SimulationState,
+    simulation_controller: SimThreadController,
 
     point_transfer_buffer: Vec<GpuPoint>,
     gpu_point_buffer: wgpu::Buffer,
@@ -747,7 +904,8 @@ struct State {
 
 impl State {
     async fn new(window: Window) -> Self {
-        let simulation_state = SimulationState::new(SimulationInputEuler::new().verlet());
+        //let simulation_state = SimulationState::new(SimulationInputEuler::new().verlet());
+        let mut simulation_controller = SimThreadController::new();
 
         let size: winit::dpi::PhysicalSize<u32> = window.inner_size();
         let instance: wgpu::Instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -803,7 +961,8 @@ impl State {
         surface.configure(&device, &config);
 
         let mut point_transfer_buffer = Vec::new();
-        simulation_state.serialize_gpu(&mut point_transfer_buffer);
+        //simulation_state.serialize_gpu(&mut point_transfer_buffer);
+        simulation_controller.get_state(&mut point_transfer_buffer);
         let gpu_point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Point Buffer"),
             contents: bytemuck::cast_slice(&point_transfer_buffer),
@@ -867,8 +1026,8 @@ impl State {
             .unwrap()
             .replace("{NUM_POINTS}", &format!("{}", NUM_POINTS))
             .replace("{NUM_KINDS}", &format!("{}", NUM_KINDS))
-            .replace("{WIDTH_X}", &format!("{}", WIDTH_X))
-            .replace("{WIDTH_Y}", &format!("{}", WIDTH_Y));
+            .replace("{WIDTH_X}", &format!("{:.10}", WIDTH_X))
+            .replace("{WIDTH_Y}", &format!("{:.10}", WIDTH_Y));
 
         let render_pipeline;
         {
@@ -935,16 +1094,31 @@ impl State {
             #[cfg(not(target_arch = "wasm32"))]
             last_print: Instant::now(),
             frame: 0,
-            use_simd: true,
-            simulation_state,
+            simulation_controller,
             point_transfer_buffer,
             gpu_point_buffer,
             params,
             params_buffer,
+            keystate: KeyState::new(),
         }
     }
 
     fn render(&mut self) -> Result<(), SurfaceError> {
+        {
+            let control_dt = 0.03;
+
+            let k = &self.keystate;
+
+            let lr = k.right as i32 as f32 - k.left as i32 as f32;
+            let ud = k.up as i32 as f32 - k.down as i32 as f32;
+            let io = k.zoom_out as i32 as f32 - k.zoom_in as i32 as f32;
+            self.params.offset_x += lr * control_dt / self.params.zoom_x;
+            self.params.offset_y += ud * control_dt / self.params.zoom_x;
+            self.params.zoom_x += io * control_dt * self.params.zoom_x;
+            self.params.zoom_y =
+                self.params.zoom_x * self.size.width as f32 / (self.size.height as f32);
+        }
+
         self.frame += 1;
         let max_frame = 240;
         #[cfg(not(target_arch = "wasm32"))]
@@ -959,20 +1133,13 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        timed!("Update with overhead", {
-            self.queue.write_buffer(
-                &self.gpu_point_buffer,
-                0,
-                bytemuck::cast_slice(&self.point_transfer_buffer),
-            );
-            timed!("Core update", {
-                for _ in 0..5 {
-                    self.simulation_state.update();
-                }
-            });
-            self.simulation_state
-                .serialize_gpu(&mut self.point_transfer_buffer);
-        });
+        self.queue.write_buffer(
+            &self.gpu_point_buffer,
+            0,
+            bytemuck::cast_slice(&self.point_transfer_buffer),
+        );
+        self.simulation_controller
+            .try_get_state(&mut self.point_transfer_buffer);
         self.queue.write_buffer(
             &self.params_buffer,
             0,

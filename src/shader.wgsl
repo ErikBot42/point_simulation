@@ -1,6 +1,17 @@
 
 @group(0) @binding(0) 
 var<storage, read> points: array<GpuPoint>;
+@group(0) @binding(1)
+var<uniform> params: Params;
+
+
+struct Params {
+    zoom_x: f32,
+    zoom_y: f32,
+    offset_x: f32,
+    offset_y: f32,
+}
+
 
 const NUM_POINTS: f32 = {NUM_POINTS}.0;
 const NUM_KINDS: f32 = {NUM_KINDS}.0;
@@ -65,34 +76,37 @@ fn vs_main(
     let tile_x = tile % 3u; // 0..3
     let tile_y = tile / 3u; // 0..3
     
-    var offset: vec2<f32>;
+    var offset: vec2<f32> = vec2<f32>(0.0);
 
-
-    switch member {
-        case 0u: {
-            offset = vec2<f32>(sqrt(3.0) / 2.0, -0.5);
-        }
-        case 1u: {
-            offset = vec2<f32>(0.0, 1.0);
-        }
-        case 2u, default: {
-            offset = vec2<f32>(-sqrt(3.0) / 2.0, -0.5);
-        }
-    }
     let beta: f32 = 0.4;
     let range_index: f32 = 8.0;
     let hash_texture_size = 256.0;
     let radius_clip_space = (range_index) * 1.0 / hash_texture_size;
     let inner_radius_clip_space: f32 = beta * radius_clip_space;
 
-    offset *= 0.5 * inner_radius_clip_space;
     
-
     let qqq = points[group];
 
     offset += vec2<f32>(f32(tile_x) - 1.0, f32(tile_y) - 1.0) * vec2<f32>({WIDTH_X}, {WIDTH_Y}) * 2.0;
 
+
     offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
+    
+    offset -= vec2<f32>(params.offset_x, params.offset_y);
+
+    let tri_size = 0.003;
+    switch member {
+        case 0u: {
+            offset += tri_size * vec2<f32>(sqrt(3.0) / 2.0, -0.5);
+        }
+        case 1u: {
+            offset += tri_size * vec2<f32>(0.0, 1.0);
+        }
+        case 2u, default: {
+            offset += tri_size * vec2<f32>(-sqrt(3.0) / 2.0, -0.5);
+        }
+    }
+    offset *= vec2<f32>(params.zoom_x, params.zoom_y);
 
     let num_kinds: f32 = NUM_KINDS;
 
