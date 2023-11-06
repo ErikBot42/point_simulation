@@ -33,6 +33,7 @@ struct VertexInput {
     @location(0) point_xy: vec2<f32>,
     @location(1) k: u32,
     @location(2) _unused: u32,
+    @location(3) offset: vec2<f32>,
 }
 
 struct VertexOutputMain {
@@ -80,19 +81,20 @@ fn vs_main(
     offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
     
     offset -= vec2<f32>(params.offset_x, params.offset_y);
-
-    let tri_size = 0.003;
-    switch member {
-        case 0u: {
-            offset += tri_size * vec2<f32>(sqrt(3.0) / 2.0, -0.5);
-        }
-        case 1u: {
-            offset += tri_size * vec2<f32>(0.0, 1.0);
-        }
-        case 2u, default: {
-            offset += tri_size * vec2<f32>(-sqrt(3.0) / 2.0, -0.5);
-        }
-    }
+    
+    offset += in.offset;
+    //let tri_size = 0.003;
+    //switch member {
+    //    case 0u: {
+    //        offset += tri_size * vec2<f32>(sqrt(3.0) / 2.0, -0.5);
+    //    }
+    //    case 1u: {
+    //        offset += tri_size * vec2<f32>(0.0, 1.0);
+    //    }
+    //    case 2u, default: {
+    //        offset += tri_size * vec2<f32>(-sqrt(3.0) / 2.0, -0.5);
+    //    }
+    //}
     offset *= vec2<f32>(params.zoom_x, params.zoom_y);
 
     let num_kinds: f32 = NUM_KINDS;

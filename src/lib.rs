@@ -1426,7 +1426,6 @@ struct State {
     window: Window,
 
     render_pipeline: wgpu::RenderPipeline,
-    //bogo_compute_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1438,6 +1437,7 @@ struct State {
 
     point_transfer_buffer: Vec<GpuPoint>,
     gpu_point_buffer: wgpu::Buffer,
+    vertex_offsets_buffer: wgpu::Buffer,
 
     params_buffer: wgpu::Buffer,
 
@@ -1532,7 +1532,8 @@ impl State {
                 f32::sqrt(3.0) / 2.0,
                 -0.5,
                 0.0,
-                1.0 - f32::sqrt(3.0) / 2.0,
+                1.0,
+                -f32::sqrt(3.0) / 2.0,
                 -0.5,
             ]
             .map(|x| x * tri_size)
@@ -1569,51 +1570,27 @@ impl State {
                     },
                 ],
             });
-
-        //let bogo_compute_pipeline =
-        //    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        //        label: None,
-        //        layout: Some(
-        //            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        //                label: None,
-        //                bind_group_layouts: &[&bind_group_layout],
-        //                push_constant_ranges: &[],
-        //            }),
-        //        ),
-        //        module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        //            label: None,
-        //            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-        //                "
-        //            @group(0) @binding(0) 
-        //            var<storage, read_write> points: array<GpuPoint>;
-        //            struct GpuPoint {
-        //                x: f32,
-        //                y: f32,
-        //                k: u32,
-        //                _unused: u32,
-        //            }
-        //            @compute @workgroup_size(1)
-        //            fn main(
-        //                //@builtin(local_invocation_id) LocalInvocationID: vec3<u32>, // position in workgroup
-        //                //@builtin(local_invocation_index) LocalInvocationIndex: u32, // same but linearized
-        //                @builtin(global_invocation_id) GlobalInvocationID: vec3<u32>, // position in compute shader grid
-        //                //@builtin(workgroup_id) WorkgroupID: vec3<u32>, // what workgroup this is
-        //                //@builtin(num_workgroups) NumWorkgroups: vec3<u32>, // dispatch size
-        //                ) {
-
-        //                let i = GlobalInvocationID.x;
-        //                var p: GpuPoint;
-        //                p.x = 0.0;//x0[i];
-        //                p.y = 0.0;//y0[i];
-        //                p.k = 0u;//k[i];
-        //                p._unused = 0u;
-        //                points[i] = p;
-        //            }
-        //             ",
-        //            )),
-        //        }),
-        //        entry_point: "main",
-        //    });
+        let bogo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bogo_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bogo_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: gpu_point_buffer.as_entire_binding(),
+            }],
+        });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Bind group"),
@@ -1681,7 +1658,12 @@ impl State {
                             array_stride: size_of::<GpuPoint>() as _,
                             step_mode: wgpu::VertexStepMode::Instance,
                             attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Uint32, 2 => Uint32],
-                        }
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: size_of::<f32>() as u64 * 2,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![3 => Float32x2],
+                        },
                     ],
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1708,7 +1690,6 @@ impl State {
             size,
             window,
             render_pipeline,
-            //bogo_compute_pipeline,
             bind_group,
             #[cfg(not(target_arch = "wasm32"))]
             last_print: Instant::now(),
@@ -1720,6 +1701,7 @@ impl State {
             params_buffer,
             keystate: KeyState::new(),
             gpu_simulation_state,
+            vertex_offsets_buffer,
         }
     }
 
@@ -1772,18 +1754,11 @@ impl State {
                     label: Some("Encoder"),
                 });
         //{
-        //    let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        //        label: None,
-        //    });
+        //    let mut compute_pass =
+        //        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         //    compute_pass.set_pipeline(&self.bogo_compute_pipeline);
-        //    compute_pass.set_bind_group(0, &self.bind_group, &[]);
-        //    //compute_pass.set_pipeline(&self.gpu_simulation_state.point_serialize_pipeline);
-        //    //compute_pass.set_bind_group(
-        //    //    0,
-        //    //    &self.gpu_simulation_state.point_serialize_bind_group,
-        //    //    &[],
-        //    //);
-        //    compute_pass.dispatch_workgroups(NUM_POINTS, 0, 0);
+        //    compute_pass.set_bind_group(0, &self.bogo_bind_group, &[]);
+        //    compute_pass.dispatch_workgroups(NUM_POINTS, 1, 1);
         //}
 
         {
@@ -1810,6 +1785,7 @@ impl State {
             //render_pass.draw(0..(3 * NUM_POINTS * 9), 0..1);
             //render_pass.draw(0..(3 * NUM_POINTS), 0..1);
             render_pass.set_vertex_buffer(0, self.gpu_point_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.vertex_offsets_buffer.slice(..));
             render_pass.draw(0..3, 0..NUM_POINTS);
         }
 
