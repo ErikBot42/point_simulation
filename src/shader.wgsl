@@ -1,6 +1,6 @@
 
-@group(0) @binding(0) 
-var<storage, read> points: array<GpuPoint>;
+//@group(0) @binding(0) 
+//var<storage, read_write> points: array<GpuPoint>;
 @group(0) @binding(1)
 var<uniform> params: Params;
 
@@ -23,36 +23,16 @@ struct GpuPoint {
     _unused: u32,
 }
 
-
-struct FillVertexInput {
-    @location(0) position: vec2<f32>,
-}
-struct FillVertexOuput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) pos: vec4<f32>,
-}
-
-
-@vertex
-fn vs_fill(
-    in: FillVertexInput
-) -> FillVertexOuput {
-    var out: FillVertexOuput;
-    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
-    out.pos = vec4<f32>(in.position, 0.0, 1.0);
-    return out;
-}
-@fragment
-fn fs_fill(
-    in: FillVertexOuput,
-) -> @location(0) vec4<f32> {
-    let c: f32 = in.pos.x;
-    return vec4<f32>(c, sin(c * (NUM_POINTS + 1.9008)), 0.0, 0.0);
-}
+// @location(0) particle_pos: vec2<f32>,
+// @location(1) particle_vel: vec2<f32>,
+// @location(2) position: vec2<f32>,
 
 struct VertexInput {
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
+    @location(0) point_xy: vec2<f32>,
+    @location(1) k: u32,
+    @location(2) _unused: u32,
 }
 
 struct VertexOutputMain {
@@ -67,14 +47,16 @@ fn vs_main(
     var out: VertexOutputMain;
     
 
-    var remaining = in.vertex_index;
-    let tile = in.vertex_index / (3u * {NUM_POINTS}u);
-    remaining = remaining % (3u * {NUM_POINTS}u);
-    let group = remaining / 3u; // 0..NUM_POINTS
-    let member = remaining % 3u; // 0..3
+    //var remaining = in.vertex_index;
+    //let tile = in.vertex_index / (3u * {NUM_POINTS}u);
+    //remaining = remaining % (3u * {NUM_POINTS}u);
+    //let group = remaining / 3u; // 0..NUM_POINTS
+    //let member = remaining % 3u; // 0..3
+    let group = in.instance_index;//in.vertex_index / 3u;
+    let member = in.vertex_index;// % 3u;
 
-    let tile_x = tile % 3u; // 0..3
-    let tile_y = tile / 3u; // 0..3
+    //let tile_x = tile % 3u; // 0..3
+    //let tile_y = tile / 3u; // 0..3
     
     var offset: vec2<f32> = vec2<f32>(0.0);
 
@@ -85,9 +67,14 @@ fn vs_main(
     let inner_radius_clip_space: f32 = beta * radius_clip_space;
 
     
-    let qqq = points[group];
+    //let qqq = points[group];
+    var qqq: GpuPoint;
+    qqq.x = in.point_xy.x;
+    qqq.y = in.point_xy.y;
+    qqq.k = in.k;
+        
 
-    offset += vec2<f32>(f32(tile_x) - 1.0, f32(tile_y) - 1.0) * vec2<f32>({WIDTH_X}, {WIDTH_Y}) * 2.0;
+    //offset += vec2<f32>(f32(tile_x) - 1.0, f32(tile_y) - 1.0) * vec2<f32>({WIDTH_X}, {WIDTH_Y}) * 2.0;
 
 
     offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
@@ -119,9 +106,9 @@ fn vs_main(
         pow(sin(u + 2.0 * w), 4.0),
         1.0
     );
-    if (tile_x != 1u || tile_y != 1u) {
-        color *= .2;
-    }
+    //if (tile_x != 1u || tile_y != 1u) {
+    //    color *= .2;
+    //}
     out.color = color;
 
     out.clip_position = vec4<f32>(offset.x, offset.y, 0.0, 1.0);
