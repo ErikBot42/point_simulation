@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::mem::{replace, size_of, swap};
+use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Add;
 use std::ops::AddAssign;
 use std::ops::Deref;
@@ -25,7 +26,7 @@ use winit::{
 // API
 // cpu IR, gpu IR -> point buffer
 
-const USE_GPU_COMPUTE: bool = true;
+const USE_GPU_COMPUTE: bool = false;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -62,10 +63,10 @@ const K_FAC: f32 = 2.0 * 0.2;
 #[cfg(feature = "simd")]
 const K_FAC: f32 = 2.0 * 0.2 * (1.0 / (1.0 - BETA));
 const BETA: f32 = 0.3; //0.3;
-const DT: f32 = 0.008; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.008; //0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const NUM_POINTS: u32 = 1024; //16384; //8192; //2048; //16384;
+const NUM_POINTS: u32 = 8192; //1024; //16384; //8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 
 fn debug_check_valid_pos(f: f32) -> bool {
@@ -510,6 +511,7 @@ impl_into_gpu!(f32, f32);
 struct TypedBuffer<T: GpuRepresentable> {
     buffer: wgpu::Buffer,
     ty: PhantomData<T>,
+    count: u32,
 }
 
 struct GpuSimulationState {
@@ -533,11 +535,33 @@ struct GpuSimulationState {
     cell_index: TypedBuffer<u32>, // Pid -> u32
 
     relation_table: TypedBuffer<f32>, // f32
+    //
+    // update points from surrounding data, compute cell
+    // increment counts
+    //update_pipeline: wgpu::ComputePipeline,
+    //update_bind_group: wgpu::BindGroup,
 
-    point_serialize_pipeline: wgpu::ComputePipeline,
-    point_serialize_bind_group: wgpu::BindGroup,
+    // increment count for cell, shared memory too small though
+    // count_pipeline: wgpu::ComputePipeline,
+    // count_bind_group: wgpu::BindGroup,
+
+    // perform ppa, although shared memory is small
+    // ppa_pipeline: wgpu::ComputePipeline,
+    // ppa_bind_group: wgpu::BindGroup,
+
+    // insert into calculated offsets. merge with previous?
+    // insert_pipeline: wgpu::ComputePipeline,
+    // insert_bind_group: wgpu::BindGroup,
+    // point_serialize_pipeline: wgpu::ComputePipeline,
+    // point_serialize_bind_group: wgpu::BindGroup,
+    //
+    serialize_pipeline: wgpu::ComputePipeline,
+    update_pipeline: wgpu::ComputePipeline,
+
+    bind_group: wgpu::BindGroup,
 }
 impl GpuSimulationState {
+    const WORKGROUP_SIZE: u16 = 256; // the max
     fn from_simulation_state(
         device: &wgpu::Device,
         point_buffer: &wgpu::Buffer,
@@ -554,101 +578,8 @@ impl GpuSimulationState {
             TypedBuffer {
                 buffer,
                 ty: PhantomData,
+                count: content.len().try_into().unwrap(),
             }
-        }
-
-        fn make_bind_group(
-            device: &wgpu::Device,
-            layout: &wgpu::BindGroupLayout,
-            entries: &[&wgpu::Buffer],
-        ) -> wgpu::BindGroup {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout,
-                entries: &entries
-                    .iter()
-                    .enumerate()
-                    .map(|(i, buffer)| wgpu::BindGroupEntry {
-                        binding: i as _,
-                        resource: buffer.as_entire_binding(),
-                    })
-                    .collect::<Vec<_>>(),
-            })
-        }
-        enum Access {
-            Read,
-            ReadWrite,
-            Uniform,
-        }
-        use Access::*;
-        fn make_compute_pipeline_and_layout(
-            device: &wgpu::Device,
-            declarations: &[(Access, &str)],
-            source: impl std::fmt::Display,
-        ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-            // (access), (name: type)
-            fn make_wgpu_declarations(a: &[(Access, &str)]) -> String {
-                let mut s = String::new();
-                for (i, (a, name_ty)) in a.iter().enumerate() {
-                    s += &format!(
-                        "@group(0) @binding({i}) var<{}> {};\n",
-                        match a {
-                            Access::Read => "storage, read",
-                            Access::ReadWrite => "storage, read_write",
-                            Access::Uniform => "uniform",
-                        },
-                        name_ty
-                    );
-                }
-                s
-            }
-            fn make_bind_group_layout(
-                device: &wgpu::Device,
-                a: &[(Access, &str)],
-            ) -> wgpu::BindGroupLayout {
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: None,
-                    entries: &a
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (a, _))| wgpu::BindGroupLayoutEntry {
-                            binding: i as _,
-                            visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX, // TODO
-                            ty: wgpu::BindingType::Buffer {
-                                ty: match a {
-                                    Read => wgpu::BufferBindingType::Storage { read_only: true },
-                                    ReadWrite => {
-                                        wgpu::BufferBindingType::Storage { read_only: false }
-                                    }
-                                    Uniform => wgpu::BufferBindingType::Uniform,
-                                },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        })
-                        .collect::<Vec<_>>(),
-                })
-            }
-
-            let bind_group_layout = make_bind_group_layout(device, declarations);
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            });
-            let source = format!("{}\n{}", make_wgpu_declarations(declarations), source);
-            let compute_pipeline =
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: None,
-                    layout: Some(&pipeline_layout),
-                    module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: None,
-                        source: wgpu::ShaderSource::Wgsl(Cow::from(source)),
-                    }),
-                    entry_point: "main",
-                });
-            (compute_pipeline, bind_group_layout)
         }
 
         let x0 = galloc(device, state.x0.0.as_slice());
@@ -670,52 +601,108 @@ impl GpuSimulationState {
             bytemuck::cast_slice::<_, f32>(state.relation_table.as_slice()),
         );
 
-        const WORKGROUP_SIZE: u16 = 64;
-        /* create kernel here */
-        let (point_serialize_pipeline, point_serialize_layout) = make_compute_pipeline_and_layout(
-            device,
-            &[
-                (ReadWrite, "points: array<GpuPoint>"),
-                (ReadWrite, "x0: array<f32>"),
-                (Read, "y0: array<f32>"),
-                (Read, "k: array<u32>"),
-            ],
-            stringify!(
-            struct GpuPoint {
-                x: f32,
-                y: f32,
-                k: u32,
-                _unused: u32,
-            }
-
-            @compute @workgroup_size(1)
-            fn main(
-                //@builtin(local_invocation_id) LocalInvocationID: vec3<u32>, // position in workgroup
-                //@builtin(local_invocation_index) LocalInvocationIndex: u32, // same but linearized
-                @builtin(global_invocation_id) GlobalInvocationID: vec3<u32>, // position in compute shader grid
-                //@builtin(workgroup_id) WorkgroupID: vec3<u32>, // what workgroup this is
-                //@builtin(num_workgroups) NumWorkgroups: vec3<u32>, // dispatch size
-                ) {
-
-                let i = GlobalInvocationID.x;
-                ////if (i < NUM_POINTS) {
-                    var p: GpuPoint;
-                    p.x = 0.0;//x0[i];
-                    p.y = 0.0;//y0[i];
-                    p.k = 0u;//k[i];
-                    p._unused = 0u;
-                    points[i] = p;
-                ////}
+        #[rustfmt::skip]
+        let gpu_vars = [
+            (x0.count, &x0.buffer, "x0", "f32"),
+            (y0.count, &y0.buffer, "y0", "f32"),
+            (x1.count, &x1.buffer, "x1", "f32"),
+            (y1.count, &y1.buffer, "y1", "f32"),
+            (k.count, &k.buffer, "k", "u32"),
+            (x0_tmp.count, &x0_tmp.buffer, "x0_tmp", "f32"),
+            (y0_tmp.count, &y0_tmp.buffer, "y0_tmp", "f32"),
+            (x1_tmp.count, &x1_tmp.buffer, "x1_tmp", "f32"),
+            (y1_tmp.count, &y1_tmp.buffer, "y1_tmp", "f32"),
+            (k_tmp.count, &k_tmp.buffer, "k_tmp", "u32"),
+            (point_cell.count, &point_cell.buffer, "point_cell", "u32"),
+            (point_cell_offset.count, &point_cell_offset.buffer, "point_cell_offset", "u32"),
+            (cell_count.count, &cell_count.buffer, "cell_count", "atomic<u32>"),
+            (cell_index.count, &cell_index.buffer, "cell_index", "u32"),
+            (relation_table.count, &relation_table.buffer, "relation_table", "f32"),
+            (NUM_POINTS, &point_buffer, "points", "GpuPoint"),
+        ];
+        let layout_entries = gpu_vars
+            .iter()
+            .enumerate()
+            .map(|(i, (_, b, _, _))| wgpu::BindGroupLayoutEntry {
+                binding: i as _,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(b.size()),
+                },
+                count: None, //NonZeroU32::new(3849),
             })
-            .replace("NUM_POINTS", &format!("{NUM_POINTS}u"))
-            .replace("WORKGROUP_SIZE", &format!("{WORKGROUP_SIZE}")),
-        );
+            .collect::<Vec<_>>();
 
-        let point_serialize_bind_group = make_bind_group(
-            &device,
-            &point_serialize_layout,
-            &[&point_buffer, &x0.buffer, &y0.buffer, &k.buffer],
-        );
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &layout_entries,
+        });
+
+        let bind_entries = gpu_vars
+            .iter()
+            .enumerate()
+            .map(|(i, (_, b, _, _))| wgpu::BindGroupEntry {
+                binding: i as _,
+                resource: b.as_entire_binding(),
+            })
+            .collect::<Vec<_>>();
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_layout,
+            entries: &bind_entries,
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+
+        let wgpu_declarations: String = gpu_vars
+            .iter()
+            .enumerate()
+            .map(|(i, (count, _, name, ty))| {
+                format!(
+                    "@group(0) @binding({i}) var<storage, read_write> {name}: array<{ty}, {}>;\n",
+                    count
+                )
+            })
+            .collect();
+
+        let source = std::fs::read_to_string("src/compute.wgsl")
+            .unwrap()
+            .replace("NUM_POINTS", &format!("{NUM_POINTS}u"))
+            .replace("MIN_WIDTH", &format!("{MIN_WIDTH}"))
+            .replace("NUM_KINDS", &format!("{NUM_KINDS}"))
+            .replace("CELLS_Y", &format!("{CELLS_Y}u"))
+            .replace("CELLS_X", &format!("{CELLS_X}u"))
+            .replace("POINT_MAX_RADIUS", &format!("{POINT_MAX_RADIUS}"))
+            .replace("BETA", &format!("{BETA}"))
+            .replace("DT", &format!("{DT}"))
+            .replace("WORKGROUP_SIZE", &format!("{}", Self::WORKGROUP_SIZE));
+
+        let source = format!("{}\n{}", wgpu_declarations, source);
+        println!("SHADER SOURCE: \n\n {}\n\n", &source);
+
+        let module_descriptor = wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::from(source)),
+        };
+
+        let module = device.create_shader_module(module_descriptor);
+
+        let [serialize_pipeline, update_pipeline] = ["serialize", "update"].map(|entry_point| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point,
+            })
+        });
+
         Self {
             x0,
             y0,
@@ -732,159 +719,55 @@ impl GpuSimulationState {
             cell_count,
             cell_index,
             relation_table,
-            point_serialize_pipeline,
-            point_serialize_bind_group,
+            serialize_pipeline,
+            update_pipeline,
+            bind_group,
         }
     }
-    fn update<'a>(&'a mut self, pass: &mut wgpu::ComputePass<'a>) {
-        /* dispatch compute shaders */
-    }
-    fn serialize_gpu<'a>(&'a mut self, pass: &mut wgpu::ComputePass<'a>) {
-        pass.set_pipeline(&self.point_serialize_pipeline);
-        pass.set_bind_group(0, &self.point_serialize_bind_group, &[]);
-        // TODO: increase workgroup size
-        pass.dispatch_workgroups(1, 0, 0);
-    }
-}
+    fn update<'this, 'pass>(&'this self, pass: &mut wgpu::ComputePass<'pass>)
+    where
+        'this: 'pass,
+    {
+        pass.set_bind_group(0, &self.bind_group, &[]);
 
-fn tmp(device: &wgpu::Device) {
-    enum Access {
-        Read,
-        ReadWrite,
-        Uniform,
-    }
-    use Access::*;
-    fn make_bind_group<T: GpuRepresentable>(
-        device: &wgpu::Device,
-        kernel: &Kernel,
-        entries: &[&TypedBuffer<T>],
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &kernel.layout,
-            entries: &entries
-                .iter()
-                .enumerate()
-                .map(|(i, buffer)| wgpu::BindGroupEntry {
-                    binding: i as _,
-                    resource: buffer.buffer.as_entire_binding(),
-                })
-                .collect::<Vec<_>>(),
-        })
-    }
-    struct Kernel {
-        pipeline: wgpu::ComputePipeline,
-        layout: wgpu::BindGroupLayout,
-    }
-    fn make_compute_pipeline_and_layout(
-        device: &wgpu::Device,
-        declarations: &[(Access, &str)],
-        source: impl std::fmt::Display,
-    ) -> Kernel {
-        // (access), (name: type)
-        fn make_wgpu_declarations(a: &[(Access, &str)]) -> String {
-            let mut s = String::new();
-            for (i, (a, name_ty)) in a.iter().enumerate() {
-                s += &format!(
-                    "@group(0) @binding({i}) var<{}> {};\n",
-                    match a {
-                        Access::Read => "storage, read",
-                        Access::ReadWrite => "storage, read_write",
-                        Access::Uniform => "uniform",
-                    },
-                    name_ty
-                );
-            }
-            s
-        }
+        // TODO: update particle "cell position" at low frequency.
 
-        fn make_bind_group_layout(
-            device: &wgpu::Device,
-            a: &[(Access, &str)],
-        ) -> wgpu::BindGroupLayout {
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
-                entries: &a
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (a, _))| wgpu::BindGroupLayoutEntry {
-                        binding: i as _,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: match a {
-                                Read => wgpu::BufferBindingType::Storage { read_only: true },
-                                ReadWrite => wgpu::BufferBindingType::Storage { read_only: false },
-                                Uniform => wgpu::BufferBindingType::Uniform,
-                            },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    })
-                    .collect::<Vec<_>>(),
-            })
-        }
-
-        let bind_group_layout = make_bind_group_layout(device, declarations);
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let source = format!("{}\n{}", make_wgpu_declarations(declarations), source);
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: None,
-                source: wgpu::ShaderSource::Wgsl(Cow::from(source)),
-            }),
-            entry_point: "main",
-        });
-        Kernel {
-            pipeline: compute_pipeline,
-            layout: bind_group_layout,
-        }
+        pass.set_pipeline(&self.update_pipeline);
+        Self::dispatch(Self::WORKGROUP_SIZE, NUM_POINTS, pass);
     }
+    fn serialize_gpu<'this, 'pass>(&'this self, pass: &mut wgpu::ComputePass<'pass>)
+    where
+        'this: 'pass,
+    {
+        pass.set_bind_group(0, &self.bind_group, &[]);
 
-    const WORKGROUP_SIZE: u16 = 64;
-    // serialize for render
-    let serialize_kernel: Kernel = make_compute_pipeline_and_layout(
-        device,
-        &[
-            (ReadWrite, "points: array<GpuPoint>"),
-            (Read, "x0: array<f32>"),
-            (Read, "y0: array<f32>"),
-            (Read, "k: array<u32>"),
-        ],
-        stringify!(
-        struct GpuPoint {
-            x: f32,
-            y: f32,
-            k: u32,
-            _unused: u32,
-        }
-
-        @compute @workgroup_size(WORKGROUP_SIZE)
-        fn main(
-            @builtin(local_invocation_id) LocalInvocationID: vec3<u32>, // position in workgroup
-            @builtin(local_invocation_index) LocalInvocationIndex: u32, // same but linearized
-            @builtin(global_invocation_id) GlobalInvocationID: vec3<u32>, // position in compute shader grid
-            @builtin(workgroup_id) WorkgroupID: vec3<u32>, // what workgroup this is
-            @builtin(num_workgroups) NumWorkgroups: vec3<u32>, // dispatch size
-            ) {
-            let i = GlobalInvocationID.x;
-            if (i < NUM_POINTS) {
-                var p: GpuPoint;
-                p.x = x0[i];
-                p.y = y0[i];
-                p.k = k[i];
-                p._unused = 0u;
-            }
-        })
-        .replace("NUM_POINTS", &format!("{NUM_POINTS}u"))
-        .replace("WORKGROUP_SIZE", &format!("{WORKGROUP_SIZE}")),
-    );
+        pass.set_pipeline(&self.serialize_pipeline);
+        Self::dispatch(Self::WORKGROUP_SIZE, NUM_POINTS, pass);
+    }
+    fn dispatch<'a>(
+        workgroup_size: impl TryInto<u32>,
+        total_size: impl TryInto<u32>,
+        pass: &mut wgpu::ComputePass<'a>,
+    ) {
+        let (workgroup_size, total_size) = (
+            workgroup_size.try_into().unwrap_or_else(|_| panic!()),
+            total_size.try_into().unwrap_or_else(|_| panic!()),
+        );
+        pass.dispatch_workgroups(
+            total_size
+                .checked_div(workgroup_size)
+                .unwrap_or_else(|| panic!()),
+            1,
+            1,
+        );
+    }
+    fn dispatch_size(workgroup_size: impl TryInto<u32>, total_size: impl TryInto<u32>) -> u32 {
+        let (workgroup_size, total_size) = (
+            workgroup_size.try_into().unwrap_or_else(|_| panic!()),
+            total_size.try_into().unwrap_or_else(|_| panic!()),
+        );
+        total_size.div_ceil(workgroup_size)
+    }
 }
 
 /// Entire state of the simulation
@@ -1253,8 +1136,8 @@ impl CpuSimulationState {
                     self.x1_tmp[i] = new_x;
                     self.y1_tmp[i] = new_y;
 
-                    self.x0_tmp[i] = x1;
-                    self.y0_tmp[i] = y1;
+                    // self.x0_tmp[i] = x1;
+                    // self.y0_tmp[i] = y1;
 
                     let new_cell = compute_cell(new_x, new_y);
                     self.point_cell[i] = new_cell;
@@ -1263,6 +1146,7 @@ impl CpuSimulationState {
                 }
             }
         }
+
 
         // The last passes are very serial, but is fast enough
         // that it basically does not matter
@@ -1277,12 +1161,20 @@ impl CpuSimulationState {
         for i in (0..NUM_POINTS_U).map(Into::into) {
             let cell = self.point_cell[i];
             let index = self.cell_index[cell] + self.point_cell_offset[i];
-            self.x0[index] = self.x0_tmp[i];
-            self.y0[index] = self.y0_tmp[i];
-            self.x1[index] = self.x1_tmp[i];
-            self.y1[index] = self.y1_tmp[i];
+            // self.x0[index] = self.x0_tmp[i];
+            // self.y0[index] = self.y0_tmp[i];
+            // self.x1[index] = self.x1_tmp[i];
+            // self.y1[index] = self.y1_tmp[i];
+
+            self.x0[index] = self.x1[i];
+            self.y0[index] = self.y1[i];
+            self.x0_tmp[index] = self.x1_tmp[i];
+            self.y0_tmp[index] = self.y1_tmp[i];
             self.k_tmp[index] = self.k[i];
         }
+
+        swap(&mut self.x1, &mut self.x0_tmp);
+        swap(&mut self.y1, &mut self.y0_tmp);
         swap(&mut self.k, &mut self.k_tmp);
     }
     fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
@@ -1570,27 +1462,6 @@ impl State {
                     },
                 ],
             });
-        let bogo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let bogo_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &bogo_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: gpu_point_buffer.as_entire_binding(),
-            }],
-        });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Bind group"),
@@ -1632,15 +1503,6 @@ impl State {
                     push_constant_ranges: &[],
                 });
             let layout = Some(&pipeline_layout);
-            let make_primitive = |topology| wgpu::PrimitiveState {
-                topology,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            };
             let multisample: wgpu::MultisampleState = wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -1675,7 +1537,15 @@ impl State {
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
-                primitive: make_primitive(wgpu::PrimitiveTopology::TriangleList),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
                 depth_stencil: None,
                 multisample,
                 multiview: None,
@@ -1735,13 +1605,16 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.queue.write_buffer(
-            &self.gpu_point_buffer,
-            0,
-            bytemuck::cast_slice(&self.point_transfer_buffer),
-        );
-        self.simulation_controller
-            .try_get_state(&mut self.point_transfer_buffer);
+
+        if !USE_GPU_COMPUTE {
+            self.queue.write_buffer(
+                &self.gpu_point_buffer,
+                0,
+                bytemuck::cast_slice(&self.point_transfer_buffer),
+            );
+            self.simulation_controller
+                .try_get_state(&mut self.point_transfer_buffer);
+        }
         self.queue.write_buffer(
             &self.params_buffer,
             0,
@@ -1753,13 +1626,13 @@ impl State {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Encoder"),
                 });
-        //{
-        //    let mut compute_pass =
-        //        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        //    compute_pass.set_pipeline(&self.bogo_compute_pipeline);
-        //    compute_pass.set_bind_group(0, &self.bogo_bind_group, &[]);
-        //    compute_pass.dispatch_workgroups(NUM_POINTS, 1, 1);
-        //}
+        if USE_GPU_COMPUTE {
+            let mut compute_pass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            let compute_pass = &mut compute_pass;
+            self.gpu_simulation_state.update(compute_pass);
+            self.gpu_simulation_state.serialize_gpu(compute_pass);
+        }
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
