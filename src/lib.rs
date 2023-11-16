@@ -67,7 +67,7 @@ const BETA: f32 = 0.3; //0.3;
 const DT: f32 = 0.004; //0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const NUM_POINTS: u32 = 16384;//8192; //1024; //16384; //8192; //2048; //16384;
+const NUM_POINTS: u32 = 16384; //8192; //1024; //16384; //8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 
 fn debug_check_valid_pos(f: f32) -> bool {
@@ -184,10 +184,10 @@ impl KeyState {
 impl SimulationInputEuler {
     fn new() -> Self {
         Self::from_seed(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as u64,
+            238948293, //SystemTime::now()
+                      //    .duration_since(SystemTime::UNIX_EPOCH)
+                      //    .unwrap()
+                      //    .as_micros() as u64,
         )
     }
     fn from_seed(seed: u64) -> SimulationInputEuler {
@@ -414,6 +414,12 @@ type UnsafePointVec<T> = UnsafeVec<T, NUM_POINTS_U>;
 struct UnsafeVec<T, const SIZE: usize> {
     inner: Box<[T; SIZE]>,
     len: usize,
+}
+impl<T, const SIZE: usize> UnsafeVec<T, SIZE> {
+    #[inline(always)]
+    unsafe fn end_ptr_mut(&mut self) -> *mut T {
+        self.inner.as_mut_ptr().add(self.len)
+    }
 }
 
 impl<T, const SIZE: usize> From<Box<[T; SIZE]>> for UnsafeVec<T, SIZE> {
@@ -952,6 +958,36 @@ impl CpuSimulationState {
                     let range_middle = usize::from(self.cell_index[cell_min_cropped])
                         ..usize::from(self.cell_index[cell_max_cropped + 1.into()]);
 
+                    #[cfg(feature = "simd")]
+                    {
+                        unsafe {
+                            use core::arch::x86_64::*;
+                            let mut x_write_ptr = self.surround_buffer_x.end_ptr_mut();
+                            let mut y_write_ptr = self.surround_buffer_y.end_ptr_mut();
+                            let mut k_write_ptr = self.surround_buffer_k.end_ptr_mut();
+                            for i in range_middle.clone().map(Into::into).step_by(8) {
+                                let x_read_ptr = self.x1.as_ptr().add(i);
+                                let y_read_ptr = self.y1.as_ptr().add(i);
+                                _mm256_storeu_ps(x_write_ptr, _mm256_loadu_ps(x_read_ptr));
+                                _mm256_storeu_ps(y_write_ptr, _mm256_loadu_ps(y_read_ptr));
+                                x_write_ptr = x_write_ptr.add(8);
+                                y_write_ptr = y_write_ptr.add(8);
+                            }
+                            for i in range_middle.clone().map(Into::into).step_by(32) {
+                                let k_read_ptr = self.k.as_ptr().add(i);
+                                _mm256_storeu_si256(
+                                    k_write_ptr as *mut __m256i,
+                                    _mm256_loadu_si256(k_read_ptr as *const __m256i),
+                                );
+                                k_write_ptr = k_write_ptr.add(32);
+                            }
+                            self.surround_buffer_x.len += range_middle.len();
+                            self.surround_buffer_y.len += range_middle.len();
+                            self.surround_buffer_k.len += range_middle.len();
+                        }
+                    }
+
+                    #[cfg(not(feature = "simd"))]
                     for i in range_middle.map(Into::into) {
                         unsafe {
                             self.surround_buffer_x.push(self.x1[i]);
@@ -959,66 +995,25 @@ impl CpuSimulationState {
                             self.surround_buffer_k.push(self.k[i]);
                         }
                     }
-                    //for dx in -1..=1 {
-                    //    let cell_x = cx as i32 + dx as i32;
-                    //    let (offset_x, cell_x) = if cell_x == -1 {
-                    //        (-WIDTH_X, CELLS_X as i32 - 1)
-                    //    } else if cell_x == CELLS_X as i32 {
-                    //        (WIDTH_X, 0)
-                    //    } else {
-                    //        (0.0, cell_x)
-                    //    };
-                    //    let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
-
-                    //    let range = usize::from(self.cell_index[cell])
-                    //        ..usize::from(self.cell_index[cell + 1.into()]);
-                    //    for i in range.map(Into::into) {
-                    //        unsafe {
-                    //            self.surround_buffer_x.push(self.x1[i] + offset_x);
-                    //            self.surround_buffer_y.push(self.y1[i] + offset_y);
-                    //            self.surround_buffer_k.push(self.k[i]);
-                    //        }
-                    //    }
-                    //}
-
-                    /*for dx in -1..=1 {
-                        let cell_x = cx as i32 + dx as i32;
-                        let cell_y = cy as i32 + dy as i32;
-                        let (offset_x, cell_x) = if cell_x == -1 {
-                            (-WIDTH_X, CELLS_X as i32 - 1)
-                        } else if cell_x == CELLS_X as i32 {
-                            (WIDTH_X, 0)
-                        } else {
-                            (0.0, cell_x)
-                        };
-                        let (offset_y, cell_y) = if cell_y == -1 {
-                            (-WIDTH_Y, CELLS_Y as i32 - 1)
-                        } else if cell_y == CELLS_Y as i32 {
-                            (WIDTH_Y, 0)
-                        } else {
-                            (0.0, cell_y)
-                        };
-                        let cell: Cid = ((cell_x + cell_y * CELLS_X as i32) as usize).into();
-
-                        let range = usize::from(self.cell_index[cell])
-                            ..usize::from(self.cell_index[cell + 1.into()]);
-                        for i in range.map(Into::into) {
-                            unsafe {
-                                self.surround_buffer_x.push(self.x1[i] + offset_x);
-                                self.surround_buffer_y.push(self.y1[i] + offset_y);
-                                self.surround_buffer_k.push(self.k[i]);
-                            }
-                        }
-                    }*/
                 }
                 #[cfg(feature = "simd")]
-                {
-                    for _ in 0..EXTRA_ELEMS {
-                        unsafe {
-                            self.surround_buffer_x.push(0.0);
-                            self.surround_buffer_y.push(0.0);
-                        }
-                    }
+                unsafe {
+                    use core::arch::x86_64::*;
+                    let zero = _mm256_setzero_ps();
+
+                    _mm256_storeu_ps(self.surround_buffer_x.end_ptr_mut(), zero);
+                    _mm256_storeu_ps(self.surround_buffer_y.end_ptr_mut(), zero);
+
+                    self.surround_buffer_x.len += EXTRA_ELEMS;
+                    self.surround_buffer_y.len += EXTRA_ELEMS;
+
+                    // Equvalent:
+                    // for _ in 0..EXTRA_ELEMS {
+                    //     unsafe {
+                    //         self.surround_buffer_x.push(0.0);
+                    //         self.surround_buffer_y.push(0.0);
+                    //     }
+                    // }
                 }
                 #[cfg(feature = "simd")]
                 const EXTRA_ELEMS: usize = 7; // round down num iterations to (hopefully?) skip these.
