@@ -23,6 +23,8 @@ log = "0.4.19"
 #naga = "0.12.2"
 nohash = "0.2.0"
 
+itertools = "0.11.0"
+
 [rust]
 debuginfo-level = 1
 

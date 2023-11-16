@@ -1,4 +1,5 @@
 //#![feature(portable_simd)]
+use itertools::Itertools;
 use std::array::from_fn;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -39,7 +40,7 @@ mod vertex;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime};
 
-type IndexType = u32;
+type IndexType = u16;
 
 const CELLS_X: IndexType = 64;
 const CELLS_Y: IndexType = 64;
@@ -63,10 +64,10 @@ const K_FAC: f32 = 2.0 * 0.2;
 #[cfg(feature = "simd")]
 const K_FAC: f32 = 2.0 * 0.2 * (1.0 / (1.0 - BETA));
 const BETA: f32 = 0.3; //0.3;
-const DT: f32 = 0.008; //0.008; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.004; //0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const NUM_POINTS: u32 = 8192; //1024; //16384; //8192; //2048; //16384;
+const NUM_POINTS: u32 = 16384;//8192; //1024; //16384; //8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 
 fn debug_check_valid_pos(f: f32) -> bool {
@@ -373,14 +374,14 @@ impl SimThreadController {
             loop {
                 simulation_state.update();
                 updates += 1;
-                let mut v = Vec::new();
                 if counter.load(Relaxed) < 20 {
+                    let mut v = Vec::new();
                     simulation_state.serialize_gpu(&mut v);
                     counter.fetch_add(1, Relaxed);
                     if !send.send(v).is_ok() {
                         break;
                     };
-                } else {
+                } else if USE_GPU_COMPUTE {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 let elapsed = delta.elapsed();
@@ -514,6 +515,13 @@ struct TypedBuffer<T: GpuRepresentable> {
     count: u32,
 }
 
+struct Pipelines {
+    serialize: wgpu::ComputePipeline,
+    update: wgpu::ComputePipeline,
+    ppa_256: wgpu::ComputePipeline,
+    ppa_full: wgpu::ComputePipeline,
+}
+
 struct GpuSimulationState {
     x0: TypedBuffer<f32>, // f32
     y0: TypedBuffer<f32>, // f32
@@ -554,11 +562,10 @@ struct GpuSimulationState {
     // insert_bind_group: wgpu::BindGroup,
     // point_serialize_pipeline: wgpu::ComputePipeline,
     // point_serialize_bind_group: wgpu::BindGroup,
-    //
-    serialize_pipeline: wgpu::ComputePipeline,
-    update_pipeline: wgpu::ComputePipeline,
-
-    bind_group: wgpu::BindGroup,
+    pipelines: Pipelines,
+    //serialize_pipeline: wgpu::ComputePipeline,
+    //update_pipeline: wgpu::ComputePipeline,
+    bind_groups: [wgpu::BindGroup; 2],
 }
 impl GpuSimulationState {
     const WORKGROUP_SIZE: u16 = 256; // the max
@@ -603,23 +610,24 @@ impl GpuSimulationState {
 
         #[rustfmt::skip]
         let gpu_vars = [
-            (x0.count, &x0.buffer, "x0", "f32"),
-            (y0.count, &y0.buffer, "y0", "f32"),
-            (x1.count, &x1.buffer, "x1", "f32"),
-            (y1.count, &y1.buffer, "y1", "f32"),
-            (k.count, &k.buffer, "k", "u32"),
-            (x0_tmp.count, &x0_tmp.buffer, "x0_tmp", "f32"),
-            (y0_tmp.count, &y0_tmp.buffer, "y0_tmp", "f32"),
-            (x1_tmp.count, &x1_tmp.buffer, "x1_tmp", "f32"),
-            (y1_tmp.count, &y1_tmp.buffer, "y1_tmp", "f32"),
-            (k_tmp.count, &k_tmp.buffer, "k_tmp", "u32"),
-            (point_cell.count, &point_cell.buffer, "point_cell", "u32"),
-            (point_cell_offset.count, &point_cell_offset.buffer, "point_cell_offset", "u32"),
-            (cell_count.count, &cell_count.buffer, "cell_count", "atomic<u32>"),
-            (cell_index.count, &cell_index.buffer, "cell_index", "u32"),
-            (relation_table.count, &relation_table.buffer, "relation_table", "f32"),
-            (NUM_POINTS, &point_buffer, "points", "GpuPoint"),
+            (x0.count, [&x0.buffer, &x0.buffer], "x0", "f32"),
+            (y0.count, [&y0.buffer, &y0.buffer], "y0", "f32"),
+            (x1.count, [&x1.buffer, &x1.buffer], "x1", "f32"),
+            (y1.count, [&y1.buffer, &y1.buffer], "y1", "f32"),
+            (k.count, [&k.buffer, &k.buffer], "k", "u32"),
+            (x0_tmp.count, [&x0_tmp.buffer, &x0_tmp.buffer], "x0_tmp", "f32"),
+            (y0_tmp.count, [&y0_tmp.buffer, &y0_tmp.buffer], "y0_tmp", "f32"),
+            (x1_tmp.count, [&x1_tmp.buffer, &x1_tmp.buffer], "x1_tmp", "f32"),
+            (y1_tmp.count, [&y1_tmp.buffer, &y1_tmp.buffer], "y1_tmp", "f32"),
+            (k_tmp.count, [&k_tmp.buffer, &k_tmp.buffer], "k_tmp", "u32"),
+            (point_cell.count, [&point_cell.buffer, &point_cell.buffer], "point_cell", "u32"),
+            (point_cell_offset.count, [&point_cell_offset.buffer, &point_cell_offset.buffer], "point_cell_offset", "u32"),
+            (cell_count.count, [&cell_count.buffer, &cell_count.buffer], "cell_count", "atomic<u32>"),
+            (cell_index.count, [&cell_index.buffer, &cell_index.buffer], "cell_index", "u32"),
+            (relation_table.count, [&relation_table.buffer, &relation_table.buffer], "relation_table", "f32"),
+            (NUM_POINTS, [&point_buffer, &point_buffer], "points", "GpuPoint"),
         ];
+
         let layout_entries = gpu_vars
             .iter()
             .enumerate()
@@ -629,9 +637,11 @@ impl GpuSimulationState {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(b.size()),
+                    min_binding_size: NonZeroU64::new(
+                        b.iter().map(|b| b.size()).all_equal_value().unwrap(),
+                    ),
                 },
-                count: None, //NonZeroU32::new(3849),
+                count: None,
             })
             .collect::<Vec<_>>();
 
@@ -640,19 +650,23 @@ impl GpuSimulationState {
             entries: &layout_entries,
         });
 
-        let bind_entries = gpu_vars
-            .iter()
-            .enumerate()
-            .map(|(i, (_, b, _, _))| wgpu::BindGroupEntry {
-                binding: i as _,
-                resource: b.as_entire_binding(),
-            })
-            .collect::<Vec<_>>();
+        let bind_entries: [_; 2] = from_fn(|e| {
+            gpu_vars
+                .iter()
+                .enumerate()
+                .map(|(i, (_, b, _, _))| wgpu::BindGroupEntry {
+                    binding: i as _,
+                    resource: b[e].as_entire_binding(),
+                })
+                .collect::<Vec<_>>()
+        });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &bind_layout,
-            entries: &bind_entries,
+        let bind_groups = bind_entries.map(|bind_entries| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &bind_layout,
+                entries: &bind_entries,
+            })
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -674,15 +688,26 @@ impl GpuSimulationState {
 
         let source = std::fs::read_to_string("src/compute.wgsl")
             .unwrap()
-            .replace("NUM_POINTS", &format!("{NUM_POINTS}u"))
+            .replace("NUM_POINTS", &format!("{NUM_POINTS}"))
             .replace("MIN_WIDTH", &format!("{MIN_WIDTH}"))
             .replace("NUM_KINDS", &format!("{NUM_KINDS}"))
-            .replace("CELLS_Y", &format!("{CELLS_Y}u"))
-            .replace("CELLS_X", &format!("{CELLS_X}u"))
+            .replace("CELLS_Y", &format!("{CELLS_Y}"))
+            .replace("CELLS_X", &format!("{CELLS_X}"))
+            .replace("CELLS", &format!("{CELLS}"))
             .replace("POINT_MAX_RADIUS", &format!("{POINT_MAX_RADIUS}"))
             .replace("BETA", &format!("{BETA}"))
             .replace("DT", &format!("{DT}"))
+            .replace("MIN_Y", &format!("{MIN_Y:?}"))
+            .replace("MIN_X", &format!("{MIN_X:?}"))
+            .replace("MAX_Y", &format!("{MAX_Y:?}"))
+            .replace("MAX_X", &format!("{MAX_X:?}"))
+            .replace(
+                "PPA_BATCHES",
+                &format!("{:?}", NUM_POINTS.checked_div(256).unwrap()),
+            )
             .replace("WORKGROUP_SIZE", &format!("{}", Self::WORKGROUP_SIZE));
+
+        assert!(NUM_POINTS <= 32768, "ppa needs to be updated");
 
         let source = format!("{}\n{}", wgpu_declarations, source);
         println!("SHADER SOURCE: \n\n {}\n\n", &source);
@@ -694,14 +719,21 @@ impl GpuSimulationState {
 
         let module = device.create_shader_module(module_descriptor);
 
-        let [serialize_pipeline, update_pipeline] = ["serialize", "update"].map(|entry_point| {
+        let pipe = |entry_point| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: None,
                 layout: Some(&pipeline_layout),
                 module: &module,
                 entry_point,
             })
-        });
+        };
+
+        let pipelines = Pipelines {
+            serialize: pipe("serialize"),
+            update: pipe("update"),
+            ppa_256: pipe("exclusive_ppa256"),
+            ppa_full: pipe("full_ppa"),
+        };
 
         Self {
             x0,
@@ -719,29 +751,40 @@ impl GpuSimulationState {
             cell_count,
             cell_index,
             relation_table,
-            serialize_pipeline,
-            update_pipeline,
-            bind_group,
+            bind_groups,
+            pipelines,
         }
     }
     fn update<'this, 'pass>(&'this self, pass: &mut wgpu::ComputePass<'pass>)
     where
         'this: 'pass,
     {
-        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(0, &self.bind_groups[0], &[]);
+        self.update_i(pass);
+        pass.set_bind_group(0, &self.bind_groups[1], &[]);
+        self.update_i(pass);
+    }
 
-        // TODO: update particle "cell position" at low frequency.
-
-        pass.set_pipeline(&self.update_pipeline);
+    fn update_i<'this, 'pass>(&'this self, pass: &mut wgpu::ComputePass<'pass>)
+    where
+        'this: 'pass,
+    {
+        pass.set_pipeline(&self.pipelines.update);
         Self::dispatch(Self::WORKGROUP_SIZE, NUM_POINTS, pass);
+        pass.set_pipeline(&self.pipelines.ppa_256);
+        Self::dispatch(256, u32::try_from(CELLS).unwrap(), pass);
+        pass.set_pipeline(&self.pipelines.ppa_full);
+        let final_size = u32::try_from(CELLS).unwrap().checked_div(256).unwrap();
+        assert!(final_size <= 256);
+        Self::dispatch(256, final_size, pass);
     }
     fn serialize_gpu<'this, 'pass>(&'this self, pass: &mut wgpu::ComputePass<'pass>)
     where
         'this: 'pass,
     {
-        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(0, &self.bind_groups[0], &[]);
 
-        pass.set_pipeline(&self.serialize_pipeline);
+        pass.set_pipeline(&self.pipelines.serialize);
         Self::dispatch(Self::WORKGROUP_SIZE, NUM_POINTS, pass);
     }
     fn dispatch<'a>(
@@ -1147,7 +1190,6 @@ impl CpuSimulationState {
             }
         }
 
-
         // The last passes are very serial, but is fast enough
         // that it basically does not matter
 
@@ -1330,6 +1372,7 @@ struct State {
     point_transfer_buffer: Vec<GpuPoint>,
     gpu_point_buffer: wgpu::Buffer,
     vertex_offsets_buffer: wgpu::Buffer,
+    vertices: u32,
 
     params_buffer: wgpu::Buffer,
 
@@ -1418,8 +1461,8 @@ impl State {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
         });
 
-        let vertex_offsets = {
-            let tri_size = 0.003;
+        let tri_size = 0.003;
+        let vertex_offsets: [f32; 6] = {
             [
                 f32::sqrt(3.0) / 2.0,
                 -0.5,
@@ -1430,6 +1473,16 @@ impl State {
             ]
             .map(|x| x * tri_size)
         };
+        dbg!(&vertex_offsets);
+        let qq = 32;
+        let vertex_offsets: Vec<_> = (0..qq)
+            .map(|i| ((i as f32) / ((qq - 1) as f32)) * std::f32::consts::PI * 2.0)
+            .map(|i| [-i.sin(), i.cos()])
+            .flatten()
+            .map(|i| i * tri_size)
+            .collect();
+        dbg!(&vertex_offsets);
+        let vertices = u32::try_from(vertex_offsets.len().checked_div(2).unwrap()).unwrap();
         let vertex_offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&vertex_offsets),
@@ -1538,7 +1591,7 @@ impl State {
                     })],
                 }),
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    topology: wgpu::PrimitiveTopology::LineStrip,//TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
                     cull_mode: Some(wgpu::Face::Back),
@@ -1572,6 +1625,7 @@ impl State {
             keystate: KeyState::new(),
             gpu_simulation_state,
             vertex_offsets_buffer,
+            vertices,
         }
     }
 
@@ -1659,7 +1713,7 @@ impl State {
             //render_pass.draw(0..(3 * NUM_POINTS), 0..1);
             render_pass.set_vertex_buffer(0, self.gpu_point_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.vertex_offsets_buffer.slice(..));
-            render_pass.draw(0..3, 0..NUM_POINTS);
+            render_pass.draw(0..self.vertices, 0..NUM_POINTS);
         }
 
         self.queue.submit(Some(encoder.finish()));
