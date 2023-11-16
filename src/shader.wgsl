@@ -30,9 +30,11 @@ struct GpuPoint {
 struct VertexInput {
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
+
     @location(0) point_xy: vec2<f32>,
     @location(1) k: u32,
     @location(2) _unused: u32,
+
     @location(3) offset: vec2<f32>,
 }
 
@@ -59,7 +61,6 @@ fn vs_main(
     //let tile_x = tile % 3u; // 0..3
     //let tile_y = tile / 3u; // 0..3
     
-    var offset: vec2<f32> = vec2<f32>(0.0);
 
     let beta: f32 = 0.4;
     let range_index: f32 = 8.0;
@@ -77,10 +78,14 @@ fn vs_main(
 
     //offset += vec2<f32>(f32(tile_x) - 1.0, f32(tile_y) - 1.0) * vec2<f32>({WIDTH_X}, {WIDTH_Y}) * 2.0;
 
+    var offset: vec2<f32> = vec2<f32>(0.0);
 
     offset += (vec2<f32>(qqq.x, qqq.y) * 2.0 - 1.0); // 0..1 -> -1..1
-    
+   
     offset -= vec2<f32>(params.offset_x, params.offset_y);
+
+    offset = (((offset) % 2.0 + 2.0) % 2.0 - 1.0);
+
     
     offset += in.offset;
     //let tri_size = 0.003;

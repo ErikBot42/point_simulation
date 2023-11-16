@@ -67,7 +67,7 @@ const BETA: f32 = 0.3; //0.3;
 const DT: f32 = 0.004; //0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const NUM_POINTS: u32 = 16384; //8192; //1024; //16384; //8192; //2048; //16384;
+const NUM_POINTS: u32 = 8192; //16384; //8192; //1024; //16384; //8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 
 fn debug_check_valid_pos(f: f32) -> bool {
@@ -381,8 +381,8 @@ impl SimThreadController {
                     if !send.send(v).is_ok() {
                         break;
                     };
-                } else if USE_GPU_COMPUTE {
-                    std::thread::sleep(Duration::from_millis(100));
+                } else {
+                    //std::thread::sleep(Duration::from_millis(10));
                 }
                 let elapsed = delta.elapsed();
                 if elapsed > Duration::from_secs(1) {
@@ -947,8 +947,10 @@ impl CpuSimulationState {
 
                     let cell_x_min = cx as i32 - 1;
                     let cell_x_max = cx as i32 + 1;
-                    let cell_x_min_cropped = (cell_x_min as i32 - 1).max(0);
-                    let cell_x_max_cropped = (cell_x_max as i32 + 1).min(CELLS_X as i32 - 1);
+                    let cell_x_min_wrapped = cell_x_min % CELLS_X as i32;
+                    let cell_x_max_wrapped = cell_x_max % CELLS_X as i32;
+                    let cell_x_min_cropped = (cell_x_min as i32).max(0);
+                    let cell_x_max_cropped = (cell_x_max as i32).min(CELLS_X as i32 - 1);
 
                     let cell_min_cropped: Cid =
                         ((cell_x_min_cropped + cell_y * CELLS_X as i32) as usize).into();
@@ -962,14 +964,23 @@ impl CpuSimulationState {
                     {
                         unsafe {
                             use core::arch::x86_64::*;
+                            let offset_y = _mm256_set1_ps(offset_y);
                             let mut x_write_ptr = self.surround_buffer_x.end_ptr_mut();
                             let mut y_write_ptr = self.surround_buffer_y.end_ptr_mut();
                             let mut k_write_ptr = self.surround_buffer_k.end_ptr_mut();
+
+                            if cell_x_min != cell_x_min_cropped {
+                            } else if cell_x_max != cell_x_max_cropped {
+                            }
+
                             for i in range_middle.clone().map(Into::into).step_by(8) {
                                 let x_read_ptr = self.x1.as_ptr().add(i);
                                 let y_read_ptr = self.y1.as_ptr().add(i);
                                 _mm256_storeu_ps(x_write_ptr, _mm256_loadu_ps(x_read_ptr));
-                                _mm256_storeu_ps(y_write_ptr, _mm256_loadu_ps(y_read_ptr));
+                                _mm256_storeu_ps(
+                                    y_write_ptr,
+                                    _mm256_add_ps(offset_y, _mm256_loadu_ps(y_read_ptr)),
+                                );
                                 x_write_ptr = x_write_ptr.add(8);
                                 y_write_ptr = y_write_ptr.add(8);
                             }
@@ -1635,7 +1646,9 @@ impl State {
             let io = k.zoom_out as i32 as f32 - k.zoom_in as i32 as f32;
             self.params.offset_x += lr * control_dt / self.params.zoom_x;
             self.params.offset_y += ud * control_dt / self.params.zoom_x;
+
             self.params.zoom_x += io * control_dt * self.params.zoom_x;
+            //self.params.zoom_x = self.params.zoom_x.max(1.0);
             self.params.zoom_y =
                 self.params.zoom_x * self.size.width as f32 / (self.size.height as f32);
         }
