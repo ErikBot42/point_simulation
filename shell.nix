@@ -2,6 +2,7 @@
 pkgs.mkShell rec {
 name = "rust-env";
 buildInputs = with pkgs; [
+linuxPackages.perf
 cmake
 gcc
 mesa

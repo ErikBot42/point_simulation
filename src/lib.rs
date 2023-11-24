@@ -42,8 +42,8 @@ use std::time::{Instant, SystemTime};
 
 type IndexType = u16;
 
-const CELLS_X: IndexType = 64;
-const CELLS_Y: IndexType = 64;
+const CELLS_X: IndexType = 128;
+const CELLS_Y: IndexType = 128;
 const CELLS_MAX_DIM: IndexType = if CELLS_X > CELLS_Y { CELLS_X } else { CELLS_Y };
 const CELLS: IndexType = CELLS_X * CELLS_Y;
 const POINT_MAX_RADIUS: f32 = MIN_WIDTH / (CELLS_MAX_DIM as f32);
@@ -59,15 +59,16 @@ const WIDTH_X: f32 = MAX_X - MIN_X;
 const WIDTH_Y: f32 = MAX_Y - MIN_Y;
 
 const MIN_WIDTH: f32 = if WIDTH_X > WIDTH_Y { WIDTH_Y } else { WIDTH_X };
-#[cfg(not(feature = "simd"))]
-const K_FAC: f32 = 2.0 * 0.2;
-#[cfg(feature = "simd")]
-const K_FAC: f32 = 2.0 * 0.2 * (1.0 / (1.0 - BETA));
+const K_FAC_BASE: f32 = 0.2;
+#[cfg(feature = "nosimd")]
+const K_FAC: f32 = K_FAC_BASE * 2.0 * 0.2;
+#[cfg(not(feature = "nosimd"))]
+const K_FAC: f32 = K_FAC_BASE * 2.0 * 0.2 * (1.0 / (1.0 - BETA));
 const BETA: f32 = 0.3; //0.3;
-const DT: f32 = 0.004; //0.008; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.008; //0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const NUM_POINTS: u32 = 8192; //16384; //8192; //1024; //16384; //8192; //2048; //16384;
+const NUM_POINTS: u32 = 32768; //16384; //8192; //1024; //16384; //8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 
 fn debug_check_valid_pos(f: f32) -> bool {
@@ -371,9 +372,12 @@ impl SimThreadController {
             let mut simulation_state = CpuSimulationState::new();
             let mut delta = Instant::now();
             let mut updates = 0;
+            let mut cycles_last = unsafe { core::arch::x86_64::_rdtsc() };
             loop {
-                simulation_state.update();
-                updates += 1;
+                for _ in 0..10 {
+                    simulation_state.update();
+                    updates += 1;
+                }
                 if counter.load(Relaxed) < 20 {
                     let mut v = Vec::new();
                     simulation_state.serialize_gpu(&mut v);
@@ -387,7 +391,11 @@ impl SimThreadController {
                 let elapsed = delta.elapsed();
                 if elapsed > Duration::from_secs(1) {
                     let ups = updates as f64 / elapsed.as_secs_f64();
-                    println!("ups: {ups}");
+                    let cycles_now = unsafe { core::arch::x86_64::_rdtsc() };
+                    let cycles_elapsed = cycles_now - replace(&mut cycles_last, cycles_now);
+                    let cycles_per_point_update =
+                        cycles_elapsed as f64 / (updates as f64 * NUM_POINTS as f64);
+                    println!("ups: {ups}, cppu: {cycles_per_point_update}");
                     updates = 0;
                     delta = Instant::now();
                 }
@@ -819,6 +827,36 @@ impl GpuSimulationState {
     }
 }
 
+/// Automatically selects appropriate fused multiply add/sub intrinsic.
+/// will perform simple add/sub/mul if surrounded in parenthesis.
+/// function calls are allowed, but their arguments are invisible to the macro
+#[rustfmt::skip]
+macro_rules! fma {
+    (($a:tt * $b:tt + $c:tt)) => { core::arch::x86_64::_mm256_fmadd_ps(fma!($a), fma!($b), fma!($c)) };
+    (($a:tt * $b:tt - $c:tt)) => { core::arch::x86_64::_mm256_fmsum_ps(fma!($a), fma!($b), fma!($c)) };
+    ((- $a:tt * $b:tt + $c:tt)) => { core::arch::x86_64::_mm256_fnadd_ps(fma!($a), fma!($b), fma!($c)) };
+    ((- $a:tt * $b:tt - $c:tt)) => { core::arch::x86_64::_mm256_fnsum_ps(fma!($a), fma!($b), fma!($c)) };
+    ($a:tt * $b:tt + $c:tt) => { core::arch::x86_64::_mm256_fmadd_ps(fma!($a), fma!($b), fma!($c)) };
+    ($a:tt * $b:tt - $c:tt) => { core::arch::x86_64::_mm256_fmsum_ps(fma!($a), fma!($b), fma!($c)) };
+    (- $a:tt * $b:tt + $c:tt) => { core::arch::x86_64::_mm256_fnadd_ps(fma!($a), fma!($b), fma!($c)) };
+    (- $a:tt * $b:tt - $c:tt) => { core::arch::x86_64::_mm256_fnsum_ps(fma!($a), fma!($b), fma!($c)) };
+    (($a:tt - $b:tt)) => { core::arch::x86_64::_mm256_sub_ps(fma!($a), fma!($b)) };
+    (($a:tt + $b:tt)) => { core::arch::x86_64::_mm256_add_ps(fma!($a), fma!($b)) };
+    (($a:tt * $b:tt)) => { core::arch::x86_64::_mm256_mul_ps(fma!($a), fma!($b)) };
+    ($a:tt) => {$a};
+}
+unsafe fn test() {
+    use simd::*;
+    use core::arch::x86_64::*;
+    let a = set1(1.0);
+    let b = set1(2.0);
+    let c = set1(3.0);
+    unsafe fn q() -> __m256 {
+        set1(3.0)
+    }
+    fma!(((a * b + c) * (b + c)));
+}
+
 /// Entire state of the simulation
 pub struct CpuSimulationState {
     x0: Pbox<f32>,
@@ -947,8 +985,6 @@ impl CpuSimulationState {
 
                     let cell_x_min = cx as i32 - 1;
                     let cell_x_max = cx as i32 + 1;
-                    let cell_x_min_wrapped = cell_x_min % CELLS_X as i32;
-                    let cell_x_max_wrapped = cell_x_max % CELLS_X as i32;
                     let cell_x_min_cropped = (cell_x_min as i32).max(0);
                     let cell_x_max_cropped = (cell_x_max as i32).min(CELLS_X as i32 - 1);
 
@@ -960,45 +996,39 @@ impl CpuSimulationState {
                     let range_middle = usize::from(self.cell_index[cell_min_cropped])
                         ..usize::from(self.cell_index[cell_max_cropped + 1.into()]);
 
-                    #[cfg(feature = "simd")]
-                    {
-                        unsafe {
-                            use core::arch::x86_64::*;
-                            let offset_y = _mm256_set1_ps(offset_y);
-                            let mut x_write_ptr = self.surround_buffer_x.end_ptr_mut();
-                            let mut y_write_ptr = self.surround_buffer_y.end_ptr_mut();
-                            let mut k_write_ptr = self.surround_buffer_k.end_ptr_mut();
+                    let range_middle_leftover8 = range_middle.len() % 8;
+                    let range_middle_leftover32 = range_middle.len() % 32;
 
-                            if cell_x_min != cell_x_min_cropped {
-                            } else if cell_x_max != cell_x_max_cropped {
-                            }
+                    #[cfg(not(feature = "nosimd"))]
+                    unsafe {
+                        use core::arch::x86_64::*;
+                        let offset_y = _mm256_set1_ps(offset_y);
+                        let mut x_write_ptr = self.surround_buffer_x.end_ptr_mut();
+                        let mut y_write_ptr = self.surround_buffer_y.end_ptr_mut();
+                        let mut k_write_ptr = self.surround_buffer_k.end_ptr_mut();
 
-                            for i in range_middle.clone().map(Into::into).step_by(8) {
-                                let x_read_ptr = self.x1.as_ptr().add(i);
-                                let y_read_ptr = self.y1.as_ptr().add(i);
-                                _mm256_storeu_ps(x_write_ptr, _mm256_loadu_ps(x_read_ptr));
-                                _mm256_storeu_ps(
-                                    y_write_ptr,
-                                    _mm256_add_ps(offset_y, _mm256_loadu_ps(y_read_ptr)),
-                                );
-                                x_write_ptr = x_write_ptr.add(8);
-                                y_write_ptr = y_write_ptr.add(8);
-                            }
-                            for i in range_middle.clone().map(Into::into).step_by(32) {
-                                let k_read_ptr = self.k.as_ptr().add(i);
-                                _mm256_storeu_si256(
-                                    k_write_ptr as *mut __m256i,
-                                    _mm256_loadu_si256(k_read_ptr as *const __m256i),
-                                );
-                                k_write_ptr = k_write_ptr.add(32);
-                            }
-                            self.surround_buffer_x.len += range_middle.len();
-                            self.surround_buffer_y.len += range_middle.len();
-                            self.surround_buffer_k.len += range_middle.len();
+                        for i in range_middle.clone().map(Into::into).step_by(8) {
+                            let x_read_ptr = self.x1.as_ptr().add(i);
+                            let y_read_ptr = self.y1.as_ptr().add(i);
+                            let k_read_ptr = self.k.as_ptr().add(i);
+
+                            _mm256_storeu_ps(x_write_ptr, _mm256_loadu_ps(x_read_ptr));
+                            _mm256_storeu_ps(
+                                y_write_ptr,
+                                _mm256_add_ps(offset_y, _mm256_loadu_ps(y_read_ptr)),
+                            );
+                            (k_write_ptr as *mut u64)
+                                .write_unaligned((k_read_ptr as *mut u64).read_unaligned());
+                            x_write_ptr = x_write_ptr.add(8);
+                            y_write_ptr = y_write_ptr.add(8);
+                            k_write_ptr = k_write_ptr.add(8);
                         }
-                    }
 
-                    #[cfg(not(feature = "simd"))]
+                        self.surround_buffer_x.len += range_middle.len();
+                        self.surround_buffer_y.len += range_middle.len();
+                        self.surround_buffer_k.len += range_middle.len();
+                    }
+                    #[cfg(feature = "nosimd")]
                     for i in range_middle.map(Into::into) {
                         unsafe {
                             self.surround_buffer_x.push(self.x1[i]);
@@ -1007,27 +1037,13 @@ impl CpuSimulationState {
                         }
                     }
                 }
-                #[cfg(feature = "simd")]
+                #[cfg(not(feature = "nosimd"))]
                 unsafe {
                     use core::arch::x86_64::*;
                     let zero = _mm256_setzero_ps();
-
                     _mm256_storeu_ps(self.surround_buffer_x.end_ptr_mut(), zero);
                     _mm256_storeu_ps(self.surround_buffer_y.end_ptr_mut(), zero);
-
-                    self.surround_buffer_x.len += EXTRA_ELEMS;
-                    self.surround_buffer_y.len += EXTRA_ELEMS;
-
-                    // Equvalent:
-                    // for _ in 0..EXTRA_ELEMS {
-                    //     unsafe {
-                    //         self.surround_buffer_x.push(0.0);
-                    //         self.surround_buffer_y.push(0.0);
-                    //     }
-                    // }
                 }
-                #[cfg(feature = "simd")]
-                const EXTRA_ELEMS: usize = 7; // round down num iterations to (hopefully?) skip these.
                 for i in (usize::from(self.cell_index[cell])
                     ..usize::from(self.cell_index[cell + 1.into()]))
                     .map(Into::into)
@@ -1041,7 +1057,7 @@ impl CpuSimulationState {
                     let mut acc_y;
 
                     // about 42 % faster
-                    #[cfg(feature = "simd")]
+                    #[cfg(not(feature = "nosimd"))]
                     unsafe {
                         use simd::*;
                         use std::arch::x86_64::*;
@@ -1071,11 +1087,10 @@ impl CpuSimulationState {
                             let dx = sub(x1, x_other);
                             let dy = sub(y1, y_other);
                             let dot = fmadd(dx, dx, mul(dy, dy));
-                            let rsqrt = rsqrt_fast(dot);
+                            let recip_sqrt = rsqrt_fast(dot);
 
                             // NOTE: also test _mm256_rcp_ps
-                            let r = mul(rsqrt, dot); //sqrt(dot);
-                            let r_inv = mul(rsqrt, rsqrt);
+                            let r = mul(recip_sqrt, dot); //sqrt(dot);
                             let x = mul(r, set1(1.0 / POINT_MAX_RADIUS));
 
                             // do not inline, will change later
@@ -1096,7 +1111,7 @@ impl CpuSimulationState {
                             let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_NEQ_OQ);
 
                             // f / r
-                            let f_div_r = and(mul(f, rsqrt), mask_ok);
+                            let f_div_r = and(mul(f, recip_sqrt), mask_ok);
 
                             acc_x_s = fmadd(dx, f_div_r, acc_x_s);
                             acc_y_s = fmadd(dy, f_div_r, acc_y_s);
@@ -1106,7 +1121,7 @@ impl CpuSimulationState {
                     }
 
                     // about 52 % of execution time is spent here
-                    #[cfg(not(feature = "simd"))]
+                    #[cfg(feature = "nosimd")]
                     {
                         acc_x = 0.0;
                         acc_y = 0.0;
@@ -1148,28 +1163,60 @@ impl CpuSimulationState {
                     acc_y *= MIN_WIDTH;
                     debug_assert_float!(acc_x);
                     debug_assert_float!(acc_y);
+
+                    /*
+                       n in [-1, 0, 1]
+                       dx = x1 - x0 + n * MIN_WIDTH;
+                       dy = y1 - y0 + n * MIN_WIDTH;
+
+                       want closest value to zero
+                       => ignore sign, then add sign back
+
+                    */
+
                     let mut vx = x1 - x0;
                     let mut vy = y1 - y0;
 
-                    for dx in [-WIDTH_X, WIDTH_X] {
-                        let c = x1 - x0 + dx;
-                        if c.abs() < vx.abs() {
-                            vx = c
+                    {
+                        const MIDPOINT_X: f32 = (MIN_X + MAX_X) / 2.0;
+                        if vx > MIDPOINT_X {
+                            vx -= WIDTH_X;
+                        } else if vx < -MIDPOINT_X {
+                            vx += WIDTH_X;
                         }
                     }
-                    for dy in [-WIDTH_Y, WIDTH_Y] {
-                        let c = y1 - y0 + dy;
-                        if c.abs() < vy.abs() {
-                            vy = c
+                    {
+                        const MIDPOINT_Y: f32 = (MIN_Y + MAX_Y) / 2.0;
+                        if vy > MIDPOINT_Y {
+                            vy -= WIDTH_Y;
+                        } else if vy < -MIDPOINT_Y {
+                            vy += WIDTH_Y;
                         }
                     }
                     let v2 = vx * vx + vy * vy;
-                    let vx_norm = vx / v2.sqrt();
-                    let vy_norm = vy / v2.sqrt();
-                    let friction_force = v2 * (50.0 / (DT * DT));
+                    let v = v2.sqrt();
+                    let vx_norm = vx / v;
+                    let vy_norm = vy / v;
+                    // let friction_force = v2 * (50.0 / (DT * DT));
+                    // let friction_force = v2 * (500.0 / (DT * DT));
+                    let v = v2.sqrt();
+                    //let friction_force = v2 * (500.0 / (DT * DT));
+                    // acc_x *= 0.001;
+                    // acc_y *= 0.001;
+                    //let friction_force = v * v * 31250000.0;
+
+                    let friction_force: f32;
+                    {
+                        let h = 0.001;
+                        let c = 1.0;
+                        let x = v.min((2.0 * h) / c);
+
+                        let target_v = (c - (c * c / (4.0 * h) * x)) * x;
+                        friction_force = v - target_v;
+                    }
                     if !(vx_norm.is_nan() || vy_norm.is_nan()) {
-                        acc_x += friction_force * (-vx_norm);
-                        acc_y += friction_force * (-vy_norm);
+                        acc_x += friction_force * (-vx_norm) / (DT * DT);
+                        acc_y += friction_force * (-vy_norm) / (DT * DT);
                     }
 
                     let new_x = mod_simulation_x(x1 + vx + acc_x * DT * DT); //.rem_euclid(1.0);
@@ -1467,7 +1514,8 @@ impl State {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
         });
 
-        let tri_size = 0.003;
+        let tri_size = POINT_MAX_RADIUS * BETA; //0.003;
+
         let vertex_offsets: [f32; 6] = {
             [
                 f32::sqrt(3.0) / 2.0,

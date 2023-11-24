@@ -5,8 +5,8 @@ fn main() {
     let mut state = black_box(CpuSimulationState::from_seed(23483489));
     //let iters = 10000;
     //let iters_pre = 1000;
-    let iters = 100;
-    let iters_pre = 10;
+    let iters = 5000;
+    let iters_pre = 1000;
     for _ in 0..iters_pre{
         state.update();
     }
@@ -14,7 +14,8 @@ fn main() {
     for _ in 0..iters {
         state.update();
     }
-    println!("{} ups", iters as f64 / now.elapsed().as_secs_f64());
+    let elapsed = now.elapsed().as_secs_f64();
+    println!("{} ups, {} s", iters as f64 / elapsed, elapsed);
     black_box(state);
 
 }
