@@ -111,7 +111,7 @@ fn vs_main(
         pow(sin(u + 0.0 * w), 4.0),
         pow(sin(u + 1.0 * w), 4.0),
         pow(sin(u + 2.0 * w), 4.0),
-        1.0
+        1.0,
     );
     //if (tile_x != 1u || tile_y != 1u) {
     //    color *= .2;
