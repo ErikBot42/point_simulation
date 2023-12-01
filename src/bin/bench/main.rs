@@ -5,7 +5,7 @@ fn main() {
     let mut state = black_box(CpuSimulationState::from_seed(23483489));
     //let iters = 10000;
     //let iters_pre = 1000;
-    let iters = 50000;
+    let iters = 500;
     let iters_pre = 100;
     for _ in 0..iters_pre{
         state.update();

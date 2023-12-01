@@ -102,6 +102,7 @@ const POINT_MAX_RADIUS: f32 = MIN_WIDTH / (CELLS_MAX_DIM as f32);
 // exclusive upper bound
 const MIN_X: f32 = 0.0;
 const MAX_X: f32 = 1.0;
+
 const MIN_Y: f32 = 0.0;
 const MAX_Y: f32 = 1.0;
 
@@ -137,27 +138,27 @@ macro_rules! debug_assert_float {
 }
 #[inline(always)]
 fn scale_simulation_x(f: f32) -> f32 {
-    MIN_X + (MAX_X - MIN_X) * f
+    MIN_X + WIDTH_X * f
 }
 #[inline(always)]
 fn scale_simulation_y(f: f32) -> f32 {
-    MIN_Y + (MAX_Y - MIN_Y) * f
+    MIN_Y + WIDTH_Y * f
 }
 #[inline(always)]
 fn inv_scale_simulation_x(f: f32) -> f32 {
-    (f - MIN_X) * (1.0 / (MAX_X - MIN_X))
+    (f - MIN_X) * (1.0 / WIDTH_X)
 }
 #[inline(always)]
 fn inv_scale_simulation_y(f: f32) -> f32 {
-    (f - MIN_Y) * (1.0 / (MAX_Y - MIN_Y))
+    (f - MIN_Y) * (1.0 / WIDTH_Y)
 }
 #[inline(always)]
 fn mod_simulation_x(f: f32) -> f32 {
-    (f - MIN_X).rem_euclid(MAX_X - MIN_X) + MIN_X
+    (f - MIN_X).rem_euclid(WIDTH_X) + MIN_X
 }
 #[inline(always)]
 fn mod_simulation_y(f: f32) -> f32 {
-    (f - MIN_Y).rem_euclid(MAX_Y - MIN_Y) + MIN_Y
+    (f - MIN_Y).rem_euclid(WIDTH_Y) + MIN_Y
 }
 
 #[inline(always)]
@@ -402,7 +403,7 @@ impl Packed {
             )
     }
     #[inline(always)]
-    unsafe fn mm256_unpack_shifted_k(combined: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    unsafe fn mm256_unpack_preshifted_k(combined: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
         use core::arch::x86_64::*;
         _mm256_and_si256(_mm256_set1_epi32(Packed::MASK as i32), combined)    
     }
@@ -411,8 +412,10 @@ impl Packed {
         use core::arch::x86_64::*;
         _mm256_srli_epi32(_mm256_and_si256(_mm256_set1_epi32(Packed::MASK as i32), combined), Packed::SHIFT as i32)   
     }
+    #[inline(always)]
     unsafe fn mm256_unpack_x(combined: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
-
+        use core::arch::x86_64::*;
+        _mm256_or_si256(_mm256_set1_epi32(Packed::MASK as i32), combined)    
     }
 
 }
@@ -970,14 +973,17 @@ pub struct CpuSimulationState {
     y0: Pbox<f32>,
     x1: Pbox<f32>,
     y1: Pbox<f32>,
+    // TODO: merge with f32 unused bits
     k: Pbox<u8>,
 
     x0_tmp: Pbox<f32>,
     y0_tmp: Pbox<f32>,
     x1_tmp: Pbox<f32>,
     y1_tmp: Pbox<f32>,
+    // TODO: merge with f32 unused bits
     k_tmp: Pbox<u8>,
-
+    
+    // TODO: pack (xxxxxxxxyyyyyyyy) in single array.
     surround_buffer_x: UnsafePointVec<f32>,
     surround_buffer_y: UnsafePointVec<f32>,
     surround_buffer_k: UnsafePointVec<u8>,
@@ -1084,8 +1090,8 @@ impl CpuSimulationState {
             .zip(self.y0.iter())
             .zip(self.k.iter())
             .map(|((&x, &y), &k)| GpuPoint {
-                x,
-                y,
+                x: (x - MIN_X) * (1.0 / (MAX_X-MIN_X)),
+                y: (y - MIN_X) * (1.0 / (MAX_X-MIN_X)),
                 k: k as _,
                 _unused: 0,
             }),
@@ -1203,7 +1209,13 @@ impl CpuSimulationState {
                             // step_by rounds down
                             let k_base: __m256 =
                                 _mm256_load_ps(self.relation_table.as_ptr().add(k as usize).cast());
-                            for i in (0..self.surround_buffer_len).step_by(8) {
+
+                            
+                            // TODO: only do first N iterations.
+
+                            // for i in (0..self.surround_buffer_len).step_by(8) {
+                            let i = 0;
+                            if false {
                                 // load ks, zero extend, and index into base
                                 let k_factor: __m256 = _mm256_permutevar8x32_ps(
                                     k_base,
@@ -1631,7 +1643,7 @@ impl CpuSimulationState {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
             });
 
-            let tri_size = POINT_MAX_RADIUS * BETA; //0.003;
+            let tri_size = POINT_MAX_RADIUS * BETA / (MAX_X - MIN_X); //0.003;
 
             // let vertex_offsets: [f32; 6] = {
             //     [
