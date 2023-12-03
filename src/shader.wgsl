@@ -84,7 +84,7 @@ fn vs_main(
    
     offset -= vec2<f32>(params.offset_x, params.offset_y);
 
-    offset = (((offset) % 2.0 + 2.0) % 2.0 - 1.0);
+    //offset = (((offset) % 2.0 + 2.0) % 2.0 - 1.0);
 
     
     offset += in.offset;

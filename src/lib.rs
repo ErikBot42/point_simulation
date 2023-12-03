@@ -1,14 +1,12 @@
 //#![feature(trace_macros)]
 //#![feature(portable_simd)]
-#![deny(clippy::correctness)]
-#![deny(clippy::suspicious)]
-
 
 #![deny(clippy::complexity)]
+#![deny(clippy::correctness)]
+#![deny(clippy::suspicious)]
 #![deny(clippy::perf)]
 #![deny(clippy::style)]
 #![allow(clippy::new_without_default)]
-
 #![warn(clippy::pedantic)]
 #![allow(clippy::inline_always)]
 #![allow(clippy::wildcard_imports)]
@@ -20,12 +18,19 @@
 #![allow(clippy::cast_ptr_alignment)]
 #![allow(clippy::ptr_as_ptr)]
 #![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::unnecessary_box_returns)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::struct_excessive_bools)]
 #![allow(clippy::many_single_char_names)]
 #![allow(clippy::similar_names)]
+#![deny(clippy::nursery)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::future_not_send)]
+#![deny(clippy::suboptimal_flops)]
+
+//#![deny(clippy::restrict)]
 
 // #![deny(clippy::complexity)]
 // #![deny(clippy::perf)]
@@ -54,25 +59,21 @@
 // #![allow(clippy::indexing_slicing)]
 // #![allow(clippy::panic)]
 
-use std::array::from_fn;
-use std::fmt::Debug;
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::mem::{replace, size_of, swap};
-use std::ops::Add;
-use std::ops::AddAssign;
-use std::ops::Deref;
-use std::ops::DerefMut;
-use std::ops::Index;
-use std::ops::IndexMut;
-use std::time::Duration;
-use wgpu::util::DeviceExt;
-use wgpu::SurfaceError;
-use winit::window::Window;
+use std::{
+    array::from_fn,
+    fmt::Debug,
+    marker::PhantomData,
+    mem::{replace, size_of, swap, ManuallyDrop},
+    ops::{Add, AddAssign, Deref, DerefMut, Index, IndexMut, Range},
+    time::Duration,
+};
+
+use no_panic::no_panic;
+use wgpu::{util::DeviceExt, SurfaceError};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    window::{Window, WindowBuilder},
 };
 
 // API
@@ -119,8 +120,9 @@ const BETA: f32 = 0.3; //0.3;
 const DT: f32 = 0.006; //0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-const NUM_POINTS: u32 = 32768; //16384; //8192; //1024; //16384; //8192; //2048; //16384;
+pub const NUM_POINTS: u32 = 32768; //16384; //8192; //1024; //16384; //8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
+const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
 fn debug_check_valid_pos(f: f32) -> bool {
     #[cfg(debug_assertions)]
@@ -146,11 +148,15 @@ fn scale_simulation_y(f: f32) -> f32 {
 }
 #[inline(always)]
 fn inv_scale_simulation_x(f: f32) -> f32 {
-    (f - MIN_X) * (1.0 / WIDTH_X)
+    //(f - MIN_X) * (1.0 / WIDTH_X)
+    // TODO: not respecting min_x, max_x
+    f
 }
 #[inline(always)]
 fn inv_scale_simulation_y(f: f32) -> f32 {
-    (f - MIN_Y) * (1.0 / WIDTH_Y)
+    //(f - MIN_Y) * (1.0 / WIDTH_Y)
+    // TODO: not respecting min_x, max_x
+    f
 }
 #[inline(always)]
 fn mod_simulation_x(f: f32) -> f32 {
@@ -159,6 +165,39 @@ fn mod_simulation_x(f: f32) -> f32 {
 #[inline(always)]
 fn mod_simulation_y(f: f32) -> f32 {
     (f - MIN_Y).rem_euclid(WIDTH_Y) + MIN_Y
+}
+fn reflect_sim_x(f: f32) -> f32 {
+    // TODO: not respecting min_x, max_x
+    // (((f.min(2.0-f).max(-f))-0.5)*0.999999)+0.5
+    //f.min(2.0-f).max(-f)
+    //f.min(5.0-f*4.0).max(-f*4.0)
+    if f.is_nan() {
+        eprintln!("nan x pos detected...");
+        0.5
+    } else if f < 0.0 {
+        0.004
+    } else if f > 1.0 {
+        1.0 - 0.004
+    } else {
+        f
+    }
+}
+fn reflect_sim_y(f: f32) -> f32 {
+    // TODO: not respecting min_x, max_x
+    // (((f.min(2.0-f).max(-f))-0.5)*0.999999)+0.5
+    //f.min(2.0-f).max(-f)
+    //f.min(5.0-f*4.0).max(-f*4.0)
+
+    if f.is_nan() {
+        eprintln!("nan y pos detected...");
+        0.5
+    } else if f < 0.0 {
+        0.004
+    } else if f > 1.0 {
+        1.0 - 0.004
+    } else {
+        f
+    }
 }
 
 #[inline(always)]
@@ -174,7 +213,7 @@ fn compute_cell(x: f32, y: f32) -> Cid {
     debug_assert!(
         cell < CELLS as <Cid as IndexWrapped>::IndexType,
         "{cell} >= CEllS, cell_x: {cell_x}, cell_y: {cell_y}, x: {x}, y: {y}"
-        );
+    );
     Cid(cell)
 }
 
@@ -249,13 +288,13 @@ impl SimulationInputEuler {
                                   //    .duration_since(SystemTime::UNIX_EPOCH)
                                   //    .unwrap()
                                   //    .as_micros() as u64,
-            )
+        )
     }
     #[must_use]
     fn from_seed(seed: u64) -> SimulationInputEuler {
         fn iter_alloc<T: std::fmt::Debug, const SIZE: usize, F: FnMut() -> T>(
             mut f: F,
-            ) -> Box<[T; SIZE]> {
+        ) -> Box<[T; SIZE]> {
             (0..SIZE)
                 .map(|_| f())
                 .collect::<Vec<_>>()
@@ -282,13 +321,13 @@ impl SimulationInputEuler {
         let mut y1 = self.vy;
         for (((x0, y0), x1), y1) in x0
             .iter()
-                .zip(y0.iter())
-                .zip(x1.iter_mut())
-                .zip(y1.iter_mut())
-                {
-                    *x1 = (x0 + *x1 * DT).rem_euclid(1.0);
-                    *y1 = (y0 + *y1 * DT).rem_euclid(1.0);
-                }
+            .zip(y0.iter())
+            .zip(x1.iter_mut())
+            .zip(y1.iter_mut())
+        {
+            *x1 = f32::mul_add(*x1, DT, *x0).rem_euclid(1.0);
+            *y1 = f32::mul_add(*y1, DT, *y0).rem_euclid(1.0);
+        }
         SimulationInputVerlet {
             x0,
             y0,
@@ -315,6 +354,11 @@ macro_rules! index_wrap {
         }
         impl From<$name> for usize {
             fn from(value: $name) -> usize {
+                value.0 as _
+            }
+        }
+        impl From<$name> for u32 {
+            fn from(value: $name) -> u32 {
                 value.0 as _
             }
         }
@@ -381,50 +425,60 @@ impl Packed {
         // assert!(MAX_X < 1.1);
     };
     const MASK: u32 = 0b0011_1110_0000_0000_0000_0000_0000_0000;
-    const SHIFT: u32 = Packed::MASK.trailing_zeros();
+    const SHIFT: u32 = Self::MASK.trailing_zeros();
     #[inline(always)]
     fn pack(float: f32, val: u8) -> u32 {
-        (float.to_bits() & (!Packed::MASK)) | ((val as u32) << Packed::SHIFT)
+        (float.to_bits() & (!Self::MASK)) | ((val as u32) << Self::SHIFT)
     }
     #[inline(always)]
     fn unpack_float(packed: u32) -> f32 {
-        f32::from_bits(packed | Packed::MASK)
+        f32::from_bits(packed | Self::MASK)
     }
     #[inline(always)]
     fn unpack_u8(packed: u32) -> u8 {
-        ((packed & Self::MASK) >> Packed::SHIFT) as u8
+        ((packed & Self::MASK) >> Self::SHIFT) as u8
     }
     #[inline(always)]
-    unsafe fn mm256_pack_preshifted(x: core::arch::x86_64::__m256, preshifted_k: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    unsafe fn mm256_pack_preshifted(
+        x: core::arch::x86_64::__m256,
+        preshifted_k: core::arch::x86_64::__m256i,
+    ) -> core::arch::x86_64::__m256i {
         use core::arch::x86_64::*;
         _mm256_or_si256(
-            _mm256_and_si256(_mm256_set1_epi32((!Packed::MASK) as i32), _mm256_castps_si256(x)),
+            _mm256_and_si256(
+                _mm256_set1_epi32((!Self::MASK) as i32),
+                _mm256_castps_si256(x),
+            ),
             preshifted_k,
-            )
+        )
     }
     #[inline(always)]
-    unsafe fn mm256_unpack_preshifted_k(combined: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    unsafe fn mm256_unpack_preshifted_k(
+        combined: core::arch::x86_64::__m256i,
+    ) -> core::arch::x86_64::__m256i {
         use core::arch::x86_64::*;
-        _mm256_and_si256(_mm256_set1_epi32(Packed::MASK as i32), combined)    
+        _mm256_and_si256(_mm256_set1_epi32(Self::MASK as i32), combined)
     }
     #[inline(always)]
     unsafe fn mm256_unpack_k(combined: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
         use core::arch::x86_64::*;
-        _mm256_srli_epi32(_mm256_and_si256(_mm256_set1_epi32(Packed::MASK as i32), combined), Packed::SHIFT as i32)   
+        _mm256_srli_epi32(
+            _mm256_and_si256(_mm256_set1_epi32(Self::MASK as i32), combined),
+            Self::SHIFT as i32,
+        )
     }
     #[inline(always)]
     unsafe fn mm256_unpack_x(combined: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
         use core::arch::x86_64::*;
-        _mm256_or_si256(_mm256_set1_epi32(Packed::MASK as i32), combined)    
+        _mm256_or_si256(_mm256_set1_epi32(Self::MASK as i32), combined)
     }
-
 }
 
 #[derive(Debug)]
 struct Tb<I, T, const SIZE: usize>(Box<[T; SIZE]>, PhantomData<I>);
 impl<I, T, const SIZE: usize> From<Box<[T; SIZE]>> for Tb<I, T, SIZE> {
-    fn from(value: Box<[T; SIZE]>) -> Tb<I, T, SIZE> {
-        Tb(value, PhantomData)
+    fn from(value: Box<[T; SIZE]>) -> Self {
+        Self(value, PhantomData)
     }
 }
 
@@ -518,7 +572,7 @@ impl SimThreadController {
             }
         });
 
-        SimThreadController {
+        Self {
             recv_data: recv,
             counter,
         }
@@ -550,7 +604,7 @@ impl<T, const SIZE: usize> UnsafeVec<T, SIZE> {
 
 impl<T, const SIZE: usize> From<Box<[T; SIZE]>> for UnsafeVec<T, SIZE> {
     fn from(inner: Box<[T; SIZE]>) -> Self {
-        UnsafeVec { inner }
+        Self { inner }
     }
 }
 
@@ -567,36 +621,67 @@ impl<T, const SIZE: usize> DerefMut for UnsafeVec<T, SIZE> {
     }
 }
 
-fn calloc<T: Default + Debug + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize, O>() -> O
+fn calloc_counted<T: Default + Debug + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize, O>(
+    byte_counter: &mut usize,
+) -> O
 where
-O: From<Box<[T; SIZE]>>,
+    O: From<Box<[T; SIZE]>>,
 {
     //let b: Box<[T; SIZE]> = (0..SIZE)
     //    .map(|_| T::default())
     //    .collect::<Vec<T>>()
     //    .try_into()
     //    .unwrap();
-    let b = aligned_alloc();
+    *byte_counter += size_of::<T>() * SIZE;
+    calloc()
+}
+
+fn calloc<T: Default + Debug + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize, O>() -> O
+where
+    O: From<Box<[T; SIZE]>>,
+{
+    let b = aligned_alloc_64();
     let alignment = 1 << (b.as_ptr() as usize).trailing_zeros();
     println!(
         "ALIGNMENT: {}, LEN: {} {}",
         alignment,
         b.len(),
-        if alignment >= 64 { "(OK)" } else { "" }
-        );
+        if alignment >= 64 { "(OK)" } else { panic!() }
+    );
     O::from(b)
 }
 
-fn aligned_alloc<T: Default + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize>(
-                                                                                    ) -> Box<[T; SIZE]> {
+fn aligned_alloc_64<T: Default + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize>(
+) -> Box<[T; SIZE]> {
     #[repr(align(64), C)]
     struct AlignedBytes([u8; 64]);
+    impl Default for AlignedBytes {
+        fn default() -> Self {
+            Self([0; 64])
+        }
+    }
+    aligned_alloc::<AlignedBytes, T, SIZE>()
+}
 
+fn aligned_alloc_4096<T: Default + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize>(
+) -> Box<[T; SIZE]> {
+    #[repr(align(4096), C)]
+    struct AlignedBytes([u8; 4096]);
+    impl Default for AlignedBytes {
+        fn default() -> Self {
+            Self([0; 4096])
+        }
+    }
+    aligned_alloc::<AlignedBytes, T, SIZE>()
+}
+
+fn aligned_alloc<S: Default, T: Default + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize>(
+) -> Box<[T; SIZE]> {
     let mut v = ManuallyDrop::new(
-        (0..((SIZE * size_of::<T>()) / size_of::<AlignedBytes>()))
-        .map(|_| AlignedBytes([0; 64]))
-        .collect::<Vec<AlignedBytes>>(),
-        );
+        (0..((SIZE * size_of::<T>()) / size_of::<S>()))
+            .map(|_| S::default())
+            .collect::<Vec<S>>(),
+    );
     v.shrink_to_fit();
     unsafe { Box::from_raw(v.as_mut_ptr() as *mut [T; SIZE]) }
 }
@@ -967,6 +1052,282 @@ macro_rules! fma {
     ( 0 )                           => { core::arch::x86_64::_mm256_setzero_ps() };
 }
 
+fn test() {
+    macro_rules! multi_alloc {
+        ($a:ident) => {
+            let $a = calloc();
+        };
+    }
+
+    macro_rules! find_min {
+    // Base case:
+    ($x:expr) => ($x);
+    // `$x` followed by at least one `$y,`
+    ($x:expr, $($y:expr),+) => (
+        // Call `find_min!` on the tail `$y`
+        std::cmp::min($x, find_min!($($y),+))
+    )
+}
+
+    // let x0;
+    // let y0;
+    // let x1;
+    // let y1;
+    // let k;
+    // let x0_tmp;
+    // let y0_tmp;
+    // let x1_tmp;
+    // let y1_tmp;
+    // let k_tmp;
+    // let point_cell;
+    // let point_cell_offset;
+    // let cell_count;
+    // let cell_index;
+    // let relation_table;
+
+    macro_rules! multi_alloc {
+        ($a:ident, $($b:ident),+) => {
+            multi_alloc!($a);
+            multi_alloc!($($b),+);
+        };
+        ($a:ident) => {
+            let $a = calloc();
+        };
+    }
+
+    // multi_alloc!(
+    //     x0,
+    //     y0,
+    //     x1,
+    //     y1,
+    //     k,
+    //     x0_tmp,
+    //     y0_tmp,
+    //     x1_tmp,
+    //     y1_tmp,
+    //     k_tmp,
+    //     point_cell,
+    //     point_cell_offset,
+    //     cell_count,
+    //     cell_index,
+    //     relation_table
+    // );
+    //    macro_rules! my_macro {
+    //     (struct $name:ident {
+    //         $($field_name:ident: $field_type:ty,)*
+    //     }) => {
+    //         struct $name {
+    //             $($field_name: $field_type,)*
+    //         }
+    //
+    //         impl $name {
+    //             // This is purely an example—not a good one.
+    //             fn get_field_names() -> Vec<&'static str> {
+    //                 vec![$(stringify!($field_name)),*]
+    //             }
+    //         }
+    //     }
+    // }
+    //
+    // my_macro! {
+    //     struct S {
+    //         a: String,
+    //         b: String,
+    //     }
+    // }
+    {
+        // ((SIZE * size_of::<T>()) / size_of::<S>())
+
+        // let mut v = (0..(SIZE.div_ceil(size_of::<AlignedBytes>())))
+        //     .map(|_| AlignedBytes([0;4096]))
+        //     .collect::<Vec<AlignedBytes>>();
+        // v.shrink_to_fit();
+        // v.into_boxed_slice();
+    }
+    #[no_panic]
+
+    fn tt(a: &mut [u64; 4]) {
+        let b: &mut [u64; 8] = bytemuck::cast_mut(a);
+    }
+
+    macro_rules! make_state {
+        ($name:ident $borrowed_name:ident { $($field_name:ident : [ $t:ty ; $e:expr],)* })=> {
+
+
+            struct $borrowed_name < 'a > {
+                $($field_name : & 'a mut [$t ; $e],)*
+            }
+            impl<'a> $borrowed_name <'a> {
+                fn new(data: &'a mut [AlignedBytes; ALLOC_SIZE]) -> $borrowed_name <'a> {
+                    let data: &mut [u8] = bytemuck::cast_slice_mut(data.as_mut_slice());
+                    $(
+                        let alloc_size = $e * std::mem::size_of::<$t>();
+                        let $field_name: &mut [u8] = &mut [];
+                        let $field_name: &mut [$t] = bytemuck::cast_slice_mut($field_name);
+                        let $field_name: &mut [$t; $e] = $field_name.try_into().unwrap();
+                    )*
+
+                    $borrowed_name {
+                        $($field_name,)*
+                    }
+                }
+            }
+            const ALIGN: usize = 128;
+            const ALLOC_SIZE_BYTES: usize = calc_alloc_size();
+            const ALLOC_SIZE: usize = ALLOC_SIZE_BYTES.div_ceil(size_of::<AlignedBytes>());
+            const fn calc_alloc_size() -> usize {
+                let mut offset = 0;
+                $(offset = (offset + $e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);)*
+                offset
+            }
+
+
+            unsafe impl bytemuck::Zeroable for AlignedBytes {}
+            unsafe impl bytemuck::Pod for AlignedBytes {}
+            #[derive(Copy, Clone)]
+            #[repr(align(4096), C)]
+            struct AlignedBytes([u8; 4096]);
+            struct $name (Box<[AlignedBytes; ALLOC_SIZE]>);
+            impl $name {
+                fn new() -> Self {
+                    let Ok(v) = (0..ALLOC_SIZE).map(|_| AlignedBytes([0; 4096]))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                        .try_into() else { panic!() };
+                    Self( v )
+                }
+            }
+        }
+    }
+
+    make_state!(
+        State BorrowedState {
+            x0: [f32; NUM_POINTS_U],
+            y0: [f32; NUM_POINTS_U],
+            x1: [f32; NUM_POINTS_U],
+            y1: [f32; NUM_POINTS_U],
+            k: [u8; NUM_POINTS_U],
+            x0_tmp: [f32; NUM_POINTS_U],
+            y0_tmp: [f32; NUM_POINTS_U],
+            x1_tmp: [f32; NUM_POINTS_U],
+            y1_tmp: [f32; NUM_POINTS_U],
+            k_tmp: [u8; NUM_POINTS_U],
+            point_cell: [Cid; NUM_POINTS_U],
+            point_cell_offset: [Pid; NUM_POINTS_U],
+            cell_count: [Pid; CELLS_PLUS_1_U],
+            cell_index: [Pid; CELLS_PLUS_1_U],
+            relation_table: [f32; NUM_KINDS2],
+        }
+    );
+
+    // struct BorrowedState<'a> {
+    //     x0: &'a mut [f32; NUM_POINTS_U],
+    //     y0: &'a mut [f32; NUM_POINTS_U],
+    //     x1: &'a mut [f32; NUM_POINTS_U],
+    //     y1: &'a mut [f32; NUM_POINTS_U],
+    //     k: &'a mut [u8; NUM_POINTS_U],
+    //     x0_tmp: &'a mut [f32; NUM_POINTS_U],
+    //     y0_tmp: &'a mut [f32; NUM_POINTS_U],
+    //     x1_tmp: &'a mut [f32; NUM_POINTS_U],
+    //     y1_tmp: &'a mut [f32; NUM_POINTS_U],
+    //     k_tmp: &'a mut [u8; NUM_POINTS_U],
+    //     point_cell: &'a mut [Cid; NUM_POINTS_U],
+    //     point_cell_offset: &'a mut [Pid; NUM_POINTS_U],
+    //     cell_count: &'a mut [Pid; CELLS_PLUS_1_U],
+    //     cell_index: &'a mut [Pid; CELLS_PLUS_1_U],
+    //     relation_table: &'a mut [f32; NUM_KINDS2],
+    // }
+
+    //macro_rules! make_state {
+    //    // ($field:ident) => {
+    //    //
+    //    //     //let $field: &mut [$t ; $size];
+
+    //    // };
+
+    //    ($field:ident , $($fieldd:ident),*) => {
+
+    //        //make_state!($field : [$t ; $size ]);
+
+    //    };
+    //}
+
+    // trace_macros!(true);
+    // macro_rules! make_state_inner {
+    //     ($l:lifetime, $i:ident, $t:ty, $e:expr) => {
+    //         $i: & $l mut [ $t ; $e ],
+    //     };
+    //     ($l:lifetime, $ii:ident, $tt:ty, $ee:expr, $($i:ident, $t:ty, $e:expr),+) => {
+    //         make_state_inner!($l, $ii, $tt, $ee)
+    //         make_state_inner!($l, $($i, $t, $e),+)
+    //     };
+    // }
+
+    // macro_rules! make_state {
+    //     //($x:ident) => {};
+    //     ($l:lifetime $name:ident $($i:ident : [ $t:ty ; $e:expr ]),+) => {
+    //         struct $name {
+    //             make_state_inner!($l, $($i, $t, $e),+)
+    //         }
+    //     };
+    // }
+
+    // make_state!(
+    //     'a BorrowedThing
+    //     x0: [f32; NUM_POINTS_U],
+    //     y0: [f32; NUM_POINTS_U],
+    //     x1: [f32; NUM_POINTS_U],
+    //     y1: [f32; NUM_POINTS_U],
+    //     k: [u8; NUM_POINTS_U],
+    //     x0_tmp: [f32; NUM_POINTS_U],
+    //     y0_tmp: [f32; NUM_POINTS_U],
+    //     x1_tmp: [f32; NUM_POINTS_U],
+    //     y1_tmp: [f32; NUM_POINTS_U],
+    //     k_tmp: [u8; NUM_POINTS_U],
+    //     point_cell: [Cid; NUM_POINTS_U],
+    //     point_cell_offset: [Pid; NUM_POINTS_U],
+    //     cell_count: [Pid; CELLS_PLUS_1_U],
+    //     cell_index: [Pid; CELLS_PLUS_1_U],
+    //     relation_table: [f32; NUM_KINDS]
+    // );
+
+    // trace_macros!(false);
+
+    // x0 = calloc();
+    // y0 = calloc();
+    // x1 = calloc();
+    // y1 = calloc();
+    // k = calloc();
+    // x0_tmp = calloc();
+    // y0_tmp = calloc();
+    // x1_tmp = calloc();
+    // y1_tmp = calloc();
+    // k_tmp = calloc();
+    // point_cell = calloc();
+    // point_cell_offset = calloc();
+    // cell_count = calloc();
+    // cell_index = calloc();
+    // relation_table = calloc();
+
+    // CpuSimulationState {
+    //     x0,
+    //     y0,
+    //     x1,
+    //     y1,
+    //     k,
+    //     x0_tmp,
+    //     y0_tmp,
+    //     x1_tmp,
+    //     y1_tmp,
+    //     k_tmp,
+    //     point_cell,
+    //     point_cell_offset,
+    //     cell_count,
+    //     cell_index,
+    //     relation_table,
+    // };
+}
+
 /// Entire state of the simulation
 pub struct CpuSimulationState {
     x0: Pbox<f32>,
@@ -982,14 +1343,8 @@ pub struct CpuSimulationState {
     y1_tmp: Pbox<f32>,
     // TODO: merge with f32 unused bits
     k_tmp: Pbox<u8>,
-    
+
     // TODO: pack (xxxxxxxxyyyyyyyy) in single array.
-    surround_buffer_x: UnsafePointVec<f32>,
-    surround_buffer_y: UnsafePointVec<f32>,
-    surround_buffer_k: UnsafePointVec<u8>,
-
-    surround_buffer_len: usize,
-
     point_cell: Pbox<Cid>,
 
     point_cell_offset: Pbox<Pid>,
@@ -1022,27 +1377,29 @@ impl CpuSimulationState {
         y0.iter_mut().for_each(|e| *e = scale_simulation_y(*e));
         x1.iter_mut().for_each(|e| *e = scale_simulation_x(*e));
         y1.iter_mut().for_each(|e| *e = scale_simulation_y(*e));
+        let mut counter = 0;
         let mut this = Self {
-            x0: calloc(),
-            y0: calloc(),
-            x1: calloc(),
-            y1: calloc(),
-            k: calloc(),
-            x0_tmp: calloc(),
-            y0_tmp: calloc(),
-            x1_tmp: calloc(),
-            y1_tmp: calloc(),
-            k_tmp: calloc(),
-            surround_buffer_x: calloc(),
-            surround_buffer_y: calloc(),
-            surround_buffer_k: calloc(),
-            surround_buffer_len: 0,
-            point_cell: calloc(),
-            point_cell_offset: calloc(),
-            cell_count: calloc(),
-            cell_index: calloc(),
-            relation_table: calloc(),
+            x0: calloc_counted(&mut counter),
+            y0: calloc_counted(&mut counter),
+            x1: calloc_counted(&mut counter),
+            y1: calloc_counted(&mut counter),
+            k: calloc_counted(&mut counter),
+            x0_tmp: calloc_counted(&mut counter),
+            y0_tmp: calloc_counted(&mut counter),
+            x1_tmp: calloc_counted(&mut counter),
+            y1_tmp: calloc_counted(&mut counter),
+            k_tmp: calloc_counted(&mut counter),
+            // surround_buffer_x: calloc(&mut counter),
+            // surround_buffer_y: calloc(&mut counter),
+            // surround_buffer_k: calloc(&mut counter),
+            // surround_buffer_len: 0,
+            point_cell: calloc_counted(&mut counter),
+            point_cell_offset: calloc_counted(&mut counter),
+            cell_count: calloc_counted(&mut counter),
+            cell_index: calloc_counted(&mut counter),
+            relation_table: calloc_counted(&mut counter),
         };
+        println!("TOTAL ALLOCATED: {counter} bytes");
         this.x0_tmp.copy_from_slice(&**x0);
         this.y0_tmp.copy_from_slice(&**y0);
         this.x1_tmp.copy_from_slice(&**x1);
@@ -1086,663 +1443,887 @@ impl CpuSimulationState {
         data.clear();
         data.extend(
             self.x0
-            .iter()
-            .zip(self.y0.iter())
-            .zip(self.k.iter())
-            .map(|((&x, &y), &k)| GpuPoint {
-                x: (x - MIN_X) * (1.0 / (MAX_X-MIN_X)),
-                y: (y - MIN_X) * (1.0 / (MAX_X-MIN_X)),
-                k: k as _,
-                _unused: 0,
-            }),
-            );
+                .iter()
+                .zip(self.y0.iter())
+                .zip(self.k.iter())
+                .map(|((&x, &y), &k)| GpuPoint {
+                    x: (x - MIN_X) * (1.0 / (MAX_X - MIN_X)),
+                    y: (y - MIN_X) * (1.0 / (MAX_X - MIN_X)),
+                    k: k as _,
+                    _unused: 0,
+                }),
+        );
+    }
+    #[no_panic]
+    fn z_to_xy(val: u32) -> (u32, u32) {
+        #[allow(clippy::all)]
+        const _A: () = assert!(CELLS_X == CELLS_Y);
+        use core::arch::x86_64::*;
+        const MASK_X: u32 = 0b10101010101010101010101010101010;
+        const MASK_Y: u32 = 0b01010101010101010101010101010101;
+        unsafe { (_pext_u32(val, MASK_X), _pext_u32(val, MASK_Y)) }
     }
 
     #[allow(unused_parens)]
     #[inline(never)]
     pub fn update(&mut self) {
-        for cx in 0..CELLS_X {
-            for cy in 0..CELLS_Y {
-                //for i in (0..NUM_POINTS_U).map(Into::into) {
-                let cell: Cid = Cid((cx + cy * CELLS_X) as IndexType);
-                self.surround_buffer_len = 0;
-                for dy in -1..=1 {
-                    let cell_y = cy as i32 + dy;
-                    let (offset_y, cell_y) = if cell_y == -1 {
-                        (-WIDTH_Y, CELLS_Y as i32 - 1)
-                    } else if cell_y == CELLS_Y as i32 {
-                        (WIDTH_Y, 0)
-                    } else {
-                        (0.0, cell_y)
-                    };
+        const BLOCK_SIZE: u16 = 4;
 
-                    let cell_x_min = cx as i32 - 1;
-                    let cell_x_max = cx as i32 + 1;
-                    let cell_x_min_cropped = cell_x_min.max(0_i32);
-                    let cell_x_max_cropped = cell_x_max.min(CELLS_X as i32 - 1);
+        //{{ for cx in 0..CELLS_X {for cy in 0..CELLS_Y {
 
-                    let cell_min_cropped: Cid =
-                        ((cell_x_min_cropped + cell_y * CELLS_X as i32) as usize).into();
-                    let cell_max_cropped: Cid =
-                        ((cell_x_max_cropped + cell_y * CELLS_X as i32) as usize).into();
+        // 340, 243
+        // 347, 238
 
-                    let range_middle = usize::from(self.cell_index[cell_min_cropped])
-                        ..usize::from(self.cell_index[cell_max_cropped + 1.into()]);
+        {
+            {
+                {
+                    for z in 0..(CELLS_X as u32 * CELLS_Y as u32) {
+                        let (cx, cy) = Self::z_to_xy(z);
+                        let (cx, cy) = (cx as u16, cy as u16);
+                        // for ccx in (0..CELLS_X).step_by(BLOCK_SIZE as usize) {
+                        //     for ccy in (0..CELLS_Y).step_by(BLOCK_SIZE as usize) {
+                        //         for cy in ccy..(CELLS_Y.min(ccy + BLOCK_SIZE)) {
+                        //             for cx in ccx..(CELLS_X.min(ccx + BLOCK_SIZE)) {
+                        //for i in (0..NUM_POINTS_U).map(Into::into) {
+                        let cell: Cid = Cid((cx + cy * CELLS_X) as IndexType);
+                        //self.fill_surround_buffer(cy, cx);
 
-                    // let range_middle_leftover8 = range_middle.len() % 8;
-                    // let range_middle_leftover32 = range_middle.len() % 32;
+                        let ranges = self.generate_ranges(cy, cx);
 
-                    #[cfg(not(feature = "nosimd"))]
-                    unsafe {
-                        use core::arch::x86_64::*;
-                        let offset_y = _mm256_set1_ps(offset_y);
-                        let mut x_write_ptr =
-                            self.surround_buffer_x.end_ptr_mut(self.surround_buffer_len);
-                        let mut y_write_ptr =
-                            self.surround_buffer_y.end_ptr_mut(self.surround_buffer_len);
-                        let mut k_write_ptr =
-                            self.surround_buffer_k.end_ptr_mut(self.surround_buffer_len);
-
-                        for i in range_middle.clone().map(Into::into).step_by(8) {
-                            let x_read_ptr = self.x1.as_ptr().add(i);
-                            let y_read_ptr = self.y1.as_ptr().add(i);
-                            let k_read_ptr = self.k.as_ptr().add(i);
-
-                            _mm256_storeu_ps(x_write_ptr, _mm256_loadu_ps(x_read_ptr));
-                            _mm256_storeu_ps(
-                                y_write_ptr,
-                                _mm256_add_ps(offset_y, _mm256_loadu_ps(y_read_ptr)),
-                                );
-                            (k_write_ptr as *mut u64)
-                                .write_unaligned((k_read_ptr as *mut u64).read_unaligned());
-                            x_write_ptr = x_write_ptr.add(8);
-                            y_write_ptr = y_write_ptr.add(8);
-                            k_write_ptr = k_write_ptr.add(8);
-                        }
-                        self.surround_buffer_len += range_middle.len();
-                    }
-                    #[cfg(feature = "nosimd")]
-                    for i in range_middle.map(Into::into) {
-                        unsafe {
-                            self.surround_buffer_x.push(self.x1[i]);
-                            self.surround_buffer_y.push(self.y1[i] + offset_y);
-                            self.surround_buffer_k.push(self.k[i]);
-                        }
-                    }
-                }
-                #[cfg(not(feature = "nosimd"))]
-                unsafe {
-                    use core::arch::x86_64::*;
-                    let zero = _mm256_setzero_ps();
-                    _mm256_storeu_ps(
-                        self.surround_buffer_x.end_ptr_mut(self.surround_buffer_len),
-                        zero,
-                        );
-                    _mm256_storeu_ps(
-                        self.surround_buffer_y.end_ptr_mut(self.surround_buffer_len),
-                        zero,
-                        );
-                }
-                for i_self in (usize::from(self.cell_index[cell])
-                               ..usize::from(self.cell_index[cell + 1.into()]))
-                    .map(Into::into)
-                    {
-                        let x0 = self.x0[i_self];
-                        let y0 = self.y0[i_self];
-                        let x1 = self.x1[i_self];
-                        let y1 = self.y1[i_self];
-                        let k = self.k[i_self];
-                        let mut acc_x;
-                        let mut acc_y;
-
-                        // about 42 % faster
-                        #[cfg(not(feature = "nosimd"))]
-                        unsafe {
-                            use simd::*;
-                            use std::arch::x86_64::*;
-                            let mut acc_x_s = zero();
-                            let mut acc_y_s = zero();
-
-                            let x1_self = set1(x1);
-                            let y1_self = set1(y1);
-                            // 256 = 8xf32 => 8 iterations
-                            // step_by rounds down
-                            let k_base: __m256 =
-                                _mm256_load_ps(self.relation_table.as_ptr().add(k as usize).cast());
-
-                            
-                            // TODO: only do first N iterations.
-
-                            // for i in (0..self.surround_buffer_len).step_by(8) {
-                            let i = 0;
-                            if false {
-                                // load ks, zero extend, and index into base
-                                let k_factor: __m256 = _mm256_permutevar8x32_ps(
-                                    k_base,
-                                    _mm256_cvtepu8_epi32(_mm256_castsi256_si128({
-                                        _mm256_loadu_si256(
-                                            self.surround_buffer_k.inner.as_mut_ptr().add(i)
-                                            as *const __m256i,
-                                            )
-                                    })),
-                                    );
-                                let x_other = load(self.surround_buffer_x.as_ptr().add(i));
-                                let y_other = load(self.surround_buffer_y.as_ptr().add(i));
-
-                                let dx = fma!(x1_self - x_other);
-                                let dy = fma!(y1_self - y_other);
-                                //let dot = fmadd(dx, dx, mul(dy, dy));
-                                let dot = fma!(dx * dx + fma!(dy * dy));
-                                let recip_sqrt = _mm256_rsqrt_ps(dot); // 1.0 / sqrt(d * d)
-
-                                let r = fma!(recip_sqrt * dot); //sqrt(dot);
-                                                                //let x = mul(r, set1(1.0 / POINT_MAX_RADIUS));
-                                let x = fma!(r * set1(1.0 / POINT_MAX_RADIUS));
-
-                                // max(x, y) = 0.5 * (x + y + abs(x - y))
-                                // min(x, y) = 0.5 * (x + y - abs(x - y))
-                                // clamp(x, y (min), z (max)) = max(min(x, z), y)
-                                // = max(0.5 * (x + z - abs(x - z)), y)
-
-                                // > 0.0 will also test for Nan
-                                //let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_GT_OQ);
-                                //let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_NEQ_OQ);
-                                let mask_ok = _mm256_cmp_ps(dot, zero(), _CMP_NEQ_OQ);
-
-
-                                let f = fma!(
-                                    recip_sqrt
-                                    * max(
-                                        fma!(
-                                            k_factor
-                                            * maxzero(min(
-                                                    fma!(x - set1(BETA)),
-                                                    fma!(-x + set1(1.0))
-                                                    ))
-                                            ),
-                                            fma!(
-                                                -r * (set1((4.0 / BETA) * (1.0 / POINT_MAX_RADIUS)))
-                                                + set1(4.0)
-                                                ),
-                                                )
-                                    );
-
-
-                                // f / r
-                                let f_masked = fma!(mask_ok & f);
-
-                                acc_x_s = fma!(dx * f_masked + acc_x_s);
-                                acc_y_s = fma!(dy * f_masked + acc_y_s);
-                            }
-                            acc_x = hadd(acc_x_s);
-                            acc_y = hadd(acc_y_s);
-                        }
-
-                        // about 52 % of execution time is spent here
-                        #[cfg(feature = "nosimd")]
+                        for i_self in (usize::from(self.cell_index[cell])
+                            ..usize::from(self.cell_index[cell + 1.into()]))
+                            .map(Into::into)
                         {
-                            acc_x = 0.0;
-                            acc_y = 0.0;
-                            let local_k_arr: [f32; NUM_KINDS] =
-                                *unsafe { self.relation_table.get_unchecked(k as usize) };
-                            for ((&x_other, &y_other), &k_other) in self
-                                .surround_buffer_x
+                            let x0 = self.x0[i_self];
+                            let y0 = self.y0[i_self];
+                            let x1 = self.x1[i_self];
+                            let y1 = self.y1[i_self];
+                            let k = self.k[i_self];
+                            let mut acc_x = 0.0;
+                            let mut acc_y = 0.0;
+
+                            // self.k
+                            // self.x1
+                            // self.y1
+                            #[rustfmt::skip]
+                            unsafe {
+                                use core::arch::x86_64::*;
+                                // for range in &ranges {
+                                //     _mm_prefetch(self.k.0.get_unchecked(range.start as usize) as *const u8 as *const i8, _MM_HINT_T0);
+                                //     _mm_prefetch(self.x1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
+                                //     _mm_prefetch(self.y1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
+                                // }
+                            };
+
+                            // about 42 % faster
+                            #[cfg(not(feature = "nosimd"))]
+                            unsafe {
+                                //self.iterate_neighbours(x1, y1, k, &mut acc_x, &mut acc_y);
+                                self.iterate_ranges(
+                                    ranges.clone(),
+                                    x1,
+                                    y1,
+                                    k,
+                                    &mut acc_x,
+                                    &mut acc_y,
+                                );
+                            }
+
+                            // about 52 % of execution time is spent here
+                            #[cfg(feature = "nosimd")]
+                            {
+                                acc_x = 0.0;
+                                acc_y = 0.0;
+                                let local_k_arr: [f32; NUM_KINDS] =
+                                    *unsafe { self.relation_table.get_unchecked(k as usize) };
+                                for ((&x_other, &y_other), &k_other) in self
+                                    .surround_buffer_x
                                     .slice()
                                     .iter()
                                     .zip(self.surround_buffer_y.slice().iter())
                                     .zip(self.surround_buffer_k.slice().iter())
-                                    {
-                                        // https://www.desmos.com/calculator/yos22615bv
+                                {
+                                    // https://www.desmos.com/calculator/yos22615bv
 
-                                        let dx = x1 - x_other;
-                                        let dy = y1 - y_other;
-                                        let dot = dx * dx + dy * dy;
-                                        let r = dot.sqrt();
+                                    let dx = x1 - x_other;
+                                    let dy = y1 - y_other;
+                                    let dot = dx * dx + dy * dy;
+                                    let r = dot.sqrt();
 
-                                        let x = r * (1.0 / POINT_MAX_RADIUS);
-                                        let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
-                                        let c = 4.0 * (1.0 - x / BETA);
-                                        //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
+                                    let x = r * (1.0 / POINT_MAX_RADIUS);
+                                    let k: f32 =
+                                        *unsafe { local_k_arr.get_unchecked(k_other as usize) };
+                                    let c = 4.0 * (1.0 - x / BETA);
+                                    //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
 
-                                        let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
-                                        let dir_x = dx / r;
-                                        let dir_y = dy / r;
-                                        if dot != 0.0 {
-                                            acc_x += dir_x * f;
-                                            acc_y += dir_y * f;
-                                            debug_assert_float!(acc_x);
-                                            debug_assert_float!(acc_y);
-                                        }
+                                    let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0))
+                                        .max(c);
+                                    let dir_x = dx / r;
+                                    let dir_y = dy / r;
+                                    if dot != 0.0 {
+                                        acc_x += dir_x * f;
+                                        acc_y += dir_y * f;
+                                        debug_assert_float!(acc_x);
+                                        debug_assert_float!(acc_y);
                                     }
-                        }
-                        debug_assert_float!(acc_x);
-                        debug_assert_float!(acc_y);
-                        acc_x *= MIN_WIDTH;
-                        acc_y *= MIN_WIDTH;
-                        debug_assert_float!(acc_x);
-                        debug_assert_float!(acc_y);
-
-                        /*
-                           n in [-1, 0, 1]
-                           dx = x1 - x0 + n * MIN_WIDTH;
-                           dy = y1 - y0 + n * MIN_WIDTH;
-
-                           want closest value to zero
-                           => ignore sign, then add sign back
-
-*/
-
-                        let mut vx = x1 - x0;
-                        let mut vy = y1 - y0;
-
-                        {
-                            const MIDPOINT_X: f32 = (MIN_X + MAX_X) / 2.0;
-                            if vx > MIDPOINT_X {
-                                vx -= WIDTH_X;
-                            } else if vx < -MIDPOINT_X {
-                                vx += WIDTH_X;
+                                }
                             }
+                            let (new_x, new_y) =
+                                Self::calc_new_position(acc_x, acc_y, x1, x0, y1, y0);
+
+                            self.store_temporary_results(i_self, new_x, new_y);
                         }
-                        {
-                            const MIDPOINT_Y: f32 = (MIN_Y + MAX_Y) / 2.0;
-                            if vy > MIDPOINT_Y {
-                                vy -= WIDTH_Y;
-                            } else if vy < -MIDPOINT_Y {
-                                vy += WIDTH_Y;
-                            }
-                        }
-                        let v2 = vx * vx + vy * vy;
-                        let v = v2.sqrt();
-                        let vx_norm = vx / v;
-                        let vy_norm = vy / v;
-                        // let friction_force = v2 * (50.0 / (DT * DT));
-                        // let friction_force = v2 * (500.0 / (DT * DT));
-                        //let friction_force = v2 * (500.0 / (DT * DT));
-                        // acc_x *= 0.001;
-                        // acc_y *= 0.001;
-                        //let friction_force = v * v * 31250000.0;
-
-                        let friction_force: f32;
-                        {
-                            let h = 0.002;
-                            let c = 0.999;
-                            let x = v.min((2.0 * h) / c);
-
-                            let target_v = (c - (c * c / (4.0 * h) * x)) * x;
-                            friction_force = v - target_v;
-                        }
-                        if !(vx_norm.is_nan() || vy_norm.is_nan()) {
-                            acc_x -= (friction_force * (1.0 / (DT * DT))) * vx_norm;
-                            acc_y -= (friction_force * (1.0 / (DT * DT))) * vy_norm;
-                        }
-
-                        let new_x = mod_simulation_x(x1 + vx + acc_x * (DT * DT)); //.rem_euclid(1.0);
-                        let new_y = mod_simulation_y(y1 + vy + acc_y * (DT * DT)); //.rem_euclid(1.0);
-                        if !(debug_check_valid_pos(x1)
-                             && debug_check_valid_pos(y1)
-                             && debug_check_valid_pos(new_x)
-                             && debug_check_valid_pos(new_y))
-                        {
-                            panic!("ERR: x1: {x1}, y1: {y1}, vx: {vx}, vy: {vy}, acc_x: {acc_x}, acc_y: {acc_y} new_x: {new_x}, new_y: {new_y}");
-                        }
-
-                        self.x1_tmp[i_self] = new_x;
-                        self.y1_tmp[i_self] = new_y;
-
-                        // self.x0_tmp[i] = x1;
-                        // self.y0_tmp[i] = y1;
-
-                        let new_cell = compute_cell(new_x, new_y);
-                        self.point_cell[i_self] = new_cell;
-                        self.point_cell_offset[i_self] = self.cell_count[new_cell];
-                        self.cell_count[new_cell] += 1.into();
                     }
+                }
             }
-            }
+        }
 
-            // The last passes are very serial, but is fast enough
-            // that it basically does not matter
+        // The last passes are very serial, but is fast enough
+        // that it basically does not matter
 
-            let mut acc: Pid = 0.into();
-            for i in (0..CELLS_PLUS_1_U).map(Into::into) {
-                self.cell_index[i] = acc;
-                let count = replace(&mut self.cell_count[i], 0.into());
-                acc += count;
-            }
+        self.prefix_sum();
 
-            for i in (0..NUM_POINTS_U).map(Into::into) {
-                let cell = self.point_cell[i];
-                let index = self.cell_index[cell] + self.point_cell_offset[i];
-                // self.x0[index] = self.x0_tmp[i];
-                // self.y0[index] = self.y0_tmp[i];
-                // self.x1[index] = self.x1_tmp[i];
-                // self.y1[index] = self.y1_tmp[i];
+        self.final_insert();
 
-                self.x0[index] = self.x1[i];
-                self.y0[index] = self.y1[i];
-                self.x0_tmp[index] = self.x1_tmp[i];
-                self.y0_tmp[index] = self.y1_tmp[i];
-                self.k_tmp[index] = self.k[i];
-            }
+        swap(&mut self.x1, &mut self.x0_tmp);
+        swap(&mut self.y1, &mut self.y0_tmp);
+        swap(&mut self.k, &mut self.k_tmp);
+    }
 
-            swap(&mut self.x1, &mut self.x0_tmp);
-            swap(&mut self.y1, &mut self.y0_tmp);
-            swap(&mut self.k, &mut self.k_tmp);
+    #[inline(never)]
+    fn final_insert(&mut self) {
+        for i in (0..NUM_POINTS_U).map(Into::into) {
+            let cell = self.point_cell[i];
+            let index = self.cell_index[cell] + self.point_cell_offset[i];
+            // self.x0[index] = self.x0_tmp[i];
+            // self.y0[index] = self.y0_tmp[i];
+            // self.x1[index] = self.x1_tmp[i];
+            // self.y1[index] = self.y1_tmp[i];
+
+            self.x0[index] = self.x1[i];
+            self.y0[index] = self.y1[i];
+            self.x0_tmp[index] = self.x1_tmp[i];
+            self.y0_tmp[index] = self.y1_tmp[i];
+            self.k_tmp[index] = self.k[i];
         }
     }
 
-    macro_rules! printlnc {
-        ($aa:expr, $bb:expr) => {
-            #[cfg(target_arch = "wasm32")]
-            {
-                web_sys::console::log_1(&format!($aa, $bb).into());
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                println!($aa, $bb);
-            }
-        };
-    }
-    macro_rules! dbgc {
-        ($aa:expr) => {{
-            match $aa {
-                tmp => {
-                    eprintln!(
-                        "[{}:{}] {} = {:#?}",
-                        file!(),
-                        line!(),
-                        stringify!($aa),
-                        &tmp
-                        );
-                    tmp
-                }
-            }
-        }};
-    }
+    #[inline(never)]
+    fn prefix_sum(&mut self) {
+        // let mut arr = [0_u32; 50];
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
-    pub async fn run() {
-        let (event_loop, window) = window_setup();
+        // for i in 0..CELLS_PLUS_1_U {
+        //     let cc = |i: usize| self.cell_count.get(i).map(|i| i.0 as usize).unwrap_or(0);
+        //     let tracked_value = cc(i - 1 + CELLS_X as usize)
+        //         + cc(i + CELLS_X as usize)
+        //         + cc(i + 1 + CELLS_X as usize)
+        //         + cc(i - 1)
+        //         + cc(i)
+        //         + cc(i + 1)
+        //         + cc(i - 1 - CELLS_X as usize)
+        //         + cc(i - CELLS_X as usize)
+        //         + cc(i + 1 - CELLS_X as usize);
+        //     *if let Some(a) = arr.get_mut(usize::from(tracked_value)) {
+        //         a
+        //     } else {
+        //         arr.last_mut().unwrap()
+        //     } += 1;
+        // }
 
-        let mut state = State::new(window).await;
-        event_loop.run(move |os_event, _, control_flow| match os_event {
-            Event::WindowEvent {
-                event: window_event,
-                window_id,
-            } if window_id == state.window.id() => match window_event {
-                WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
-                                state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            },
-                            ..
-                    } => *control_flow = ControlFlow::Exit,
-                WindowEvent::Resized(physical_size) => state.resize(physical_size),
-                WindowEvent::ScaleFactorChanged { new_inner_size, .. } => state.resize(*new_inner_size),
-                _ => state.input(&window_event),
-            },
-            Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-                match state.render() {
-                    Ok(()) => {}
-                    Err(SurfaceError::Lost) => state.resize(state.size),
-                    Err(SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                    Err(e) => eprintln!("{e:?}"),
-                }
-            }
-            Event::MainEventsCleared => {
-                state.window().request_redraw();
-            }
-            _ => {}
-        });
+        // let max_val = arr.iter().copied().max().unwrap();
+        // let mut s = String::new();
+        // for (i, a) in arr.into_iter().enumerate() {
+        //     write!(&mut s, "{i}: {a}").unwrap();
+        //     let dots = 200.0 * (a as f64 / max_val as f64);
+        //     for _ in 0..(dots as usize) {
+        //         write!(&mut s, ".").unwrap();
+        //     }
+        //     write!(&mut s, "\n").unwrap();
+        // }
+        // println!("\n{s}\n");
+
+        let mut acc: Pid = 0.into();
+        for i in (0..CELLS_PLUS_1_U).map(Cid::from) {
+            self.cell_index[i] = acc;
+            let count = replace(&mut self.cell_count[i], 0.into());
+            acc += count;
+        }
     }
 
-    fn window_setup() -> (EventLoop<()>, Window) {
-        cfg_if::cfg_if! {
-            if #[cfg(target_arch = "wasm32")] {
-                std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-                console_log::init_with_level(log::Level::Warn).expect("Couldn't initialize logger");
+    #[inline(never)]
+    fn store_temporary_results(&mut self, i_self: Pid, new_x: f32, new_y: f32) {
+        self.x1_tmp[i_self] = new_x;
+        self.y1_tmp[i_self] = new_y;
+
+        // self.x0_tmp[i] = x1;
+        // self.y0_tmp[i] = y1;
+
+        let new_cell = compute_cell(new_x, new_y);
+        self.point_cell[i_self] = new_cell;
+        self.point_cell_offset[i_self] = self.cell_count[new_cell];
+        self.cell_count[new_cell] += 1.into();
+    }
+
+    #[inline(never)]
+    unsafe fn iterate_ranges(
+        &mut self,
+        ranges: [Range<u32>; 3],
+        x1: f32,
+        y1: f32,
+        k: u8,
+        acc_x: &mut f32,
+        acc_y: &mut f32,
+    ) {
+        use simd::*;
+        use std::arch::x86_64::*;
+        let mut acc_x_s = zero();
+        let mut acc_y_s = zero();
+
+        let x1_self = set1(x1);
+        let y1_self = set1(y1);
+        // 256 = 8xf32 => 8 iterations
+        // step_by rounds down
+        let k_base: __m256 = _mm256_load_ps(self.relation_table.as_ptr().add(k as usize).cast());
+
+        // TODO: only do first N iterations.
+
+        for range in ranges {
+            if range.is_empty() {
+                continue;
+            }
+
+            for i in range.step_by(8) {
+                // 3 loads per iteration
+
+                // load ks, zero extend, and index into base
+                //_mm256_castps128_ps256
+                let k_factor: __m256 = _mm256_permutevar8x32_ps(
+                    k_base,
+                    _mm256_cvtepu8_epi32(_mm_loadu_si128(
+                        self.k.as_mut_ptr().add(i as _) as *const __m128i
+                    )),
+                );
+                let x_other = _mm256_loadu_ps(self.x1.as_ptr().add(i as _));
+                let y_other = _mm256_loadu_ps(self.y1.as_ptr().add(i as _));
+
+                let dx = fma!(x1_self - x_other);
+                let dy = fma!(y1_self - y_other);
+                //let dot = fmadd(dx, dx, mul(dy, dy));
+                let dot = fma!(dx * dx + fma!(dy * dy));
+                let recip_sqrt = _mm256_rsqrt_ps(dot); // 1.0 / sqrt(d * d)
+
+                let r = fma!(recip_sqrt * dot); //sqrt(dot);
+                                                //let x = mul(r, set1(1.0 / POINT_MAX_RADIUS));
+
+                let x = fma!(r * _mm256_set1_ps(1.0 / POINT_MAX_RADIUS));
+
+                // max(x, y) = 0.5 * (x + y + abs(x - y))
+                // min(x, y) = 0.5 * (x + y - abs(x - y))
+                // clamp(x, y (min), z (max)) = max(min(x, z), y)
+                // = max(0.5 * (x + z - abs(x - z)), y)
+
+                // > 0.0 will also test for Nan
+                //let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_GT_OQ);
+                //let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_NEQ_OQ);
+                let mask_ok = _mm256_cmp_ps(dot, _mm256_setzero_ps(), _CMP_NEQ_OQ);
+
+                let f = fma!(
+                    recip_sqrt
+                        * max(
+                            fma!(
+                                k_factor * maxzero(min(fma!(x - set1(BETA)), fma!(-x + set1(1.0))))
+                            ),
+                            fma!(-r * (set1((4.0 / BETA) * (1.0 / POINT_MAX_RADIUS))) + set1(4.0)),
+                        )
+                );
+
+                // f / r
+                let f_masked = fma!(mask_ok & f);
+
+                acc_x_s = fma!(dx * f_masked + acc_x_s);
+                acc_y_s = fma!(dy * f_masked + acc_y_s);
+            }
+        }
+        *acc_x = hadd(acc_x_s);
+        *acc_y = hadd(acc_y_s);
+    }
+    /*
+    #[inline(never)]
+    unsafe fn iterate_neighbours(
+        &mut self,
+        x1: f32,
+        y1: f32,
+        k: u8,
+        acc_x: &mut f32,
+        acc_y: &mut f32,
+    ) {
+        use simd::*;
+        use std::arch::x86_64::*;
+        let mut acc_x_s = zero();
+        let mut acc_y_s = zero();
+
+        let x1_self = set1(x1);
+        let y1_self = set1(y1);
+        // 256 = 8xf32 => 8 iterations
+        // step_by rounds down
+        let k_base: __m256 = _mm256_load_ps(self.relation_table.as_ptr().add(k as usize).cast());
+
+        // TODO: only do first N iterations.
+
+        for i in (0..self.surround_buffer_len).step_by(8) {
+            // load ks, zero extend, and index into base
+            let k_factor: __m256 = _mm256_permutevar8x32_ps(
+                k_base,
+                _mm256_cvtepu8_epi32(_mm256_castsi256_si128({
+                    _mm256_loadu_si256(
+                        self.surround_buffer_k.inner.as_mut_ptr().add(i) as *const __m256i
+                    )
+                })),
+            );
+            let x_other = load(self.surround_buffer_x.as_ptr().add(i));
+            let y_other = load(self.surround_buffer_y.as_ptr().add(i));
+
+            let dx = fma!(x1_self - x_other);
+            let dy = fma!(y1_self - y_other);
+            //let dot = fmadd(dx, dx, mul(dy, dy));
+            let dot = fma!(dx * dx + fma!(dy * dy));
+            let recip_sqrt = _mm256_rsqrt_ps(dot); // 1.0 / sqrt(d * d)
+
+            let r = fma!(recip_sqrt * dot); //sqrt(dot);
+                                            //let x = mul(r, set1(1.0 / POINT_MAX_RADIUS));
+            let x = fma!(r * set1(1.0 / POINT_MAX_RADIUS));
+
+            // max(x, y) = 0.5 * (x + y + abs(x - y))
+            // min(x, y) = 0.5 * (x + y - abs(x - y))
+            // clamp(x, y (min), z (max)) = max(min(x, z), y)
+            // = max(0.5 * (x + z - abs(x - z)), y)
+
+            // > 0.0 will also test for Nan
+            //let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_GT_OQ);
+            //let mask_ok = _mm256_cmp_ps(dot, set1(0.0), _CMP_NEQ_OQ);
+            let mask_ok = _mm256_cmp_ps(dot, zero(), _CMP_NEQ_OQ);
+
+            let f = fma!(
+                recip_sqrt
+                    * max(
+                        fma!(k_factor * maxzero(min(fma!(x - set1(BETA)), fma!(-x + set1(1.0))))),
+                        fma!(-r * (set1((4.0 / BETA) * (1.0 / POINT_MAX_RADIUS))) + set1(4.0)),
+                    )
+            );
+
+            // f / r
+            let f_masked = fma!(mask_ok & f);
+
+            acc_x_s = fma!(dx * f_masked + acc_x_s);
+            acc_y_s = fma!(dy * f_masked + acc_y_s);
+        }
+        *acc_x = hadd(acc_x_s);
+        *acc_y = hadd(acc_y_s);
+    }*/
+
+    #[inline(never)]
+    fn generate_ranges(&self, cy: u16, cx: u16) -> [Range<u32>; 3] {
+        [-1, 0, 1].map(|dy| {
+            let cell_y = cy as i32 + dy;
+            if cell_y == -1 || cell_y >= CELLS_Y as i32 {
+                0..0
             } else {
-                env_logger::init();
+                let cell_x_min = cx as i32 - 1;
+                let cell_x_max = cx as i32 + 1;
+                let cell_x_min_cropped = cell_x_min.max(0_i32);
+                let cell_x_max_cropped = cell_x_max.min(CELLS_X as i32 - 1);
+
+                let cell_min_cropped: Cid =
+                    ((cell_x_min_cropped + cell_y * CELLS_X as i32) as usize).into();
+                let cell_max_cropped: Cid =
+                    ((cell_x_max_cropped + cell_y * CELLS_X as i32) as usize).into();
+
+                u32::from(self.cell_index[cell_min_cropped])
+                    ..u32::from(self.cell_index[cell_max_cropped + 1.into()])
+            }
+        })
+    }
+
+    /*#[inline(never)]
+    fn fill_surround_buffer(&mut self, cy: u16, cx: u16) {
+        self.surround_buffer_len = 0;
+        for dy in -1..=1 {
+            let cell_y = cy as i32 + dy;
+            if cell_y == -1 {
+                continue;
+            } else if cell_y == CELLS_Y as i32 {
+                continue;
+            }
+
+            let cell_x_min = cx as i32 - 1;
+            let cell_x_max = cx as i32 + 1;
+            let cell_x_min_cropped = cell_x_min.max(0_i32);
+            let cell_x_max_cropped = cell_x_max.min(CELLS_X as i32 - 1);
+
+            let cell_min_cropped: Cid =
+                ((cell_x_min_cropped + cell_y * CELLS_X as i32) as usize).into();
+            let cell_max_cropped: Cid =
+                ((cell_x_max_cropped + cell_y * CELLS_X as i32) as usize).into();
+
+            let cropped_range = usize::from(self.cell_index[cell_min_cropped])
+                ..usize::from(self.cell_index[cell_max_cropped + 1.into()]);
+
+            // let range_middle_leftover8 = range_middle.len() % 8;
+            // let range_middle_leftover32 = range_middle.len() % 32;
+
+            #[cfg(not(feature = "nosimd"))]
+            unsafe {
+                use core::arch::x86_64::*;
+                let mut x_write_ptr = self.surround_buffer_x.end_ptr_mut(self.surround_buffer_len);
+                let mut y_write_ptr = self.surround_buffer_y.end_ptr_mut(self.surround_buffer_len);
+                let mut k_write_ptr = self.surround_buffer_k.end_ptr_mut(self.surround_buffer_len);
+
+                core::ptr::copy_nonoverlapping(
+                    self.x1.as_ptr().add(cropped_range.start),
+                    x_write_ptr,
+                    cropped_range.len(),
+                );
+                core::ptr::copy_nonoverlapping(
+                    self.y1.as_ptr().add(cropped_range.start),
+                    y_write_ptr,
+                    cropped_range.len(),
+                );
+
+                core::ptr::copy_nonoverlapping(
+                    self.k.as_ptr().add(cropped_range.start),
+                    k_write_ptr,
+                    cropped_range.len(),
+                );
+
+                // for i in range_middle.clone().map(Into::into).step_by(8) {
+                //     let x_read_ptr = self.x1.as_ptr().add(i);
+                //     let y_read_ptr = self.y1.as_ptr().add(i);
+                //     let k_read_ptr = self.k.as_ptr().add(i);
+                //     // TODO: rep movsb
+                //     _mm256_storeu_ps(x_write_ptr, _mm256_loadu_ps(x_read_ptr));
+                //     _mm256_storeu_ps(
+                //         y_write_ptr,
+                //         _mm256_loadu_ps(y_read_ptr),
+                //         //_mm256_add_ps(offset_y, _mm256_loadu_ps(y_read_ptr)),
+                //     );
+                //     (k_write_ptr as *mut u64)
+                //         .write_unaligned((k_read_ptr as *mut u64).read_unaligned());
+                //     x_write_ptr = x_write_ptr.add(8);
+                //     y_write_ptr = y_write_ptr.add(8);
+                //     k_write_ptr = k_write_ptr.add(8);
+                // }
+                self.surround_buffer_len += cropped_range.len();
+            }
+            #[cfg(feature = "nosimd")]
+            for i in range_middle.map(Into::into) {
+                unsafe {
+                    self.surround_buffer_x.push(self.x1[i]);
+                    self.surround_buffer_y.push(self.y1[i] + offset_y);
+                    self.surround_buffer_k.push(self.k[i]);
+                }
             }
         }
+        #[cfg(not(feature = "nosimd"))]
+        unsafe {
+            use core::arch::x86_64::*;
+            let zero = _mm256_setzero_ps();
+            _mm256_storeu_ps(
+                self.surround_buffer_x.end_ptr_mut(self.surround_buffer_len),
+                zero,
+            );
+            _mm256_storeu_ps(
+                self.surround_buffer_y.end_ptr_mut(self.surround_buffer_len),
+                zero,
+            );
+        }
+    }*/
+    #[inline(never)]
+    fn calc_new_position(
+        mut acc_x: f32,
+        mut acc_y: f32,
+        x1: f32,
+        x0: f32,
+        y1: f32,
+        y0: f32,
+    ) -> (f32, f32) {
+        debug_assert_float!(acc_x);
+        debug_assert_float!(acc_y);
+        debug_assert_float!(acc_x);
+        debug_assert_float!(acc_y);
+        acc_x *= MIN_WIDTH;
+        acc_y *= MIN_WIDTH;
 
-        let event_loop = EventLoop::new();
+        /*
+        n in [-1, 0, 1]
+        dx = x1 - x0 + n * MIN_WIDTH;
+        dy = y1 - y0 + n * MIN_WIDTH;
 
-        let window = WindowBuilder::new().build(&event_loop).unwrap();
+        want closest value to zero
+        => ignore sign, then add sign back
+        */
 
+        let vx = x1 - x0;
+        let vy = y1 - y0;
+        let v2 = f32::mul_add(vx, vx, vy * vy);
+        let v = v2.sqrt();
+        let v_inv = 1.0 / v;
+        // let vx_norm = vx * v_inv;
+        // let vy_norm = vy * v_inv;
+        // let friction_force = v2 * (50.0 / (DT * DT));
+        // let friction_force = v2 * (500.0 / (DT * DT));
+        //let friction_force = v2 * (500.0 / (DT * DT));
+        // acc_x *= 0.001;
+        // acc_y *= 0.001;
+        //let friction_force = v * v * 31250000.0;
+
+        let friction_force: f32;
+        {
+            const H: f32 = 0.002;
+            const C: f32 = 0.999;
+            let x = v.min((2.0 * H) / C);
+
+            let target_v = (C - (C * C * (1.0 / (4.0 * H)) * x)) * x;
+            friction_force = v - target_v;
+        }
+        let factor = (friction_force * (1.0 / (DT * DT))) * v_inv;
+        if !(vx.is_nan() || vy.is_nan() || factor.is_nan()) {
+            acc_x -= factor * vx;
+            acc_y -= factor * vy;
+        }
+        // assert!(!acc_x.is_nan());
+        // assert!(!acc_y.is_nan());
+        // assert!(!x1.is_nan());
+        // assert!(!y1.is_nan());
+        // assert!(!vx.is_nan());
+        // assert!(!vy.is_nan());
+
+        let new_x = reflect_sim_x(f32::mul_add(acc_x, DT * DT, x1) + vx);
+        //.rem_euclid(1.0);
+        let new_y = reflect_sim_y(f32::mul_add(acc_y, DT * DT, y1) + vy);
+        //.rem_euclid(1.0);
+        // if !(debug_check_valid_pos(x1)
+        //     && debug_check_valid_pos(y1)
+        //     && debug_check_valid_pos(new_x)
+        //     && debug_check_valid_pos(new_y))
+        // {
+        //     panic!("ERR: x1: {x1}, y1: {y1}, vx: {vx}, vy: {vy}, acc_x: {acc_x}, acc_y: {acc_y} new_x: {new_x}, new_y: {new_y}");
+        // }
+        (new_x, new_y)
+    }
+}
+
+macro_rules! printlnc {
+    ($aa:expr, $bb:expr) => {
         #[cfg(target_arch = "wasm32")]
         {
-            use winit::dpi::PhysicalSize;
-            window.set_inner_size(PhysicalSize::new(450, 400));
-
-            use winit::platform::web::WindowExtWebSys;
-            web_sys::window()
-                .and_then(|win| win.document())
-                .and_then(|doc| {
-                    let dst = doc.get_element_by_id("id-thingy")?;
-                    let canvas = web_sys::Element::from(window.canvas());
-                    dst.append_child(&canvas).ok()?;
-                    Some(())
-                })
-            .expect("Couldn't append canvas to document body.");
+            web_sys::console::log_1(&format!($aa, $bb).into());
         }
-        (event_loop, window)
-    }
-    struct State {
-        params: Params,
-        keystate: KeyState,
-
-        surface: wgpu::Surface,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        config: wgpu::SurfaceConfiguration,
-        size: winit::dpi::PhysicalSize<u32>,
-        window: Window,
-
-        render_pipeline: wgpu::RenderPipeline,
-        bind_group: wgpu::BindGroup,
-
         #[cfg(not(target_arch = "wasm32"))]
-        last_print: Instant,
-        frame: usize,
+        {
+            println!($aa, $bb);
+        }
+    };
+}
+macro_rules! dbgc {
+    ($aa:expr) => {{
+        match $aa {
+            tmp => {
+                eprintln!(
+                    "[{}:{}] {} = {:#?}",
+                    file!(),
+                    line!(),
+                    stringify!($aa),
+                    &tmp
+                );
+                tmp
+            },
+        }
+    }};
+}
 
-        //simulation_state: SimulationState,
-        simulation_controller: SimThreadController,
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
+pub async fn run() {
+    let (event_loop, window) = window_setup();
 
-        point_transfer_buffer: Vec<GpuPoint>,
-        gpu_point_buffer: wgpu::Buffer,
-        vertex_offsets_buffer: wgpu::Buffer,
-        vertices: u32,
+    let mut state = State::new(window).await;
+    event_loop.run(move |os_event, _, control_flow| match os_event {
+        Event::WindowEvent {
+            event: window_event,
+            window_id,
+        } if window_id == state.window.id() => match window_event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                input:
+                    KeyboardInput {
+                        state: ElementState::Pressed,
+                        virtual_keycode: Some(VirtualKeyCode::Escape),
+                        ..
+                    },
+                ..
+            } => *control_flow = ControlFlow::Exit,
+            WindowEvent::Resized(physical_size) => state.resize(physical_size),
+            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => state.resize(*new_inner_size),
+            _ => state.input(&window_event),
+        },
+        Event::RedrawRequested(window_id) if window_id == state.window().id() => {
+            match state.render() {
+                Ok(()) => {},
+                Err(SurfaceError::Lost) => state.resize(state.size),
+                Err(SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                Err(e) => eprintln!("{e:?}"),
+            }
+        },
+        Event::MainEventsCleared => {
+            state.window().request_redraw();
+        },
+        _ => {},
+    });
+}
 
-        params_buffer: wgpu::Buffer,
-        //gpu_simulation_state: GpuSimulationState,
+fn window_setup() -> (EventLoop<()>, Window) {
+    cfg_if::cfg_if! {
+        if #[cfg(target_arch = "wasm32")] {
+            std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+            console_log::init_with_level(log::Level::Warn).expect("Couldn't initialize logger");
+        } else {
+            env_logger::init();
+        }
     }
 
-    impl State {
-        async fn new(window: Window) -> Self {
-            //let simulation_state = SimulationState::new(SimulationInputEuler::new().verlet());
-            let mut simulation_controller = SimThreadController::new();
+    let event_loop = EventLoop::new();
 
-            let size: winit::dpi::PhysicalSize<u32> = window.inner_size();
-            let instance: wgpu::Instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                dx12_shader_compiler: wgpu::Dx12Compiler::default(),
-            });
-            dbgc!(instance
-                  .enumerate_adapters(wgpu::Backends::all())
-                  .collect::<Vec<_>>());
-            let surface: wgpu::Surface = unsafe { instance.create_surface(&window) }.unwrap();
-            let adapter: wgpu::Adapter = instance
-                .enumerate_adapters(wgpu::Backends::all())
-                .find(|adapter| adapter.is_surface_supported(&surface))
-                .unwrap();
-            dbgc!(adapter.features());
-            dbgc!(adapter.limits());
+    let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-            let limits = wgpu::Limits::downlevel_defaults(); //downlevel_webgl2_defaults();
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::dpi::PhysicalSize;
+        window.set_inner_size(PhysicalSize::new(450, 400));
 
-            dbgc!(&limits);
-            println!(
-                "Expected points per cell: {}",
-                NUM_POINTS as f32 / CELLS as f32
-                );
-            let (device, queue) = adapter
-                .request_device(
-                    &wgpu::DeviceDescriptor {
-                        features: adapter.features(), //wgpu::Features::VERTEX_WRITABLE_STORAGE,
-                        limits: adapter.limits(),
-                        label: None,
-                    },
-                    None,
-                    )
-                .await
-                .unwrap();
+        use winit::platform::web::WindowExtWebSys;
+        web_sys::window()
+            .and_then(|win| win.document())
+            .and_then(|doc| {
+                let dst = doc.get_element_by_id("id-thingy")?;
+                let canvas = web_sys::Element::from(window.canvas());
+                dst.append_child(&canvas).ok()?;
+                Some(())
+            })
+            .expect("Couldn't append canvas to document body.");
+    }
+    (event_loop, window)
+}
+struct State {
+    params: Params,
+    keystate: KeyState,
 
-            let surface_caps = surface.get_capabilities(&adapter);
-            let surface_format: wgpu::TextureFormat = surface_caps
-                .formats
-                .iter()
-                .copied()
-                .find(wgpu::TextureFormat::is_srgb)
-                .unwrap_or(*surface_caps.formats.first().unwrap());
-            let config = wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: surface_format,
-                width: size.width,
-                height: size.height,
-                present_mode: wgpu::PresentMode::AutoVsync,
-                //present_mode: wgpu::PresentMode::Immediate,
-                alpha_mode: *surface_caps.alpha_modes.first().unwrap(),
-                view_formats: vec![],
-            };
-            surface.configure(&device, &config);
+    surface: wgpu::Surface,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    size: winit::dpi::PhysicalSize<u32>,
+    window: Window,
 
-            let mut point_transfer_buffer = Vec::new();
-            //simulation_state.serialize_gpu(&mut point_transfer_buffer);
-            simulation_controller.get_state(&mut point_transfer_buffer);
-            let gpu_point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Point Buffer"),
-                contents: bytemuck::cast_slice(&point_transfer_buffer),
-                usage: wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::VERTEX,
-            });
+    render_pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
 
-            //let gpu_simulation_state = {
-            //    let simulation_state = CpuSimulationState::new();
-            //    GpuSimulationState::from_simulation_state(&device, &gpu_point_buffer, &simulation_state)
-            //};
+    #[cfg(not(target_arch = "wasm32"))]
+    last_print: Instant,
+    frame: usize,
 
-            let params = Params::new();
-            let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Param Buffer"),
-                contents: bytemuck::cast_slice(&bytemuck::cast::<_, [u8; size_of::<Params>()]>(params)),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
-            });
+    //simulation_state: SimulationState,
+    simulation_controller: SimThreadController,
 
-            let tri_size = POINT_MAX_RADIUS * BETA / (MAX_X - MIN_X); //0.003;
+    point_transfer_buffer: Vec<GpuPoint>,
+    gpu_point_buffer: wgpu::Buffer,
+    vertex_offsets_buffer: wgpu::Buffer,
+    vertices: u32,
 
-            // let vertex_offsets: [f32; 6] = {
-            //     [
-            //         f32::sqrt(3.0) / 2.0,
-            //         -0.5,
-            //         0.0,
-            //         1.0,
-            //         -f32::sqrt(3.0) / 2.0,
-            //         -0.5,
-            //     ]
-            //     .map(|x| x * tri_size)
-            // };
-            let qq: i32 = 32;
-            let vertex_offsets: Vec<_> = (0_i32..qq)
-                .map(|i| ((i as f32) / ((qq - 1_i32) as f32)) * core::f32::consts::PI * 2.0)
-                .flat_map(|i| [-i.sin(), i.cos()])
-                .map(|i| i * tri_size)
-                .collect();
-            let vertices = u32::try_from(vertex_offsets.len().checked_div(2).unwrap()).unwrap();
-            let vertex_offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&vertex_offsets),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+    params_buffer: wgpu::Buffer,
+    //gpu_simulation_state: GpuSimulationState,
+}
 
-            let bind_group_layout: wgpu::BindGroupLayout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Bind group layout"),
-                    entries: &[
-                        //wgpu::BindGroupLayoutEntry {
-                        //    binding: 0,
-                        //    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE,
-                        //    ty: wgpu::BindingType::Buffer {
-                        //        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        //        has_dynamic_offset: false,
-                        //        min_binding_size: Default::default(),
-                        //    },
-                        //    count: None,
-                        //},
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::VERTEX,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        ],
-                });
+impl State {
+    async fn new(window: Window) -> Self {
+        //let simulation_state = SimulationState::new(SimulationInputEuler::new().verlet());
+        let mut simulation_controller = SimThreadController::new();
 
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Bind group"),
-                layout: &bind_group_layout,
+        let size: winit::dpi::PhysicalSize<u32> = window.inner_size();
+        let instance: wgpu::Instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            dx12_shader_compiler: wgpu::Dx12Compiler::default(),
+        });
+        dbgc!(instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .collect::<Vec<_>>());
+        let surface: wgpu::Surface = unsafe { instance.create_surface(&window) }.unwrap();
+        let adapter: wgpu::Adapter = instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .find(|adapter| adapter.is_surface_supported(&surface))
+            .unwrap();
+        dbgc!(adapter.features());
+        dbgc!(adapter.limits());
+
+        let limits = wgpu::Limits::downlevel_defaults(); //downlevel_webgl2_defaults();
+
+        dbgc!(&limits);
+        println!(
+            "Expected points per cell: {}",
+            NUM_POINTS as f32 / CELLS as f32
+        );
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    features: adapter.features(), //wgpu::Features::VERTEX_WRITABLE_STORAGE,
+                    limits: adapter.limits(),
+                    label: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_format: wgpu::TextureFormat = surface_caps
+            .formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .unwrap_or(*surface_caps.formats.first().unwrap());
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            //present_mode: wgpu::PresentMode::Immediate,
+            alpha_mode: *surface_caps.alpha_modes.first().unwrap(),
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+
+        let mut point_transfer_buffer = Vec::new();
+        //simulation_state.serialize_gpu(&mut point_transfer_buffer);
+        simulation_controller.get_state(&mut point_transfer_buffer);
+        let gpu_point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Point Buffer"),
+            contents: bytemuck::cast_slice(&point_transfer_buffer),
+            usage: wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::VERTEX,
+        });
+
+        //let gpu_simulation_state = {
+        //    let simulation_state = CpuSimulationState::new();
+        //    GpuSimulationState::from_simulation_state(&device, &gpu_point_buffer, &simulation_state)
+        //};
+
+        let params = Params::new();
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Param Buffer"),
+            contents: bytemuck::cast_slice(&bytemuck::cast::<_, [u8; size_of::<Params>()]>(params)),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        });
+
+        let tri_size = POINT_MAX_RADIUS * BETA / (MAX_X - MIN_X); //0.003;
+
+        // let vertex_offsets: [f32; 6] = {
+        //     [
+        //         f32::sqrt(3.0) / 2.0,
+        //         -0.5,
+        //         0.0,
+        //         1.0,
+        //         -f32::sqrt(3.0) / 2.0,
+        //         -0.5,
+        //     ]
+        //     .map(|x| x * tri_size)
+        // };
+        let qq: i32 = 32;
+        let vertex_offsets: Vec<_> = (0_i32..qq)
+            .map(|i| ((i as f32) / ((qq - 1_i32) as f32)) * core::f32::consts::PI * 2.0)
+            .flat_map(|i| [-i.sin(), i.cos()])
+            .map(|i| i * tri_size)
+            .collect();
+        let vertices = u32::try_from(vertex_offsets.len().checked_div(2).unwrap()).unwrap();
+        let vertex_offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&vertex_offsets),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let bind_group_layout: wgpu::BindGroupLayout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bind group layout"),
                 entries: &[
-                    //wgpu::BindGroupEntry {
+                    //wgpu::BindGroupLayoutEntry {
                     //    binding: 0,
-                    //    resource: wgpu::BindingResource::Buffer(
-                    //        gpu_point_buffer.as_entire_buffer_binding(),
-                    //    ),
+                    //    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE,
+                    //    ty: wgpu::BindingType::Buffer {
+                    //        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    //        has_dynamic_offset: false,
+                    //        min_binding_size: Default::default(),
+                    //    },
+                    //    count: None,
                     //},
-                    wgpu::BindGroupEntry {
+                    wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Buffer(
-                            params_buffer.as_entire_buffer_binding(),
-                            ),
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
                 ],
             });
 
-            let shader_source: String = std::fs::read_to_string("src/shader.wgsl")
-                .unwrap()
-                .replace("{NUM_POINTS}", &format!("{NUM_POINTS}"))
-                .replace("{NUM_KINDS}", &format!("{NUM_KINDS}"))
-                .replace("{WIDTH_X}", &format!("{WIDTH_X:.10}"))
-                .replace("{WIDTH_Y}", &format!("{WIDTH_Y:.10}"));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                //wgpu::BindGroupEntry {
+                //    binding: 0,
+                //    resource: wgpu::BindingResource::Buffer(
+                //        gpu_point_buffer.as_entire_buffer_binding(),
+                //    ),
+                //},
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        params_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+            ],
+        });
 
-            let render_pipeline;
-            {
-                let fragment_vertex_shader: wgpu::ShaderModule =
-                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("Fragment and vertex shader"),
-                        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-                    });
-                let pipeline_layout: wgpu::PipelineLayout =
-                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("Render Pipeline Layout"),
-                        bind_group_layouts: &[&bind_group_layout],
-                        push_constant_ranges: &[],
-                    });
-                let layout = Some(&pipeline_layout);
-                let multisample: wgpu::MultisampleState = wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                };
+        let shader_source: String = std::fs::read_to_string("src/shader.wgsl")
+            .unwrap()
+            .replace("{NUM_POINTS}", &format!("{NUM_POINTS}"))
+            .replace("{NUM_KINDS}", &format!("{NUM_KINDS}"))
+            .replace("{WIDTH_X}", &format!("{WIDTH_X:.10}"))
+            .replace("{WIDTH_Y}", &format!("{WIDTH_Y:.10}"));
 
-                render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let render_pipeline;
+        {
+            let fragment_vertex_shader: wgpu::ShaderModule =
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Fragment and vertex shader"),
+                    source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+                });
+            let pipeline_layout: wgpu::PipelineLayout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Render Pipeline Layout"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+            let layout = Some(&pipeline_layout);
+            let multisample: wgpu::MultisampleState = wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            };
+
+            render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("Render Pipeline"),
                     layout,
                     vertex: wgpu::VertexState {
@@ -1791,294 +2372,324 @@ impl CpuSimulationState {
                     multisample,
                     multiview: None,
                 });
-            }
-
-            Self {
-                surface,
-                device,
-                queue,
-                config,
-                size,
-                window,
-                render_pipeline,
-                bind_group,
-                #[cfg(not(target_arch = "wasm32"))]
-                last_print: Instant::now(),
-                frame: 0,
-                simulation_controller,
-                point_transfer_buffer,
-                gpu_point_buffer,
-                params,
-                params_buffer,
-                keystate: KeyState::new(),
-                //gpu_simulation_state,
-                vertex_offsets_buffer,
-                vertices,
-            }
         }
 
-        fn render(&mut self) -> Result<(), SurfaceError> {
-            {
-                let control_dt = 0.03;
-
-                let k = &self.keystate;
-
-                let lr = i32::from(k.right) as f32 - i32::from(k.left) as f32;
-                let ud = i32::from(k.up) as f32 - i32::from(k.down) as f32;
-                let io = i32::from(k.zoom_out) as f32 - i32::from(k.zoom_in) as f32;
-                self.params.offset_x += lr * control_dt / self.params.zoom_x;
-                self.params.offset_y += ud * control_dt / self.params.zoom_x;
-
-                self.params.zoom_x += io * control_dt * self.params.zoom_x;
-                //self.params.zoom_x = self.params.zoom_x.max(1.0);
-                self.params.zoom_y =
-                    self.params.zoom_x * self.size.width as f32 / (self.size.height as f32);
-            }
-
-            self.frame += 1;
-            let max_frame = 240;
+        Self {
+            surface,
+            device,
+            queue,
+            config,
+            size,
+            window,
+            render_pipeline,
+            bind_group,
             #[cfg(not(target_arch = "wasm32"))]
-            if self.frame == max_frame {
-                self.frame = 0;
-                let dt = replace(&mut self.last_print, Instant::now()).elapsed();
-                let fps = max_frame as f64 / dt.as_secs_f64();
-                printlnc!("fps: {fps:?}, dt: {:50?}", dt);
-            }
+            last_print: Instant::now(),
+            frame: 0,
+            simulation_controller,
+            point_transfer_buffer,
+            gpu_point_buffer,
+            params,
+            params_buffer,
+            keystate: KeyState::new(),
+            //gpu_simulation_state,
+            vertex_offsets_buffer,
+            vertices,
+        }
+    }
 
-            let output: wgpu::SurfaceTexture = self.surface.get_current_texture()?;
-            let view = output
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
+    fn render(&mut self) -> Result<(), SurfaceError> {
+        {
+            let control_dt = 0.03;
 
-            if !USE_GPU_COMPUTE {
-                self.queue.write_buffer(
-                    &self.gpu_point_buffer,
-                    0,
-                    bytemuck::cast_slice(&self.point_transfer_buffer),
-                    );
-                self.simulation_controller
-                    .try_get_state(&mut self.point_transfer_buffer);
-            }
+            let k = &self.keystate;
+
+            let lr = i32::from(k.right) as f32 - i32::from(k.left) as f32;
+            let ud = i32::from(k.up) as f32 - i32::from(k.down) as f32;
+            let io = i32::from(k.zoom_out) as f32 - i32::from(k.zoom_in) as f32;
+            self.params.offset_x += lr * control_dt / self.params.zoom_x;
+            self.params.offset_y += ud * control_dt / self.params.zoom_x;
+
+            self.params.zoom_x += io * control_dt * self.params.zoom_x;
+            //self.params.zoom_x = self.params.zoom_x.max(1.0);
+            self.params.zoom_y =
+                self.params.zoom_x * self.size.width as f32 / (self.size.height as f32);
+        }
+
+        self.frame += 1;
+        let max_frame = 240;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.frame == max_frame {
+            self.frame = 0;
+            let dt = replace(&mut self.last_print, Instant::now()).elapsed();
+            let fps = max_frame as f64 / dt.as_secs_f64();
+            printlnc!("fps: {fps:?}, dt: {:50?}", dt);
+        }
+
+        let output: wgpu::SurfaceTexture = self.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        if !USE_GPU_COMPUTE {
             self.queue.write_buffer(
-                &self.params_buffer,
+                &self.gpu_point_buffer,
                 0,
-                bytemuck::cast_slice(&bytemuck::cast::<_, [u8; size_of::<Params>()]>(self.params)),
-                );
+                bytemuck::cast_slice(&self.point_transfer_buffer),
+            );
+            self.simulation_controller
+                .try_get_state(&mut self.point_transfer_buffer);
+        }
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&bytemuck::cast::<_, [u8; size_of::<Params>()]>(self.params)),
+        );
 
-            let mut encoder: wgpu::CommandEncoder =
-                self.device
+        let mut encoder: wgpu::CommandEncoder =
+            self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Encoder"),
                 });
-            //if USE_GPU_COMPUTE {
-            //    let mut compute_pass =
-            //        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-            //    let compute_pass = &mut compute_pass;
-            //    self.gpu_simulation_state.update(compute_pass);
-            //    self.gpu_simulation_state.serialize_gpu(compute_pass);
-            //}
+        //if USE_GPU_COMPUTE {
+        //    let mut compute_pass =
+        //        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        //    let compute_pass = &mut compute_pass;
+        //    self.gpu_simulation_state.update(compute_pass);
+        //    self.gpu_simulation_state.serialize_gpu(compute_pass);
+        //}
 
-            {
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Render Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 1.0,
-                            }),
-                            store: true,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                });
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.set_bind_group(0, &self.bind_group, &[]);
-                //render_pass.set_vertex_buffer(0, &self.gpu_point_buffer.slice(..));
-                //render_pass.draw(0..(3 * NUM_POINTS * 9), 0..1);
-                //render_pass.draw(0..(3 * NUM_POINTS), 0..1);
-                render_pass.set_vertex_buffer(0, self.gpu_point_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, self.vertex_offsets_buffer.slice(..));
-                render_pass.draw(0..self.vertices, 0..NUM_POINTS);
-            }
-
-            self.queue.submit(Some(encoder.finish()));
-            output.present();
-
-            Ok(())
-        }
-
-        fn input(&mut self, event: &WindowEvent<'_>) {
-            if let &WindowEvent::KeyboardInput {
-                input:
-                    winit::event::KeyboardInput {
-                        virtual_keycode: Some(keycode),
-                        state,
-                        ..
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: true,
                     },
+                })],
+                depth_stencil_attachment: None,
+            });
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            //render_pass.set_vertex_buffer(0, &self.gpu_point_buffer.slice(..));
+            //render_pass.draw(0..(3 * NUM_POINTS * 9), 0..1);
+            //render_pass.draw(0..(3 * NUM_POINTS), 0..1);
+            render_pass.set_vertex_buffer(0, self.gpu_point_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.vertex_offsets_buffer.slice(..));
+            render_pass.draw(0..self.vertices, 0..NUM_POINTS);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        output.present();
+
+        Ok(())
+    }
+
+    fn input(&mut self, event: &WindowEvent<'_>) {
+        if let &WindowEvent::KeyboardInput {
+            input:
+                winit::event::KeyboardInput {
+                    virtual_keycode: Some(keycode),
+                    state,
                     ..
-            } = event
-            {
-                use VirtualKeyCode::*;
-                let pressed = state == ElementState::Pressed;
+                },
+            ..
+        } = event
+        {
+            use VirtualKeyCode::*;
+            let pressed = state == ElementState::Pressed;
 
-                match keycode {
-                    W => self.keystate.up = pressed,
-                    S => self.keystate.down = pressed,
-                    A => self.keystate.left = pressed,
-                    D => self.keystate.right = pressed,
-                    Space => self.keystate.zoom_out = pressed,
-                    LShift => self.keystate.zoom_in = pressed,
-                    _ => (),
-                };
-            }
-        }
-
-        fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-            if new_size.width > 0 && new_size.height > 0 {
-                self.size = new_size;
-                self.config.width = new_size.width;
-                self.config.height = new_size.height;
-                self.surface.configure(&self.device, &self.config);
-            }
-        }
-
-        pub fn window(&self) -> &Window {
-            &self.window
+            match keycode {
+                W => self.keystate.up = pressed,
+                S => self.keystate.down = pressed,
+                A => self.keystate.left = pressed,
+                D => self.keystate.right = pressed,
+                Space => self.keystate.zoom_out = pressed,
+                LShift => self.keystate.zoom_in = pressed,
+                _ => (),
+            };
         }
     }
 
-    mod simd {
-        #![allow(dead_code)]
-        use core::arch::x86_64::*;
-        #[inline(always)]
-        pub unsafe fn load(a: *const f32) -> __m256 {
-            _mm256_load_ps(a)
-        }
-        pub unsafe fn loadu(a: *const f32) -> __m256 {
-            _mm256_loadu_ps(a)
-        }
-        pub unsafe fn loadi(a: *const __m256i) -> __m256i {
-            _mm256_load_si256(a)
-        }
-        pub unsafe fn loadiu(a: *const __m256i) -> __m256i {
-            _mm256_loadu_si256(a)
-        }
-        #[inline(always)]
-        pub unsafe fn mul(a: __m256, b: __m256) -> __m256 {
-            _mm256_mul_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn add(a: __m256, b: __m256) -> __m256 {
-            _mm256_add_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
-            _mm256_and_si256(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn and(a: __m256, b: __m256) -> __m256 {
-            _mm256_and_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn andn(a: __m256, b: __m256) -> __m256 {
-            _mm256_andnot_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn sub(a: __m256, b: __m256) -> __m256 {
-            _mm256_sub_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
-            _mm256_fmadd_ps(a, b, c)
-        }
-        #[inline(always)]
-        pub unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
-            _mm256_fmadd_ps(a, b, c)
-        }
-        #[inline(always)]
-        pub unsafe fn fnmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
-            _mm256_fnmadd_ps(a, b, c)
-        }
-        #[inline(always)]
-        pub unsafe fn fnmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
-            _mm256_fnmsub_ps(a, b, c)
-        }
-        #[inline(always)]
-        pub unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
-            _mm256_i32gather_ps::<SCALE>(p, indexes)
-        }
-        #[inline(always)]
-        pub unsafe fn sqrt(a: __m256) -> __m256 {
-            _mm256_sqrt_ps(a)
-        }
-        #[inline(always)]
-        pub unsafe fn div(a: __m256, b: __m256) -> __m256 {
-            _mm256_div_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn rsqrt_fast(a: __m256) -> __m256 {
-            _mm256_rsqrt_ps(a)
-        }
-        #[inline(always)]
-        pub unsafe fn zero() -> __m256 {
-            _mm256_setzero_ps()
-        }
-        #[inline(always)]
-        pub unsafe fn set1(a: f32) -> __m256 {
-            _mm256_set1_ps(a)
-        }
-        #[inline(always)]
-        pub unsafe fn splati(a: i32) -> __m256i {
-            _mm256_set1_epi32(a)
-        }
-        #[inline(always)]
-        pub unsafe fn max(a: __m256, b: __m256) -> __m256 {
-            _mm256_max_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn maxzero(a: __m256) -> __m256 {
-            //_mm256_max_ps(a, zero())
-            _mm256_blendv_ps(a, zero(), a)
-        }
-        #[inline(always)]
-        pub unsafe fn min(a: __m256, b: __m256) -> __m256 {
-            _mm256_min_ps(a, b)
-        }
-        #[inline(always)]
-        pub unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i {
-            _mm256_slli_epi32::<IMM>(a)
-        }
-        #[inline(always)]
-        pub unsafe fn hadd(a: __m256) -> f32 {
-            let mut b: [f32; 8] = [0.0; 8];
-            _mm256_storeu_ps(b.as_mut_ptr(), a);
-            ((b[0] + b[1]) + (b[2] + b[3])) + ((b[4] + b[5]) + (b[6] + b[7]))
-        }
-        // #[inline(always)]
-        // pub unsafe fn abs(a: __m256) -> __m256 {
-        //     let sign_bit = 0b1000_0000__0000_0000__0000_0000__0000_0000;
-        //     let mask = _mm256_set1_epi32(!sign_bit);
-        //     _mm256_castsi256_ps()
-        //     todo!()
-
-        // }
-
-        pub fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
-            unsafe fn as_chunks_unchecked<T, const N: usize>(s: &[T]) -> &[[T; N]] {
-                let new_len = s.len() / N;
-                unsafe { core::slice::from_raw_parts(s.as_ptr().cast(), new_len) }
-            }
-            assert!(N != 0, "chunk size must be non-zero");
-            let len = this.len() / N;
-            let (remainder, multiple_of_n) = this.split_at(this.len() - len * N);
-            // SAFETY: We already panicked for zero, and ensured by construction
-            // that the length of the subslice is a multiple of N.
-            let array_slice = unsafe { as_chunks_unchecked(multiple_of_n) };
-            (remainder, array_slice)
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
+            self.surface.configure(&self.device, &self.config);
         }
     }
+
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+}
+
+mod simd {
+    #![allow(dead_code)]
+    use core::arch::x86_64::*;
+    use no_panic::no_panic;
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn load(a: *const f32) -> __m256 {
+        _mm256_load_ps(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn loadu(a: *const f32) -> __m256 {
+        _mm256_loadu_ps(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn loadi(a: *const __m256i) -> __m256i {
+        _mm256_load_si256(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn loadiu(a: *const __m256i) -> __m256i {
+        _mm256_loadu_si256(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn mul(a: __m256, b: __m256) -> __m256 {
+        _mm256_mul_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn add(a: __m256, b: __m256) -> __m256 {
+        _mm256_add_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_and_si256(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn and(a: __m256, b: __m256) -> __m256 {
+        _mm256_and_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn andn(a: __m256, b: __m256) -> __m256 {
+        _mm256_andnot_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn sub(a: __m256, b: __m256) -> __m256 {
+        _mm256_sub_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fmadd_ps(a, b, c)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fmadd_ps(a, b, c)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn fnmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fnmadd_ps(a, b, c)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn fnmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fnmsub_ps(a, b, c)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
+        _mm256_i32gather_ps::<SCALE>(p, indexes)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn sqrt(a: __m256) -> __m256 {
+        _mm256_sqrt_ps(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn div(a: __m256, b: __m256) -> __m256 {
+        _mm256_div_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn rsqrt_fast(a: __m256) -> __m256 {
+        _mm256_rsqrt_ps(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn zero() -> __m256 {
+        _mm256_setzero_ps()
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn set1(a: f32) -> __m256 {
+        _mm256_set1_ps(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn splati(a: i32) -> __m256i {
+        _mm256_set1_epi32(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn max(a: __m256, b: __m256) -> __m256 {
+        _mm256_max_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn maxzero(a: __m256) -> __m256 {
+        //_mm256_max_ps(a, zero())
+        _mm256_blendv_ps(a, zero(), a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn min(a: __m256, b: __m256) -> __m256 {
+        _mm256_min_ps(a, b)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i {
+        _mm256_slli_epi32::<IMM>(a)
+    }
+    #[inline(always)]
+    #[no_panic]
+    pub unsafe fn hadd(a: __m256) -> f32 {
+        let mut b: [f32; 8] = [0.0; 8];
+        _mm256_storeu_ps(b.as_mut_ptr(), a);
+        ((b[0] + b[1]) + (b[2] + b[3])) + ((b[4] + b[5]) + (b[6] + b[7]))
+    }
+    // #[inline(always)]
+    // pub unsafe fn abs(a: __m256) -> __m256 {
+    //     let sign_bit = 0b1000_0000__0000_0000__0000_0000__0000_0000;
+    //     let mask = _mm256_set1_epi32(!sign_bit);
+    //     _mm256_castsi256_ps()
+    //     todo!()
+
+    // }
+
+    pub fn as_rchunks<T, const N: usize>(this: &[T]) -> (&[T], &[[T; N]]) {
+        unsafe fn as_chunks_unchecked<T, const N: usize>(s: &[T]) -> &[[T; N]] {
+            let new_len = s.len() / N;
+            unsafe { core::slice::from_raw_parts(s.as_ptr().cast(), new_len) }
+        }
+        assert!(N != 0, "chunk size must be non-zero");
+        let len = this.len() / N;
+        let (remainder, multiple_of_n) = this.split_at(this.len() - len * N);
+        // SAFETY: We already panicked for zero, and ensured by construction
+        // that the length of the subslice is a multiple of N.
+        let array_slice = unsafe { as_chunks_unchecked(multiple_of_n) };
+        (remainder, array_slice)
+    }
+}

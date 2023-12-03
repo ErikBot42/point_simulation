@@ -9,6 +9,9 @@ impl Prng {
         self.0 ^= self.0 << 17;
         self.0
     }
+    pub fn usize_range(&mut self, range: Range<usize>) -> usize {
+        (self.next() % ((range.len() as i64 - 1).max(1) as u64) + range.start as u64) as usize
+    }
     pub fn usize(&mut self, max: usize) -> usize {
         (self.next() % (max as u64)) as usize
     }
