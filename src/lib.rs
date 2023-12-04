@@ -481,6 +481,24 @@ impl<I: Into<usize>, T, const SIZE: usize> IndexMut<I> for Tb<I, T, SIZE> {
 type Pbox<T> = Tb<Pid, T, NUM_POINTS_U>;
 type Cbox<T> = Tb<Cid, T, CELLS_PLUS_1_U>;
 
+macro_rules! impl_unsafe_index {
+    ($index:ty, $amount:expr) => {
+        impl<T> Index<$index> for &mut [T; $amount] {
+            type Output = T;
+
+            fn index(&self, index: $index) -> &Self::Output {
+                let index: usize = index.into();
+                #[cfg(not(debug_assertions))]
+                unsafe { self.get_unchecked(index) }
+                #[cfg(debug_assertions)]
+                self.get(index).unwrap()
+            }
+        }
+    }
+}
+impl_unsafe_index!(Pid, NUM_POINTS_U);
+impl_unsafe_index!(Cid, CELLS_PLUS_1_U);
+
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
@@ -501,7 +519,7 @@ impl SimThreadController {
             self.counter.fetch_sub(1, Relaxed);
             *v = r;
         } else {
-            dbg!();
+            eprintln!("simulation cannot keep up, skipping frames...");
         }
     }
     fn new() -> Self {
@@ -1010,93 +1028,99 @@ macro_rules! fma {
     ( 0 )                           => { core::arch::x86_64::_mm256_setzero_ps() };
 }
 
-fn test() {
-    macro_rules! make_state {
-        ($name:ident { $($field_name:ident : [ $t:ty ; $e:expr],)* })=> {
-            struct $name  {
-                $($field_name: &'static mut [$t; $e],)*
-                owned: *mut [PageAligned; ALLOC_SIZE],
+macro_rules! make_state {
+    ($name:ident $borrowed_name:ident { $($field_name:ident : [ $t:ty ; $e:expr],)* })=> {
+        struct $name  {
+            $($field_name: &'static mut [$t; $e],)*
+            owned: *mut [PageAligned; ALLOC_SIZE],
+        }
+        struct $borrowed_name<'a> {
+            $($field_name: &'a [$t; $e],)*
+        }
+        impl $name {
+            #[no_panic]
+            fn new<'a>(init: $borrowed_name<'a>) -> Self {
+                let this = Self::new_uninit();
+                $(this.$field_name.copy_from_slice(&*init.$field_name);)*
+                this
             }
-            impl $name {
+            #[no_panic]
+            fn new_uninit() -> Self {
                 #[no_panic]
-                fn new() -> Self {
-                    #[no_panic]
-                    fn from_buffer(data: &'static mut [PageAligned; ALLOC_SIZE]) -> $name {
-                        let data_ptr: *mut [PageAligned; ALLOC_SIZE] = data;
-                        let mut data: &mut [u8] = bytemuck::cast_slice_mut(data.as_mut_slice());
-                        $(
-                            let $field_name: &mut [$t; $e] = {
-                                let alloc_size = ($e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);
-                                let (allocated_data, new_data) = data.split_at_mut(alloc_size);
-                                data = new_data;
-                                let (slice_data, _padding) = allocated_data.split_at_mut($e * std::mem::size_of::<$t>());
-                                bytemuck::cast_slice_mut(slice_data).try_into().unwrap()
-                            };
-                        )*
-                        let _ = data;
+                fn from_buffer(data: &'static mut [PageAligned; ALLOC_SIZE]) -> $name {
+                    let data_ptr: *mut [PageAligned; ALLOC_SIZE] = data;
+                    let mut data: &mut [u8] = bytemuck::cast_slice_mut(data.as_mut_slice());
+                    $(
+                        let $field_name: &mut [$t; $e] = {
+                            let alloc_size = ($e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);
+                            let (allocated_data, new_data) = data.split_at_mut(alloc_size);
+                            data = new_data;
+                            let (slice_data, _padding) = allocated_data.split_at_mut($e * std::mem::size_of::<$t>());
+                            bytemuck::cast_slice_mut(slice_data).try_into().unwrap()
+                        };
+                    )*
+                    let _ = data;
 
-                        $name {
-                            owned: data_ptr,
-                            $($field_name,)*
-                        }
+                    $name {
+                        owned: data_ptr,
+                        $($field_name,)*
                     }
-                    let state = InnerState::new();
-                    let state: &'static mut [PageAligned; ALLOC_SIZE] = Box::leak(state.0);
-                    from_buffer(state)
                 }
+                let state = InnerState::new();
+                let state: &'static mut [PageAligned; ALLOC_SIZE] = Box::leak(state.0);
+                from_buffer(state)
             }
-            impl Drop for $name {
-                #[no_panic]
-                fn drop(&mut self) {
-                    drop( unsafe { Box::from_raw(self.owned) } );
-                }
+        }
+        impl Drop for $name {
+            #[no_panic]
+            fn drop(&mut self) {
+                drop( unsafe { Box::from_raw(self.owned) } );
             }
-            const ALIGN: usize = 128;
-            const ALLOC_SIZE_BYTES: usize = calc_alloc_size();
-            const ALLOC_SIZE: usize = ALLOC_SIZE_BYTES.div_ceil(size_of::<PageAligned>());
-            const fn calc_alloc_size() -> usize {
-                let mut offset = 0;
-                $(offset = (offset + $e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);)*
-                offset
-            }
-            unsafe impl bytemuck::Zeroable for PageAligned {}
-            unsafe impl bytemuck::Pod for PageAligned {}
-            #[derive(Copy, Clone)]
-            #[repr(align(4096), C)]
-            struct PageAligned([u8; 4096]);
-            struct InnerState (Box<[PageAligned; ALLOC_SIZE]>);
-            impl InnerState {
-                #[no_panic]
-                fn new() -> Self {
-                    let Ok(v) = vec![PageAligned([0;4096]); ALLOC_SIZE]
-                        .into_boxed_slice()
-                        .try_into() else { panic!() };
-                    Self( v )
-                }
+        }
+        const ALIGN: usize = 128;
+        const ALLOC_SIZE_BYTES: usize = calc_alloc_size();
+        const ALLOC_SIZE: usize = ALLOC_SIZE_BYTES.div_ceil(size_of::<PageAligned>());
+        const fn calc_alloc_size() -> usize {
+            let mut offset = 0;
+            $(offset = (offset + $e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);)*
+            offset
+        }
+        unsafe impl bytemuck::Zeroable for PageAligned {}
+        unsafe impl bytemuck::Pod for PageAligned {}
+        #[derive(Copy, Clone)]
+        #[repr(align(4096), C)]
+        struct PageAligned([u8; 4096]);
+        struct InnerState (Box<[PageAligned; ALLOC_SIZE]>);
+        impl InnerState {
+            #[no_panic]
+            fn new() -> Self {
+                let Ok(v) = vec![PageAligned([0;4096]); ALLOC_SIZE]
+                    .into_boxed_slice()
+                    .try_into() else { panic!() };
+                Self( v )
             }
         }
     }
-
-    make_state!(State {
-        x0: [f32; NUM_POINTS_U],
-        y0: [f32; NUM_POINTS_U],
-        x1: [f32; NUM_POINTS_U],
-        y1: [f32; NUM_POINTS_U],
-        k: [u8; NUM_POINTS_U],
-        x0_tmp: [f32; NUM_POINTS_U],
-        y0_tmp: [f32; NUM_POINTS_U],
-        x1_tmp: [f32; NUM_POINTS_U],
-        y1_tmp: [f32; NUM_POINTS_U],
-        k_tmp: [u8; NUM_POINTS_U],
-        point_cell: [Cid; NUM_POINTS_U],
-        point_cell_offset: [Pid; NUM_POINTS_U],
-        cell_count: [Pid; CELLS_PLUS_1_U],
-        cell_index: [Pid; CELLS_PLUS_1_U],
-        relation_table: [f32; NUM_KINDS2],
-    });
-    let state = State::new();
-
 }
+
+make_state!(State BorrowedState {
+    x0: [f32; NUM_POINTS_U],
+    y0: [f32; NUM_POINTS_U],
+    x1: [f32; NUM_POINTS_U],
+    y1: [f32; NUM_POINTS_U],
+    k: [u8; NUM_POINTS_U],
+    x0_tmp: [f32; NUM_POINTS_U],
+    y0_tmp: [f32; NUM_POINTS_U],
+    x1_tmp: [f32; NUM_POINTS_U],
+    y1_tmp: [f32; NUM_POINTS_U],
+    k_tmp: [u8; NUM_POINTS_U],
+    point_cell: [Cid; NUM_POINTS_U],
+    point_cell_offset: [Pid; NUM_POINTS_U],
+    cell_count: [Pid; CELLS_PLUS_1_U],
+    cell_index: [Pid; CELLS_PLUS_1_U],
+    relation_table: [f32; NUM_KINDS2],
+});
+
 
 /// Entire state of the simulation
 pub struct CpuSimulationState {
@@ -1114,10 +1138,11 @@ pub struct CpuSimulationState {
     point_cell_offset: Pbox<Pid>,
     cell_count: Cbox<Pid>,
     cell_index: Cbox<Pid>,
-    relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]>,
+    relation_table: Box<[f32; NUM_KINDS2]>,
     // TODO: bit pack k in f32
     // TODO: AoSoA packing
 }
+
 impl CpuSimulationState {
     #[must_use]
     pub fn new() -> Self { Self::from_verlet(SimulationInputEuler::new().verlet()) }
@@ -1156,8 +1181,7 @@ impl CpuSimulationState {
         let mut this_point_cell_offset: Pbox<Pid> = calloc_counted(&mut counter);
         let mut this_cell_count: Cbox<Pid> = calloc_counted(&mut counter);
         let mut this_cell_index: Cbox<Pid> = calloc_counted(&mut counter);
-        let mut this_relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]> =
-            calloc_counted(&mut counter);
+        let mut this_relation_table: Box<[f32; NUM_KINDS2]> = calloc_counted(&mut counter);
         println!("TOTAL ALLOCATED: {counter} bytes");
 
         this_x0_tmp.copy_from_slice(&**x0);
@@ -1165,7 +1189,10 @@ impl CpuSimulationState {
         this_x1_tmp.copy_from_slice(&**x1);
         this_y1_tmp.copy_from_slice(&**y1);
         this_k_tmp.copy_from_slice(&**k);
-        this_relation_table.copy_from_slice(&*relation_table);
+        this_relation_table
+            .iter_mut()
+            .zip(relation_table.iter().flatten())
+            .for_each(|(a, b)| *a = *b);
         drop(x0);
         drop(y0);
         drop(x1);
@@ -1462,7 +1489,8 @@ impl CpuSimulationState {
         let y1_self = set1(y1);
         // 256 = 8xf32 => 8 iterations
         // step_by rounds down
-        let k_base: __m256 = _mm256_load_ps(self.relation_table.as_ptr().add(k as usize).cast());
+        let k_base: __m256 =
+            _mm256_load_ps(self.relation_table.as_ptr().add(8 * k as usize).cast());
 
         // TODO: only do first N iterations.
 
@@ -1847,10 +1875,9 @@ macro_rules! dbgc {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub async fn run() {
-    test();
     let (event_loop, window) = window_setup();
 
-    let mut state = State::new(window).await;
+    let mut state = GuiState::new(window).await;
     event_loop.run(move |os_event, _, control_flow| match os_event {
         Event::WindowEvent {
             event: window_event,
@@ -1917,7 +1944,7 @@ fn window_setup() -> (EventLoop<()>, Window) {
     }
     (event_loop, window)
 }
-struct State {
+struct GuiState {
     params: Params,
     keystate: KeyState,
 
@@ -1947,7 +1974,7 @@ struct State {
     //gpu_simulation_state: GpuSimulationState,
 }
 
-impl State {
+impl GuiState {
     async fn new(window: Window) -> Self {
         //let simulation_state = SimulationState::new(SimulationInputEuler::new().verlet());
         let mut simulation_controller = SimThreadController::new();
