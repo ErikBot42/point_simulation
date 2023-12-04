@@ -181,6 +181,8 @@ fn inv_scale_simulation_y(f: f32) -> f32 {
 fn mod_simulation_x(f: f32) -> f32 { (f - MIN_X).rem_euclid(WIDTH_X) + MIN_X }
 #[inline(always)]
 fn mod_simulation_y(f: f32) -> f32 { (f - MIN_Y).rem_euclid(WIDTH_Y) + MIN_Y }
+#[inline(always)]
+#[no_panic]
 fn reflect_sim_x(f: f32) -> f32 {
     // TODO: not respecting min_x, max_x
     // (((f.min(2.0-f).max(-f))-0.5)*0.999999)+0.5
@@ -188,10 +190,7 @@ fn reflect_sim_x(f: f32) -> f32 {
     //f.min(5.0-f*4.0).max(-f*4.0)
 
     // offset to avoid overlapping points
-    if f.is_nan() {
-        eprintln!("nan x pos detected...");
-        0.5
-    } else if f < 0.0 {
+    if f < 0.0 {
         f + 0.004
     } else if f > 1.0 {
         f - 0.004
@@ -199,6 +198,8 @@ fn reflect_sim_x(f: f32) -> f32 {
         f
     }
 }
+#[inline(always)]
+#[no_panic]
 fn reflect_sim_y(f: f32) -> f32 {
     // TODO: not respecting min_x, max_x
     // (((f.min(2.0-f).max(-f))-0.5)*0.999999)+0.5
@@ -206,10 +207,7 @@ fn reflect_sim_y(f: f32) -> f32 {
     //f.min(5.0-f*4.0).max(-f*4.0)
 
     // offset to avoid overlapping points
-    if f.is_nan() {
-        eprintln!("nan y pos detected...");
-        0.5
-    } else if f < 0.0 {
+    if f < 0.0 {
         f + 0.004
     } else if f > 1.0 {
         f - 0.004
@@ -219,6 +217,7 @@ fn reflect_sim_y(f: f32) -> f32 {
 }
 
 #[inline(always)]
+#[no_panic]
 fn compute_cell(x: f32, y: f32) -> Cid {
     let x = inv_scale_simulation_x(x);
     let y = inv_scale_simulation_y(y);
@@ -485,23 +484,38 @@ macro_rules! impl_unsafe_index {
     ($index:ty, $amount:expr) => {
         impl<T> Index<$index> for &mut [T; $amount] {
             type Output = T;
-
             fn index(&self, index: $index) -> &Self::Output {
                 let index: usize = index.into();
                 #[cfg(not(debug_assertions))]
-                unsafe { self.get_unchecked(index) }
+                unsafe {
+                    self.get_unchecked(index)
+                }
                 #[cfg(debug_assertions)]
                 self.get(index).unwrap()
             }
         }
-    }
+        impl<T> IndexMut<$index> for &mut [T; $amount] {
+            fn index_mut(&mut self, index: $index) -> &mut Self::Output {
+                let index: usize = index.into();
+                #[cfg(not(debug_assertions))]
+                unsafe {
+                    self.get_unchecked_mut(index)
+                }
+                #[cfg(debug_assertions)]
+                self.get_mut(index).unwrap()
+            }
+        }
+    };
 }
 impl_unsafe_index!(Pid, NUM_POINTS_U);
 impl_unsafe_index!(Cid, CELLS_PLUS_1_U);
 
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{
+            AtomicUsize,
+            Ordering::{AcqRel, Acquire},
+        },
         mpsc::{channel, Receiver},
         Arc,
     },
@@ -516,7 +530,7 @@ impl SimThreadController {
     fn get_state(&mut self, v: &mut Vec<GpuPoint>) { *v = self.recv_data.recv().unwrap(); }
     fn try_get_state(&mut self, v: &mut Vec<GpuPoint>) {
         if let Ok(r) = self.recv_data.try_recv() {
-            self.counter.fetch_sub(1, Relaxed);
+            self.counter.fetch_sub(1, AcqRel);
             *v = r;
         } else {
             eprintln!("simulation cannot keep up, skipping frames...");
@@ -538,10 +552,10 @@ impl SimThreadController {
                     simulation_state.update();
                     updates += 1;
                 }
-                if counter.load(Relaxed) < 2 {
+                if counter.load(Acquire) < 2 {
                     let mut v = Vec::new();
                     simulation_state.serialize_gpu(&mut v);
-                    counter.fetch_add(1, Relaxed);
+                    counter.fetch_add(1, AcqRel);
                     if send.send(v).is_err() {
                         break;
                     };
@@ -1030,7 +1044,7 @@ macro_rules! fma {
 
 macro_rules! make_state {
     ($name:ident $borrowed_name:ident { $($field_name:ident : [ $t:ty ; $e:expr],)* })=> {
-        struct $name  {
+        pub struct $name  {
             $($field_name: &'static mut [$t; $e],)*
             owned: *mut [PageAligned; ALLOC_SIZE],
         }
@@ -1038,13 +1052,14 @@ macro_rules! make_state {
             $($field_name: &'a [$t; $e],)*
         }
         impl $name {
-            #[no_panic]
-            fn new<'a>(init: $borrowed_name<'a>) -> Self {
+            //#[no_panic]
+            fn from_borrowed<'a>(init: $borrowed_name<'a>) -> Self {
                 let this = Self::new_uninit();
                 $(this.$field_name.copy_from_slice(&*init.$field_name);)*
+                this.print_alloc_info();
                 this
             }
-            #[no_panic]
+            //#[no_panic]
             fn new_uninit() -> Self {
                 #[no_panic]
                 fn from_buffer(data: &'static mut [PageAligned; ALLOC_SIZE]) -> $name {
@@ -1070,6 +1085,11 @@ macro_rules! make_state {
                 let state: &'static mut [PageAligned; ALLOC_SIZE] = Box::leak(state.0);
                 from_buffer(state)
             }
+            fn print_alloc_info(&self) {
+                eprintln!("State {{");
+                $(eprintln!("{}: 0x{:X} (align: {})", stringify!($field_name), self.$field_name as *const _ as usize, 1 << (self.$field_name as *const _ as usize).trailing_zeros());)*
+                eprintln!("}}");
+            }
         }
         impl Drop for $name {
             #[no_panic]
@@ -1092,7 +1112,7 @@ macro_rules! make_state {
         struct PageAligned([u8; 4096]);
         struct InnerState (Box<[PageAligned; ALLOC_SIZE]>);
         impl InnerState {
-            #[no_panic]
+            //#[no_panic]
             fn new() -> Self {
                 let Ok(v) = vec![PageAligned([0;4096]); ALLOC_SIZE]
                     .into_boxed_slice()
@@ -1103,7 +1123,7 @@ macro_rules! make_state {
     }
 }
 
-make_state!(State BorrowedState {
+make_state!(CpuSimulationState BorrowedState {
     x0: [f32; NUM_POINTS_U],
     y0: [f32; NUM_POINTS_U],
     x1: [f32; NUM_POINTS_U],
@@ -1121,27 +1141,26 @@ make_state!(State BorrowedState {
     relation_table: [f32; NUM_KINDS2],
 });
 
-
 /// Entire state of the simulation
-pub struct CpuSimulationState {
-    x0: Pbox<f32>,
-    y0: Pbox<f32>,
-    x1: Pbox<f32>,
-    y1: Pbox<f32>,
-    k: Pbox<u8>,
-    x0_tmp: Pbox<f32>,
-    y0_tmp: Pbox<f32>,
-    x1_tmp: Pbox<f32>,
-    y1_tmp: Pbox<f32>,
-    k_tmp: Pbox<u8>,
-    point_cell: Pbox<Cid>,
-    point_cell_offset: Pbox<Pid>,
-    cell_count: Cbox<Pid>,
-    cell_index: Cbox<Pid>,
-    relation_table: Box<[f32; NUM_KINDS2]>,
-    // TODO: bit pack k in f32
-    // TODO: AoSoA packing
-}
+// pub struct CpuSimulationState {
+//     x0: Pbox<f32>,
+//     y0: Pbox<f32>,
+//     x1: Pbox<f32>,
+//     y1: Pbox<f32>,
+//     k: Pbox<u8>,
+//     x0_tmp: Pbox<f32>,
+//     y0_tmp: Pbox<f32>,
+//     x1_tmp: Pbox<f32>,
+//     y1_tmp: Pbox<f32>,
+//     k_tmp: Pbox<u8>,
+//     point_cell: Pbox<Cid>,
+//     point_cell_offset: Pbox<Pid>,
+//     cell_count: Cbox<Pid>,
+//     cell_index: Cbox<Pid>,
+//     relation_table: Box<[f32; NUM_KINDS2]>,
+//     // TODO: bit pack k in f32
+//     // TODO: AoSoA packing
+// }
 
 impl CpuSimulationState {
     #[must_use]
@@ -1226,23 +1245,41 @@ impl CpuSimulationState {
         }
         this_cell_count.iter_mut().for_each(|e| *e = 0.into());
 
-        Self {
-            x0: this_x0,
-            y0: this_y0,
-            x1: this_x1,
-            y1: this_y1,
-            k: this_k,
-            x0_tmp: this_x0_tmp,
-            y0_tmp: this_y0_tmp,
-            x1_tmp: this_x1_tmp,
-            y1_tmp: this_y1_tmp,
-            k_tmp: this_k_tmp,
-            point_cell: this_point_cell,
-            point_cell_offset: this_point_cell_offset,
-            cell_count: this_cell_count,
-            cell_index: this_cell_index,
-            relation_table: this_relation_table,
-        }
+        Self::from_borrowed(BorrowedState {
+            x0: &this_x0,
+            y0: &this_y0,
+            x1: &this_x1,
+            y1: &this_y1,
+            k: &this_k,
+            x0_tmp: &this_x0_tmp,
+            y0_tmp: &this_y0_tmp,
+            x1_tmp: &this_x1_tmp,
+            y1_tmp: &this_y1_tmp,
+            k_tmp: &this_k_tmp,
+            point_cell: &this_point_cell,
+            point_cell_offset: &this_point_cell_offset,
+            cell_count: &this_cell_count,
+            cell_index: &this_cell_index,
+            relation_table: &this_relation_table,
+        })
+
+        // Self {
+        //     x0: this_x0,
+        //     y0: this_y0,
+        //     x1: this_x1,
+        //     y1: this_y1,
+        //     k: this_k,
+        //     x0_tmp: this_x0_tmp,
+        //     y0_tmp: this_y0_tmp,
+        //     x1_tmp: this_x1_tmp,
+        //     y1_tmp: this_y1_tmp,
+        //     k_tmp: this_k_tmp,
+        //     point_cell: this_point_cell,
+        //     point_cell_offset: this_point_cell_offset,
+        //     cell_count: this_cell_count,
+        //     cell_index: this_cell_index,
+        //     relation_table: this_relation_table,
+        // }
     }
     fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
         data.clear();
@@ -1279,109 +1316,91 @@ impl CpuSimulationState {
         // 340, 243
         // 347, 238
 
-        {
+        for z in 0..(CELLS_X as u32 * CELLS_Y as u32) {
+            let (cx, cy) = Self::z_to_xy(z);
+            let (cx, cy) = (cx as u16, cy as u16);
+            // for ccx in (0..CELLS_X).step_by(BLOCK_SIZE as usize) {
+            //     for ccy in (0..CELLS_Y).step_by(BLOCK_SIZE as usize) {
+            //         for cy in ccy..(CELLS_Y.min(ccy + BLOCK_SIZE)) {
+            //             for cx in ccx..(CELLS_X.min(ccx + BLOCK_SIZE)) {
+            //for i in (0..NUM_POINTS_U).map(Into::into) {
+            let cell: Cid = Cid((cx + cy * CELLS_X) as IndexType);
+            //self.fill_surround_buffer(cy, cx);
+
+            let ranges = self.generate_ranges(cy, cx);
+
+            for i_self in (usize::from(self.cell_index[cell])
+                ..usize::from(self.cell_index[cell + 1.into()]))
+                .map(Into::into)
             {
+                let x0 = self.x0[i_self];
+                let y0 = self.y0[i_self];
+                let x1 = self.x1[i_self];
+                let y1 = self.y1[i_self];
+                let k = self.k[i_self];
+                let mut acc_x = 0.0;
+                let mut acc_y = 0.0;
+                debug_assert_float!(acc_x);
+                debug_assert_float!(acc_y);
+
+                // self.k
+                // self.x1
+                // self.y1
+                //#[rustfmt::skip]
+                /*unsafe {
+                    use core::arch::x86_64::*;
+                    for range in &ranges {
+                        _mm_prefetch(self.k.0.get_unchecked(range.start as usize) as *const u8 as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(self.x1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(self.y1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
+                    }
+                };*/
+
+                #[cfg(not(feature = "nosimd"))]
+                unsafe {
+                    self.iterate_ranges(ranges.clone(), x1, y1, k, &mut acc_x, &mut acc_y);
+                }
+
+                // about 52 % of execution time is spent here
+                #[cfg(feature = "nosimd")]
                 {
-                    for z in 0..(CELLS_X as u32 * CELLS_Y as u32) {
-                        let (cx, cy) = Self::z_to_xy(z);
-                        let (cx, cy) = (cx as u16, cy as u16);
-                        // for ccx in (0..CELLS_X).step_by(BLOCK_SIZE as usize) {
-                        //     for ccy in (0..CELLS_Y).step_by(BLOCK_SIZE as usize) {
-                        //         for cy in ccy..(CELLS_Y.min(ccy + BLOCK_SIZE)) {
-                        //             for cx in ccx..(CELLS_X.min(ccx + BLOCK_SIZE)) {
-                        //for i in (0..NUM_POINTS_U).map(Into::into) {
-                        let cell: Cid = Cid((cx + cy * CELLS_X) as IndexType);
-                        //self.fill_surround_buffer(cy, cx);
+                    acc_x = 0.0;
+                    acc_y = 0.0;
+                    let local_k_arr: [f32; NUM_KINDS] =
+                        *unsafe { self.relation_table.get_unchecked(k as usize) };
+                    for ((&x_other, &y_other), &k_other) in self
+                        .surround_buffer_x
+                        .slice()
+                        .iter()
+                        .zip(self.surround_buffer_y.slice().iter())
+                        .zip(self.surround_buffer_k.slice().iter())
+                    {
+                        // https://www.desmos.com/calculator/yos22615bv
 
-                        let ranges = self.generate_ranges(cy, cx);
+                        let dx = x1 - x_other;
+                        let dy = y1 - y_other;
+                        let dot = dx * dx + dy * dy;
+                        let r = dot.sqrt();
 
-                        for i_self in (usize::from(self.cell_index[cell])
-                            ..usize::from(self.cell_index[cell + 1.into()]))
-                            .map(Into::into)
-                        {
-                            let x0 = self.x0[i_self];
-                            let y0 = self.y0[i_self];
-                            let x1 = self.x1[i_self];
-                            let y1 = self.y1[i_self];
-                            let k = self.k[i_self];
-                            let mut acc_x = 0.0;
-                            let mut acc_y = 0.0;
+                        let x = r * (1.0 / POINT_MAX_RADIUS);
+                        let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
+                        let c = 4.0 * (1.0 - x / BETA);
+                        //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
+
+                        let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
+                        let dir_x = dx / r;
+                        let dir_y = dy / r;
+                        if dot != 0.0 {
+                            acc_x += dir_x * f;
+                            acc_y += dir_y * f;
                             debug_assert_float!(acc_x);
                             debug_assert_float!(acc_y);
-
-                            // self.k
-                            // self.x1
-                            // self.y1
-                            //#[rustfmt::skip]
-                            /*unsafe {
-                                use core::arch::x86_64::*;
-                                for range in &ranges {
-                                    _mm_prefetch(self.k.0.get_unchecked(range.start as usize) as *const u8 as *const i8, _MM_HINT_T0);
-                                    _mm_prefetch(self.x1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
-                                    _mm_prefetch(self.y1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
-                                }
-                            };*/
-
-                            // about 42 % faster
-                            #[cfg(not(feature = "nosimd"))]
-                            unsafe {
-                                //self.iterate_neighbours(x1, y1, k, &mut acc_x, &mut acc_y);
-                                self.iterate_ranges(
-                                    ranges.clone(),
-                                    x1,
-                                    y1,
-                                    k,
-                                    &mut acc_x,
-                                    &mut acc_y,
-                                );
-                            }
-
-                            // about 52 % of execution time is spent here
-                            #[cfg(feature = "nosimd")]
-                            {
-                                acc_x = 0.0;
-                                acc_y = 0.0;
-                                let local_k_arr: [f32; NUM_KINDS] =
-                                    *unsafe { self.relation_table.get_unchecked(k as usize) };
-                                for ((&x_other, &y_other), &k_other) in self
-                                    .surround_buffer_x
-                                    .slice()
-                                    .iter()
-                                    .zip(self.surround_buffer_y.slice().iter())
-                                    .zip(self.surround_buffer_k.slice().iter())
-                                {
-                                    // https://www.desmos.com/calculator/yos22615bv
-
-                                    let dx = x1 - x_other;
-                                    let dy = y1 - y_other;
-                                    let dot = dx * dx + dy * dy;
-                                    let r = dot.sqrt();
-
-                                    let x = r * (1.0 / POINT_MAX_RADIUS);
-                                    let k: f32 =
-                                        *unsafe { local_k_arr.get_unchecked(k_other as usize) };
-                                    let c = 4.0 * (1.0 - x / BETA);
-                                    //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
-
-                                    let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0))
-                                        .max(c);
-                                    let dir_x = dx / r;
-                                    let dir_y = dy / r;
-                                    if dot != 0.0 {
-                                        acc_x += dir_x * f;
-                                        acc_y += dir_y * f;
-                                        debug_assert_float!(acc_x);
-                                        debug_assert_float!(acc_y);
-                                    }
-                                }
-                            }
-                            let (new_x, new_y) =
-                                Self::calc_new_position(acc_x, acc_y, x1, x0, y1, y0);
-
-                            self.store_temporary_results(i_self, new_x, new_y);
                         }
                     }
                 }
+                let (new_x, new_y) = Self::calc_new_position(acc_x, acc_y, x1, x0, y1, y0);
+
+                self.store_temporary_results(i_self, new_x, new_y);
             }
         }
 
@@ -1472,6 +1491,7 @@ impl CpuSimulationState {
     }
 
     #[inline(never)]
+    #[no_panic]
     unsafe fn iterate_ranges(
         &mut self,
         ranges: [Range<u32>; 3],
