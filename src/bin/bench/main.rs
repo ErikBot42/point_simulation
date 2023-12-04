@@ -5,12 +5,12 @@ use std::hint::black_box;
 use std::time::Instant;
 
 fn main() {
+    // assert_ne!(libc::nice(-50), -1, "could not set nice level");
     unsafe {
-        //assert_ne!(libc::nice(-50), -1, "could not set nice level");
-
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(1, &mut set);
+        libc::CPU_SET(2, &mut set);
+        libc::CPU_SET(3, &mut set);
         assert_eq!(
             libc::sched_setaffinity(
                 libc::getpid(),

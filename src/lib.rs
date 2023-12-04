@@ -29,6 +29,7 @@
 #![allow(clippy::missing_const_for_fn)]
 #![allow(clippy::future_not_send)]
 #![deny(clippy::suboptimal_flops)]
+#![allow(clippy::cognitive_complexity)]
 
 //#![deny(clippy::restrict)]
 
@@ -58,6 +59,7 @@
 // #![allow(clippy::missing_inline_in_public_items)]
 // #![allow(clippy::indexing_slicing)]
 // #![allow(clippy::panic)]
+//
 
 use std::{
     array::from_fn,
@@ -69,24 +71,24 @@ use std::{
 };
 
 use no_panic::no_panic;
+
 use wgpu::{util::DeviceExt, SurfaceError};
+
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
 
-// API
-// cpu IR, gpu IR -> point buffer
+mod prng;
+mod vertex;
+
+use prng::Prng;
 
 const USE_GPU_COMPUTE: bool = false;
 
-use prng::Prng;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
-
-mod prng;
-mod vertex;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -132,20 +134,37 @@ fn debug_check_valid_pos(f: f32) -> bool {
     r
 }
 
+fn simd_to_array(e: core::arch::x86_64::__m256) -> [f32; 8] {
+    let mut b: [f32; 8] = [0.0; 8];
+    unsafe {
+        core::arch::x86_64::_mm256_storeu_ps(b.as_mut_ptr(), e);
+    }
+    b
+}
+macro_rules! debug_assert_float_simd {
+    ($e:expr) => {
+        #[cfg(debug_assertions)]
+        {
+            let e = simd_to_array($e);
+            debug_assert!(!e.into_iter().any(f32::is_nan), "{e:?}");
+            debug_assert!(!e.into_iter().any(f32::is_infinite), "{e:?}");
+        }
+    };
+}
+
 macro_rules! debug_assert_float {
-    ($e:expr) => {{
-        let f: f32 = $e;
-        debug_assert!(!f.is_nan(), "{f}");
-    }};
+    ($e:expr) => {
+        #[cfg(debug_assertions)]
+        {
+            let f: f32 = $e;
+            debug_assert!(!f.is_nan() && f.is_finite(), "{}: {f}", stringify!($e));
+        }
+    };
 }
 #[inline(always)]
-fn scale_simulation_x(f: f32) -> f32 {
-    MIN_X + WIDTH_X * f
-}
+fn scale_simulation_x(f: f32) -> f32 { MIN_X + WIDTH_X * f }
 #[inline(always)]
-fn scale_simulation_y(f: f32) -> f32 {
-    MIN_Y + WIDTH_Y * f
-}
+fn scale_simulation_y(f: f32) -> f32 { MIN_Y + WIDTH_Y * f }
 #[inline(always)]
 fn inv_scale_simulation_x(f: f32) -> f32 {
     //(f - MIN_X) * (1.0 / WIDTH_X)
@@ -159,25 +178,23 @@ fn inv_scale_simulation_y(f: f32) -> f32 {
     f
 }
 #[inline(always)]
-fn mod_simulation_x(f: f32) -> f32 {
-    (f - MIN_X).rem_euclid(WIDTH_X) + MIN_X
-}
+fn mod_simulation_x(f: f32) -> f32 { (f - MIN_X).rem_euclid(WIDTH_X) + MIN_X }
 #[inline(always)]
-fn mod_simulation_y(f: f32) -> f32 {
-    (f - MIN_Y).rem_euclid(WIDTH_Y) + MIN_Y
-}
+fn mod_simulation_y(f: f32) -> f32 { (f - MIN_Y).rem_euclid(WIDTH_Y) + MIN_Y }
 fn reflect_sim_x(f: f32) -> f32 {
     // TODO: not respecting min_x, max_x
     // (((f.min(2.0-f).max(-f))-0.5)*0.999999)+0.5
     //f.min(2.0-f).max(-f)
     //f.min(5.0-f*4.0).max(-f*4.0)
+
+    // offset to avoid overlapping points
     if f.is_nan() {
         eprintln!("nan x pos detected...");
         0.5
     } else if f < 0.0 {
-        0.004
+        f + 0.004
     } else if f > 1.0 {
-        1.0 - 0.004
+        f - 0.004
     } else {
         f
     }
@@ -188,13 +205,14 @@ fn reflect_sim_y(f: f32) -> f32 {
     //f.min(2.0-f).max(-f)
     //f.min(5.0-f*4.0).max(-f*4.0)
 
+    // offset to avoid overlapping points
     if f.is_nan() {
         eprintln!("nan y pos detected...");
         0.5
     } else if f < 0.0 {
-        0.004
+        f + 0.004
     } else if f > 1.0 {
-        1.0 - 0.004
+        f - 0.004
     } else {
         f
     }
@@ -275,9 +293,7 @@ struct KeyState {
     zoom_out: bool,
 }
 impl KeyState {
-    fn new() -> Self {
-        Self::default()
-    }
+    fn new() -> Self { Self::default() }
 }
 impl SimulationInputEuler {
     #[must_use]
@@ -291,7 +307,7 @@ impl SimulationInputEuler {
         )
     }
     #[must_use]
-    fn from_seed(seed: u64) -> SimulationInputEuler {
+    fn from_seed(seed: u64) -> Self {
         fn iter_alloc<T: std::fmt::Debug, const SIZE: usize, F: FnMut() -> T>(
             mut f: F,
         ) -> Box<[T; SIZE]> {
@@ -305,7 +321,7 @@ impl SimulationInputEuler {
         let xy_range = 0.0..1.0;
         let v_range = -0.1..0.1; //-1.0..1.0;
 
-        SimulationInputEuler {
+        Self {
             x: iter_alloc(|| rng.f32(xy_range.clone())).into(),
             y: iter_alloc(|| rng.f32(xy_range.clone())).into(),
             vx: iter_alloc(|| rng.f32(v_range.clone())).into(),
@@ -353,64 +369,29 @@ macro_rules! index_wrap {
             type IndexType = $index;
         }
         impl From<$name> for usize {
-            fn from(value: $name) -> usize {
-                value.0 as _
-            }
+            fn from(value: $name) -> usize { value.0 as _ }
         }
         impl From<$name> for u32 {
-            fn from(value: $name) -> u32 {
-                value.0 as _
-            }
+            fn from(value: $name) -> u32 { value.0 as _ }
         }
         impl From<usize> for $name {
-            fn from(value: usize) -> $name {
-                $name(value as _)
-            }
+            fn from(value: usize) -> $name { $name(value as _) }
         }
         impl AddAssign<$name> for $name {
-            fn add_assign(&mut self, other: Self) {
-                self.0 += other.0;
-            }
+            fn add_assign(&mut self, other: Self) { self.0 += other.0; }
         }
         impl Add<$name> for $name {
             type Output = Self;
-            fn add(self, rhs: Self) -> Self {
-                Self(self.0 + rhs.0)
-            }
+            fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
         }
         impl IntoGpu for $name {
             type GpuType = u32;
-            fn into_gpu(self) -> Self::GpuType {
-                self.0 as _
-            }
+            fn into_gpu(self) -> Self::GpuType { self.0 as _ }
         }
     };
 }
 index_wrap!(Pid, IndexType, "Point index");
 index_wrap!(Cid, IndexType, "Cell index");
-/// Packed "float" and 4 bit value, exploiting unused bits in a float to save some memory.
-// #[repr(transparent)]
-// #[derive(Copy, Clone, Default, Debug)]
-// struct Packed(u32);
-// impl Packed {
-//     fn pack(float: f32, val: u8) -> u32 {
-//         // float needs to be in the range 64.0_f32..128.0_f32
-//         // 0b10111101000000000000000000000000
-//         let mask: u32 = 0b0011_1100_0000_0000_0000_0000_0000_0000;
-//         let shift = mask.trailing_zeros();
-//         float.to_bits() | ((val as u32) << shift)
-//     }
-//     fn unpack(self) -> (f32, u8) {
-//         // float needs to be in the range 64.0_f32..128.0_f32
-//         // 0b10111101000000000000000000000000
-//         let packed = self.0;
-//         let mask: u32 = 0b0011_1100_0000_0000_0000_0000_0000_0000;
-//         let shift = mask.trailing_zeros();
-//         let float = f32::from_bits(packed & (!mask));
-//         let val = ((packed & mask) >> shift) as u8;
-//         (float, val)
-//     }
-// }
 
 // lower_limit: 0.49
 // upper_limit: 1.1
@@ -431,13 +412,9 @@ impl Packed {
         (float.to_bits() & (!Self::MASK)) | ((val as u32) << Self::SHIFT)
     }
     #[inline(always)]
-    fn unpack_float(packed: u32) -> f32 {
-        f32::from_bits(packed | Self::MASK)
-    }
+    fn unpack_float(packed: u32) -> f32 { f32::from_bits(packed | Self::MASK) }
     #[inline(always)]
-    fn unpack_u8(packed: u32) -> u8 {
-        ((packed & Self::MASK) >> Self::SHIFT) as u8
-    }
+    fn unpack_u8(packed: u32) -> u8 { ((packed & Self::MASK) >> Self::SHIFT) as u8 }
     #[inline(always)]
     unsafe fn mm256_pack_preshifted(
         x: core::arch::x86_64::__m256,
@@ -477,22 +454,16 @@ impl Packed {
 #[derive(Debug)]
 struct Tb<I, T, const SIZE: usize>(Box<[T; SIZE]>, PhantomData<I>);
 impl<I, T, const SIZE: usize> From<Box<[T; SIZE]>> for Tb<I, T, SIZE> {
-    fn from(value: Box<[T; SIZE]>) -> Self {
-        Self(value, PhantomData)
-    }
+    fn from(value: Box<[T; SIZE]>) -> Self { Self(value, PhantomData) }
 }
 
 impl<I, T, const SIZE: usize> Deref for Tb<I, T, SIZE> {
     type Target = Box<[T; SIZE]>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 impl<I, T, const SIZE: usize> DerefMut for Tb<I, T, SIZE> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
 }
 impl<I: Into<usize>, T, const SIZE: usize> Index<I> for Tb<I, T, SIZE> {
     type Output = T;
@@ -510,20 +481,21 @@ impl<I: Into<usize>, T, const SIZE: usize> IndexMut<I> for Tb<I, T, SIZE> {
 type Pbox<T> = Tb<Pid, T, NUM_POINTS_U>;
 type Cbox<T> = Tb<Cid, T, CELLS_PLUS_1_U>;
 
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
-use std::thread;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        mpsc::{channel, Receiver},
+        Arc,
+    },
+    thread,
+};
 
 struct SimThreadController {
     recv_data: Receiver<Vec<GpuPoint>>,
     counter: Arc<AtomicUsize>,
 }
 impl SimThreadController {
-    fn get_state(&mut self, v: &mut Vec<GpuPoint>) {
-        *v = self.recv_data.recv().unwrap();
-    }
+    fn get_state(&mut self, v: &mut Vec<GpuPoint>) { *v = self.recv_data.recv().unwrap(); }
     fn try_get_state(&mut self, v: &mut Vec<GpuPoint>) {
         if let Ok(r) = self.recv_data.try_recv() {
             self.counter.fetch_sub(1, Relaxed);
@@ -597,28 +569,20 @@ struct UnsafeVec<T, const SIZE: usize> {
 }
 impl<T, const SIZE: usize> UnsafeVec<T, SIZE> {
     #[inline(always)]
-    unsafe fn end_ptr_mut(&mut self, len: usize) -> *mut T {
-        self.inner.as_mut_ptr().add(len)
-    }
+    unsafe fn end_ptr_mut(&mut self, len: usize) -> *mut T { self.inner.as_mut_ptr().add(len) }
 }
 
 impl<T, const SIZE: usize> From<Box<[T; SIZE]>> for UnsafeVec<T, SIZE> {
-    fn from(inner: Box<[T; SIZE]>) -> Self {
-        Self { inner }
-    }
+    fn from(inner: Box<[T; SIZE]>) -> Self { Self { inner } }
 }
 
 impl<T, const SIZE: usize> Deref for UnsafeVec<T, SIZE> {
     type Target = Box<[T; SIZE]>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
+    fn deref(&self) -> &Self::Target { &self.inner }
 }
 impl<T, const SIZE: usize> DerefMut for UnsafeVec<T, SIZE> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
 }
 
 fn calloc_counted<T: Default + Debug + bytemuck::Zeroable + bytemuck::Pod, const SIZE: usize, O>(
@@ -656,9 +620,7 @@ fn aligned_alloc_64<T: Default + bytemuck::Zeroable + bytemuck::Pod, const SIZE:
     #[repr(align(64), C)]
     struct AlignedBytes([u8; 64]);
     impl Default for AlignedBytes {
-        fn default() -> Self {
-            Self([0; 64])
-        }
+        fn default() -> Self { Self([0; 64]) }
     }
     aligned_alloc::<AlignedBytes, T, SIZE>()
 }
@@ -668,9 +630,7 @@ fn aligned_alloc_4096<T: Default + bytemuck::Zeroable + bytemuck::Pod, const SIZ
     #[repr(align(4096), C)]
     struct AlignedBytes([u8; 4096]);
     impl Default for AlignedBytes {
-        fn default() -> Self {
-            Self([0; 4096])
-        }
+        fn default() -> Self { Self([0; 4096]) }
     }
     aligned_alloc::<AlignedBytes, T, SIZE>()
 }
@@ -699,9 +659,7 @@ macro_rules! impl_into_gpu {
     ($from:ty, $into:ty) => {
         impl IntoGpu for $from {
             type GpuType = $into;
-            fn into_gpu(self) -> Self::GpuType {
-                self as _
-            }
+            fn into_gpu(self) -> Self::GpuType { self as _ }
         }
     };
 }
@@ -1053,145 +1011,64 @@ macro_rules! fma {
 }
 
 fn test() {
-    macro_rules! multi_alloc {
-        ($a:ident) => {
-            let $a = calloc();
-        };
-    }
-
-    macro_rules! find_min {
-    // Base case:
-    ($x:expr) => ($x);
-    // `$x` followed by at least one `$y,`
-    ($x:expr, $($y:expr),+) => (
-        // Call `find_min!` on the tail `$y`
-        std::cmp::min($x, find_min!($($y),+))
-    )
-}
-
-    // let x0;
-    // let y0;
-    // let x1;
-    // let y1;
-    // let k;
-    // let x0_tmp;
-    // let y0_tmp;
-    // let x1_tmp;
-    // let y1_tmp;
-    // let k_tmp;
-    // let point_cell;
-    // let point_cell_offset;
-    // let cell_count;
-    // let cell_index;
-    // let relation_table;
-
-    macro_rules! multi_alloc {
-        ($a:ident, $($b:ident),+) => {
-            multi_alloc!($a);
-            multi_alloc!($($b),+);
-        };
-        ($a:ident) => {
-            let $a = calloc();
-        };
-    }
-
-    // multi_alloc!(
-    //     x0,
-    //     y0,
-    //     x1,
-    //     y1,
-    //     k,
-    //     x0_tmp,
-    //     y0_tmp,
-    //     x1_tmp,
-    //     y1_tmp,
-    //     k_tmp,
-    //     point_cell,
-    //     point_cell_offset,
-    //     cell_count,
-    //     cell_index,
-    //     relation_table
-    // );
-    //    macro_rules! my_macro {
-    //     (struct $name:ident {
-    //         $($field_name:ident: $field_type:ty,)*
-    //     }) => {
-    //         struct $name {
-    //             $($field_name: $field_type,)*
-    //         }
-    //
-    //         impl $name {
-    //             // This is purely an example—not a good one.
-    //             fn get_field_names() -> Vec<&'static str> {
-    //                 vec![$(stringify!($field_name)),*]
-    //             }
-    //         }
-    //     }
-    // }
-    //
-    // my_macro! {
-    //     struct S {
-    //         a: String,
-    //         b: String,
-    //     }
-    // }
-    {
-        // ((SIZE * size_of::<T>()) / size_of::<S>())
-
-        // let mut v = (0..(SIZE.div_ceil(size_of::<AlignedBytes>())))
-        //     .map(|_| AlignedBytes([0;4096]))
-        //     .collect::<Vec<AlignedBytes>>();
-        // v.shrink_to_fit();
-        // v.into_boxed_slice();
-    }
-    #[no_panic]
-
-    fn tt(a: &mut [u64; 4]) {
-        let b: &mut [u64; 8] = bytemuck::cast_mut(a);
-    }
-
     macro_rules! make_state {
-        ($name:ident $borrowed_name:ident { $($field_name:ident : [ $t:ty ; $e:expr],)* })=> {
-
-
-            struct $borrowed_name < 'a > {
-                $($field_name : & 'a mut [$t ; $e],)*
+        ($name:ident { $($field_name:ident : [ $t:ty ; $e:expr],)* })=> {
+            struct $name  {
+                $($field_name: &'static mut [$t; $e],)*
+                owned: *mut [PageAligned; ALLOC_SIZE],
             }
-            impl<'a> $borrowed_name <'a> {
-                fn new(data: &'a mut [AlignedBytes; ALLOC_SIZE]) -> $borrowed_name <'a> {
-                    let data: &mut [u8] = bytemuck::cast_slice_mut(data.as_mut_slice());
-                    $(
-                        let alloc_size = $e * std::mem::size_of::<$t>();
-                        let $field_name: &mut [u8] = &mut [];
-                        let $field_name: &mut [$t] = bytemuck::cast_slice_mut($field_name);
-                        let $field_name: &mut [$t; $e] = $field_name.try_into().unwrap();
-                    )*
+            impl $name {
+                #[no_panic]
+                fn new() -> Self {
+                    #[no_panic]
+                    fn from_buffer(data: &'static mut [PageAligned; ALLOC_SIZE]) -> $name {
+                        let data_ptr: *mut [PageAligned; ALLOC_SIZE] = data;
+                        let mut data: &mut [u8] = bytemuck::cast_slice_mut(data.as_mut_slice());
+                        $(
+                            let $field_name: &mut [$t; $e] = {
+                                let alloc_size = ($e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);
+                                let (allocated_data, new_data) = data.split_at_mut(alloc_size);
+                                data = new_data;
+                                let (slice_data, _padding) = allocated_data.split_at_mut($e * std::mem::size_of::<$t>());
+                                bytemuck::cast_slice_mut(slice_data).try_into().unwrap()
+                            };
+                        )*
+                        let _ = data;
 
-                    $borrowed_name {
-                        $($field_name,)*
+                        $name {
+                            owned: data_ptr,
+                            $($field_name,)*
+                        }
                     }
+                    let state = InnerState::new();
+                    let state: &'static mut [PageAligned; ALLOC_SIZE] = Box::leak(state.0);
+                    from_buffer(state)
+                }
+            }
+            impl Drop for $name {
+                #[no_panic]
+                fn drop(&mut self) {
+                    drop( unsafe { Box::from_raw(self.owned) } );
                 }
             }
             const ALIGN: usize = 128;
             const ALLOC_SIZE_BYTES: usize = calc_alloc_size();
-            const ALLOC_SIZE: usize = ALLOC_SIZE_BYTES.div_ceil(size_of::<AlignedBytes>());
+            const ALLOC_SIZE: usize = ALLOC_SIZE_BYTES.div_ceil(size_of::<PageAligned>());
             const fn calc_alloc_size() -> usize {
                 let mut offset = 0;
                 $(offset = (offset + $e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);)*
                 offset
             }
-
-
-            unsafe impl bytemuck::Zeroable for AlignedBytes {}
-            unsafe impl bytemuck::Pod for AlignedBytes {}
+            unsafe impl bytemuck::Zeroable for PageAligned {}
+            unsafe impl bytemuck::Pod for PageAligned {}
             #[derive(Copy, Clone)]
             #[repr(align(4096), C)]
-            struct AlignedBytes([u8; 4096]);
-            struct $name (Box<[AlignedBytes; ALLOC_SIZE]>);
-            impl $name {
+            struct PageAligned([u8; 4096]);
+            struct InnerState (Box<[PageAligned; ALLOC_SIZE]>);
+            impl InnerState {
+                #[no_panic]
                 fn new() -> Self {
-                    let Ok(v) = (0..ALLOC_SIZE).map(|_| AlignedBytes([0; 4096]))
-                        .collect::<Vec<_>>()
+                    let Ok(v) = vec![PageAligned([0;4096]); ALLOC_SIZE]
                         .into_boxed_slice()
                         .try_into() else { panic!() };
                     Self( v )
@@ -1200,132 +1077,25 @@ fn test() {
         }
     }
 
-    make_state!(
-        State BorrowedState {
-            x0: [f32; NUM_POINTS_U],
-            y0: [f32; NUM_POINTS_U],
-            x1: [f32; NUM_POINTS_U],
-            y1: [f32; NUM_POINTS_U],
-            k: [u8; NUM_POINTS_U],
-            x0_tmp: [f32; NUM_POINTS_U],
-            y0_tmp: [f32; NUM_POINTS_U],
-            x1_tmp: [f32; NUM_POINTS_U],
-            y1_tmp: [f32; NUM_POINTS_U],
-            k_tmp: [u8; NUM_POINTS_U],
-            point_cell: [Cid; NUM_POINTS_U],
-            point_cell_offset: [Pid; NUM_POINTS_U],
-            cell_count: [Pid; CELLS_PLUS_1_U],
-            cell_index: [Pid; CELLS_PLUS_1_U],
-            relation_table: [f32; NUM_KINDS2],
-        }
-    );
+    make_state!(State {
+        x0: [f32; NUM_POINTS_U],
+        y0: [f32; NUM_POINTS_U],
+        x1: [f32; NUM_POINTS_U],
+        y1: [f32; NUM_POINTS_U],
+        k: [u8; NUM_POINTS_U],
+        x0_tmp: [f32; NUM_POINTS_U],
+        y0_tmp: [f32; NUM_POINTS_U],
+        x1_tmp: [f32; NUM_POINTS_U],
+        y1_tmp: [f32; NUM_POINTS_U],
+        k_tmp: [u8; NUM_POINTS_U],
+        point_cell: [Cid; NUM_POINTS_U],
+        point_cell_offset: [Pid; NUM_POINTS_U],
+        cell_count: [Pid; CELLS_PLUS_1_U],
+        cell_index: [Pid; CELLS_PLUS_1_U],
+        relation_table: [f32; NUM_KINDS2],
+    });
+    let state = State::new();
 
-    // struct BorrowedState<'a> {
-    //     x0: &'a mut [f32; NUM_POINTS_U],
-    //     y0: &'a mut [f32; NUM_POINTS_U],
-    //     x1: &'a mut [f32; NUM_POINTS_U],
-    //     y1: &'a mut [f32; NUM_POINTS_U],
-    //     k: &'a mut [u8; NUM_POINTS_U],
-    //     x0_tmp: &'a mut [f32; NUM_POINTS_U],
-    //     y0_tmp: &'a mut [f32; NUM_POINTS_U],
-    //     x1_tmp: &'a mut [f32; NUM_POINTS_U],
-    //     y1_tmp: &'a mut [f32; NUM_POINTS_U],
-    //     k_tmp: &'a mut [u8; NUM_POINTS_U],
-    //     point_cell: &'a mut [Cid; NUM_POINTS_U],
-    //     point_cell_offset: &'a mut [Pid; NUM_POINTS_U],
-    //     cell_count: &'a mut [Pid; CELLS_PLUS_1_U],
-    //     cell_index: &'a mut [Pid; CELLS_PLUS_1_U],
-    //     relation_table: &'a mut [f32; NUM_KINDS2],
-    // }
-
-    //macro_rules! make_state {
-    //    // ($field:ident) => {
-    //    //
-    //    //     //let $field: &mut [$t ; $size];
-
-    //    // };
-
-    //    ($field:ident , $($fieldd:ident),*) => {
-
-    //        //make_state!($field : [$t ; $size ]);
-
-    //    };
-    //}
-
-    // trace_macros!(true);
-    // macro_rules! make_state_inner {
-    //     ($l:lifetime, $i:ident, $t:ty, $e:expr) => {
-    //         $i: & $l mut [ $t ; $e ],
-    //     };
-    //     ($l:lifetime, $ii:ident, $tt:ty, $ee:expr, $($i:ident, $t:ty, $e:expr),+) => {
-    //         make_state_inner!($l, $ii, $tt, $ee)
-    //         make_state_inner!($l, $($i, $t, $e),+)
-    //     };
-    // }
-
-    // macro_rules! make_state {
-    //     //($x:ident) => {};
-    //     ($l:lifetime $name:ident $($i:ident : [ $t:ty ; $e:expr ]),+) => {
-    //         struct $name {
-    //             make_state_inner!($l, $($i, $t, $e),+)
-    //         }
-    //     };
-    // }
-
-    // make_state!(
-    //     'a BorrowedThing
-    //     x0: [f32; NUM_POINTS_U],
-    //     y0: [f32; NUM_POINTS_U],
-    //     x1: [f32; NUM_POINTS_U],
-    //     y1: [f32; NUM_POINTS_U],
-    //     k: [u8; NUM_POINTS_U],
-    //     x0_tmp: [f32; NUM_POINTS_U],
-    //     y0_tmp: [f32; NUM_POINTS_U],
-    //     x1_tmp: [f32; NUM_POINTS_U],
-    //     y1_tmp: [f32; NUM_POINTS_U],
-    //     k_tmp: [u8; NUM_POINTS_U],
-    //     point_cell: [Cid; NUM_POINTS_U],
-    //     point_cell_offset: [Pid; NUM_POINTS_U],
-    //     cell_count: [Pid; CELLS_PLUS_1_U],
-    //     cell_index: [Pid; CELLS_PLUS_1_U],
-    //     relation_table: [f32; NUM_KINDS]
-    // );
-
-    // trace_macros!(false);
-
-    // x0 = calloc();
-    // y0 = calloc();
-    // x1 = calloc();
-    // y1 = calloc();
-    // k = calloc();
-    // x0_tmp = calloc();
-    // y0_tmp = calloc();
-    // x1_tmp = calloc();
-    // y1_tmp = calloc();
-    // k_tmp = calloc();
-    // point_cell = calloc();
-    // point_cell_offset = calloc();
-    // cell_count = calloc();
-    // cell_index = calloc();
-    // relation_table = calloc();
-
-    // CpuSimulationState {
-    //     x0,
-    //     y0,
-    //     x1,
-    //     y1,
-    //     k,
-    //     x0_tmp,
-    //     y0_tmp,
-    //     x1_tmp,
-    //     y1_tmp,
-    //     k_tmp,
-    //     point_cell,
-    //     point_cell_offset,
-    //     cell_count,
-    //     cell_index,
-    //     relation_table,
-    // };
 }
 
 /// Entire state of the simulation
@@ -1334,31 +1104,23 @@ pub struct CpuSimulationState {
     y0: Pbox<f32>,
     x1: Pbox<f32>,
     y1: Pbox<f32>,
-    // TODO: merge with f32 unused bits
     k: Pbox<u8>,
-
     x0_tmp: Pbox<f32>,
     y0_tmp: Pbox<f32>,
     x1_tmp: Pbox<f32>,
     y1_tmp: Pbox<f32>,
-    // TODO: merge with f32 unused bits
     k_tmp: Pbox<u8>,
-
-    // TODO: pack (xxxxxxxxyyyyyyyy) in single array.
     point_cell: Pbox<Cid>,
-
     point_cell_offset: Pbox<Pid>,
-
     cell_count: Cbox<Pid>,
     cell_index: Cbox<Pid>,
-
     relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]>,
+    // TODO: bit pack k in f32
+    // TODO: AoSoA packing
 }
 impl CpuSimulationState {
     #[must_use]
-    pub fn new() -> Self {
-        Self::from_verlet(SimulationInputEuler::new().verlet())
-    }
+    pub fn new() -> Self { Self::from_verlet(SimulationInputEuler::new().verlet()) }
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
         Self::from_verlet(SimulationInputEuler::from_seed(seed).verlet())
@@ -1377,67 +1139,83 @@ impl CpuSimulationState {
         y0.iter_mut().for_each(|e| *e = scale_simulation_y(*e));
         x1.iter_mut().for_each(|e| *e = scale_simulation_x(*e));
         y1.iter_mut().for_each(|e| *e = scale_simulation_y(*e));
+
         let mut counter = 0;
-        let mut this = Self {
-            x0: calloc_counted(&mut counter),
-            y0: calloc_counted(&mut counter),
-            x1: calloc_counted(&mut counter),
-            y1: calloc_counted(&mut counter),
-            k: calloc_counted(&mut counter),
-            x0_tmp: calloc_counted(&mut counter),
-            y0_tmp: calloc_counted(&mut counter),
-            x1_tmp: calloc_counted(&mut counter),
-            y1_tmp: calloc_counted(&mut counter),
-            k_tmp: calloc_counted(&mut counter),
-            // surround_buffer_x: calloc(&mut counter),
-            // surround_buffer_y: calloc(&mut counter),
-            // surround_buffer_k: calloc(&mut counter),
-            // surround_buffer_len: 0,
-            point_cell: calloc_counted(&mut counter),
-            point_cell_offset: calloc_counted(&mut counter),
-            cell_count: calloc_counted(&mut counter),
-            cell_index: calloc_counted(&mut counter),
-            relation_table: calloc_counted(&mut counter),
-        };
+
+        let mut this_x0: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_y0: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_x1: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_y1: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_k: Pbox<u8> = calloc_counted(&mut counter);
+        let mut this_x0_tmp: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_y0_tmp: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_x1_tmp: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_y1_tmp: Pbox<f32> = calloc_counted(&mut counter);
+        let mut this_k_tmp: Pbox<u8> = calloc_counted(&mut counter);
+        let mut this_point_cell: Pbox<Cid> = calloc_counted(&mut counter);
+        let mut this_point_cell_offset: Pbox<Pid> = calloc_counted(&mut counter);
+        let mut this_cell_count: Cbox<Pid> = calloc_counted(&mut counter);
+        let mut this_cell_index: Cbox<Pid> = calloc_counted(&mut counter);
+        let mut this_relation_table: Box<[[f32; NUM_KINDS]; NUM_KINDS]> =
+            calloc_counted(&mut counter);
         println!("TOTAL ALLOCATED: {counter} bytes");
-        this.x0_tmp.copy_from_slice(&**x0);
-        this.y0_tmp.copy_from_slice(&**y0);
-        this.x1_tmp.copy_from_slice(&**x1);
-        this.y1_tmp.copy_from_slice(&**y1);
-        this.k_tmp.copy_from_slice(&**k);
-        this.relation_table.copy_from_slice(&*relation_table);
+
+        this_x0_tmp.copy_from_slice(&**x0);
+        this_y0_tmp.copy_from_slice(&**y0);
+        this_x1_tmp.copy_from_slice(&**x1);
+        this_y1_tmp.copy_from_slice(&**y1);
+        this_k_tmp.copy_from_slice(&**k);
+        this_relation_table.copy_from_slice(&*relation_table);
         drop(x0);
         drop(y0);
         drop(x1);
         drop(y1);
         drop(k);
+        drop(relation_table);
 
-        this.cell_count.iter_mut().for_each(|e| *e = 0.into());
+        this_cell_count.iter_mut().for_each(|e| *e = 0.into());
         for i in (0..NUM_POINTS_U).map(Into::into) {
-            let new_x = this.x1_tmp[i];
-            let new_y = this.y1_tmp[i];
+            let new_x = this_x1_tmp[i];
+            let new_y = this_y1_tmp[i];
             let cell = compute_cell(new_x, new_y);
-            this.point_cell[i] = cell;
-            this.point_cell_offset[i] = this.cell_count[cell];
-            this.cell_count[cell] += 1.into();
+            this_point_cell[i] = cell;
+            this_point_cell_offset[i] = this_cell_count[cell];
+            this_cell_count[cell] += 1.into();
         }
         let mut acc: Pid = 0.into();
         for i in (0..CELLS_PLUS_1_U).map(Into::into) {
-            this.cell_index[i] = acc;
-            let count = this.cell_count[i];
+            this_cell_index[i] = acc;
+            let count = this_cell_count[i];
             acc += count;
         }
         for i in (0..NUM_POINTS_U).map(Into::into) {
-            let cell = this.point_cell[i];
-            let index = this.cell_index[cell] + this.point_cell_offset[i];
-            this.x0[index] = this.x0_tmp[i];
-            this.y0[index] = this.y0_tmp[i];
-            this.x1[index] = this.x1_tmp[i];
-            this.y1[index] = this.y1_tmp[i];
-            this.k[index] = this.k_tmp[i];
+            let cell = this_point_cell[i];
+            let index = this_cell_index[cell] + this_point_cell_offset[i];
+            this_x0[index] = this_x0_tmp[i];
+            this_y0[index] = this_y0_tmp[i];
+            this_x1[index] = this_x1_tmp[i];
+            this_y1[index] = this_y1_tmp[i];
+            this_k[index] = this_k_tmp[i];
         }
-        this.cell_count.iter_mut().for_each(|e| *e = 0.into());
-        this
+        this_cell_count.iter_mut().for_each(|e| *e = 0.into());
+
+        Self {
+            x0: this_x0,
+            y0: this_y0,
+            x1: this_x1,
+            y1: this_y1,
+            k: this_k,
+            x0_tmp: this_x0_tmp,
+            y0_tmp: this_y0_tmp,
+            x1_tmp: this_x1_tmp,
+            y1_tmp: this_y1_tmp,
+            k_tmp: this_k_tmp,
+            point_cell: this_point_cell,
+            point_cell_offset: this_point_cell_offset,
+            cell_count: this_cell_count,
+            cell_index: this_cell_index,
+            relation_table: this_relation_table,
+        }
     }
     fn serialize_gpu(&self, data: &mut Vec<GpuPoint>) {
         data.clear();
@@ -1501,19 +1279,21 @@ impl CpuSimulationState {
                             let k = self.k[i_self];
                             let mut acc_x = 0.0;
                             let mut acc_y = 0.0;
+                            debug_assert_float!(acc_x);
+                            debug_assert_float!(acc_y);
 
                             // self.k
                             // self.x1
                             // self.y1
-                            #[rustfmt::skip]
-                            unsafe {
+                            //#[rustfmt::skip]
+                            /*unsafe {
                                 use core::arch::x86_64::*;
-                                // for range in &ranges {
-                                //     _mm_prefetch(self.k.0.get_unchecked(range.start as usize) as *const u8 as *const i8, _MM_HINT_T0);
-                                //     _mm_prefetch(self.x1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
-                                //     _mm_prefetch(self.y1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
-                                // }
-                            };
+                                for range in &ranges {
+                                    _mm_prefetch(self.k.0.get_unchecked(range.start as usize) as *const u8 as *const i8, _MM_HINT_T0);
+                                    _mm_prefetch(self.x1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
+                                    _mm_prefetch(self.y1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
+                                }
+                            };*/
 
                             // about 42 % faster
                             #[cfg(not(feature = "nosimd"))]
@@ -1674,8 +1454,7 @@ impl CpuSimulationState {
         acc_x: &mut f32,
         acc_y: &mut f32,
     ) {
-        use simd::*;
-        use std::arch::x86_64::*;
+        use {simd::*, std::arch::x86_64::*};
         let mut acc_x_s = zero();
         let mut acc_y_s = zero();
 
@@ -1691,7 +1470,6 @@ impl CpuSimulationState {
             if range.is_empty() {
                 continue;
             }
-
             for i in range.step_by(8) {
                 // 3 loads per iteration
 
@@ -1739,13 +1517,30 @@ impl CpuSimulationState {
 
                 // f / r
                 let f_masked = fma!(mask_ok & f);
+                #[cfg(debug_assertions)]
+                {
+                    let e = simd_to_array(f_masked);
+                    let e2 = simd_to_array(mask_ok);
+                    let e3 = simd_to_array(dot);
+                    {
+                        assert!(!e.into_iter().any(f32::is_nan), "\n{e:?}\n{e2:?}\n{e3:?}");
+                    }
+                };
+                debug_assert_float_simd!(f_masked);
+                debug_assert_float_simd!(dx);
+                debug_assert_float_simd!(dy);
+                debug_assert_float_simd!(acc_x_s);
+                debug_assert_float_simd!(acc_y_s);
 
                 acc_x_s = fma!(dx * f_masked + acc_x_s);
                 acc_y_s = fma!(dy * f_masked + acc_y_s);
             }
         }
+
         *acc_x = hadd(acc_x_s);
         *acc_y = hadd(acc_y_s);
+        debug_assert_float!(*acc_x);
+        debug_assert_float!(*acc_y);
     }
     /*
     #[inline(never)]
@@ -1948,8 +1743,6 @@ impl CpuSimulationState {
     ) -> (f32, f32) {
         debug_assert_float!(acc_x);
         debug_assert_float!(acc_y);
-        debug_assert_float!(acc_x);
-        debug_assert_float!(acc_y);
         acc_x *= MIN_WIDTH;
         acc_y *= MIN_WIDTH;
 
@@ -1966,6 +1759,10 @@ impl CpuSimulationState {
         let vy = y1 - y0;
         let v2 = f32::mul_add(vx, vx, vy * vy);
         let v = v2.sqrt();
+        debug_assert_float!(vx);
+        debug_assert_float!(vy);
+        debug_assert_float!(v2);
+        debug_assert_float!(v);
         let v_inv = 1.0 / v;
         // let vx_norm = vx * v_inv;
         // let vy_norm = vy * v_inv;
@@ -1985,21 +1782,28 @@ impl CpuSimulationState {
             let target_v = (C - (C * C * (1.0 / (4.0 * H)) * x)) * x;
             friction_force = v - target_v;
         }
+        debug_assert_float!(v_inv);
+        debug_assert_float!(friction_force);
         let factor = (friction_force * (1.0 / (DT * DT))) * v_inv;
+        debug_assert_float!(factor);
+        debug_assert_float!(acc_x);
+        debug_assert_float!(acc_y);
+        debug_assert_float!(vx);
+        debug_assert_float!(vy);
+        debug_assert_float!(x1);
+        debug_assert_float!(y1);
         if !(vx.is_nan() || vy.is_nan() || factor.is_nan()) {
             acc_x -= factor * vx;
             acc_y -= factor * vy;
         }
-        // assert!(!acc_x.is_nan());
-        // assert!(!acc_y.is_nan());
-        // assert!(!x1.is_nan());
-        // assert!(!y1.is_nan());
-        // assert!(!vx.is_nan());
-        // assert!(!vy.is_nan());
+        debug_assert_float!(acc_x);
+        debug_assert_float!(acc_y);
 
-        let new_x = reflect_sim_x(f32::mul_add(acc_x, DT * DT, x1) + vx);
+        let new_x = reflect_sim_x(acc_x * DT * DT + x1 + vx);
         //.rem_euclid(1.0);
-        let new_y = reflect_sim_y(f32::mul_add(acc_y, DT * DT, y1) + vy);
+        let new_y = reflect_sim_y(acc_y * DT * DT + y1 + vy);
+        debug_assert_float!(new_x);
+        debug_assert_float!(new_y);
         //.rem_euclid(1.0);
         // if !(debug_check_valid_pos(x1)
         //     && debug_check_valid_pos(y1)
@@ -2043,6 +1847,7 @@ macro_rules! dbgc {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub async fn run() {
+    test();
     let (event_loop, window) = window_setup();
 
     let mut state = State::new(window).await;
@@ -2528,85 +2333,54 @@ impl State {
         }
     }
 
-    pub fn window(&self) -> &Window {
-        &self.window
-    }
+    pub fn window(&self) -> &Window { &self.window }
 }
 
 mod simd {
     #![allow(dead_code)]
-    use core::arch::x86_64::*;
-    use no_panic::no_panic;
+    use {core::arch::x86_64::*, no_panic::no_panic};
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn load(a: *const f32) -> __m256 {
-        _mm256_load_ps(a)
-    }
+    pub unsafe fn load(a: *const f32) -> __m256 { _mm256_load_ps(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn loadu(a: *const f32) -> __m256 {
-        _mm256_loadu_ps(a)
-    }
+    pub unsafe fn loadu(a: *const f32) -> __m256 { _mm256_loadu_ps(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn loadi(a: *const __m256i) -> __m256i {
-        _mm256_load_si256(a)
-    }
+    pub unsafe fn loadi(a: *const __m256i) -> __m256i { _mm256_load_si256(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn loadiu(a: *const __m256i) -> __m256i {
-        _mm256_loadu_si256(a)
-    }
+    pub unsafe fn loadiu(a: *const __m256i) -> __m256i { _mm256_loadu_si256(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn mul(a: __m256, b: __m256) -> __m256 {
-        _mm256_mul_ps(a, b)
-    }
+    pub unsafe fn mul(a: __m256, b: __m256) -> __m256 { _mm256_mul_ps(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn add(a: __m256, b: __m256) -> __m256 {
-        _mm256_add_ps(a, b)
-    }
+    pub unsafe fn add(a: __m256, b: __m256) -> __m256 { _mm256_add_ps(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn andi(a: __m256i, b: __m256i) -> __m256i {
-        _mm256_and_si256(a, b)
-    }
+    pub unsafe fn andi(a: __m256i, b: __m256i) -> __m256i { _mm256_and_si256(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn and(a: __m256, b: __m256) -> __m256 {
-        _mm256_and_ps(a, b)
-    }
+    pub unsafe fn and(a: __m256, b: __m256) -> __m256 { _mm256_and_ps(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn andn(a: __m256, b: __m256) -> __m256 {
-        _mm256_andnot_ps(a, b)
-    }
+    pub unsafe fn andn(a: __m256, b: __m256) -> __m256 { _mm256_andnot_ps(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn sub(a: __m256, b: __m256) -> __m256 {
-        _mm256_sub_ps(a, b)
-    }
+    pub unsafe fn sub(a: __m256, b: __m256) -> __m256 { _mm256_sub_ps(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
-        _mm256_fmadd_ps(a, b, c)
-    }
+    pub unsafe fn fmadd(a: __m256, b: __m256, c: __m256) -> __m256 { _mm256_fmadd_ps(a, b, c) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
-        _mm256_fmadd_ps(a, b, c)
-    }
+    pub unsafe fn fmsub(a: __m256, b: __m256, c: __m256) -> __m256 { _mm256_fmadd_ps(a, b, c) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn fnmadd(a: __m256, b: __m256, c: __m256) -> __m256 {
-        _mm256_fnmadd_ps(a, b, c)
-    }
+    pub unsafe fn fnmadd(a: __m256, b: __m256, c: __m256) -> __m256 { _mm256_fnmadd_ps(a, b, c) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn fnmsub(a: __m256, b: __m256, c: __m256) -> __m256 {
-        _mm256_fnmsub_ps(a, b, c)
-    }
+    pub unsafe fn fnmsub(a: __m256, b: __m256, c: __m256) -> __m256 { _mm256_fnmsub_ps(a, b, c) }
     #[inline(always)]
     #[no_panic]
     pub unsafe fn gather<const SCALE: i32>(p: *const f32, indexes: __m256i) -> __m256 {
@@ -2614,39 +2388,25 @@ mod simd {
     }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn sqrt(a: __m256) -> __m256 {
-        _mm256_sqrt_ps(a)
-    }
+    pub unsafe fn sqrt(a: __m256) -> __m256 { _mm256_sqrt_ps(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn div(a: __m256, b: __m256) -> __m256 {
-        _mm256_div_ps(a, b)
-    }
+    pub unsafe fn div(a: __m256, b: __m256) -> __m256 { _mm256_div_ps(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn rsqrt_fast(a: __m256) -> __m256 {
-        _mm256_rsqrt_ps(a)
-    }
+    pub unsafe fn rsqrt_fast(a: __m256) -> __m256 { _mm256_rsqrt_ps(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn zero() -> __m256 {
-        _mm256_setzero_ps()
-    }
+    pub unsafe fn zero() -> __m256 { _mm256_setzero_ps() }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn set1(a: f32) -> __m256 {
-        _mm256_set1_ps(a)
-    }
+    pub unsafe fn set1(a: f32) -> __m256 { _mm256_set1_ps(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn splati(a: i32) -> __m256i {
-        _mm256_set1_epi32(a)
-    }
+    pub unsafe fn splati(a: i32) -> __m256i { _mm256_set1_epi32(a) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn max(a: __m256, b: __m256) -> __m256 {
-        _mm256_max_ps(a, b)
-    }
+    pub unsafe fn max(a: __m256, b: __m256) -> __m256 { _mm256_max_ps(a, b) }
     #[inline(always)]
     #[no_panic]
     pub unsafe fn maxzero(a: __m256) -> __m256 {
@@ -2655,14 +2415,10 @@ mod simd {
     }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn min(a: __m256, b: __m256) -> __m256 {
-        _mm256_min_ps(a, b)
-    }
+    pub unsafe fn min(a: __m256, b: __m256) -> __m256 { _mm256_min_ps(a, b) }
     #[inline(always)]
     #[no_panic]
-    pub unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i {
-        _mm256_slli_epi32::<IMM>(a)
-    }
+    pub unsafe fn slli<const IMM: i32>(a: __m256i) -> __m256i { _mm256_slli_epi32::<IMM>(a) }
     #[inline(always)]
     #[no_panic]
     pub unsafe fn hadd(a: __m256) -> f32 {
