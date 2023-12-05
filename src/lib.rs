@@ -113,16 +113,16 @@ const WIDTH_X: f32 = MAX_X - MIN_X;
 const WIDTH_Y: f32 = MAX_Y - MIN_Y;
 
 const MIN_WIDTH: f32 = if WIDTH_X > WIDTH_Y { WIDTH_Y } else { WIDTH_X };
-const K_FAC_BASE: f32 = 0.9;
+const K_FAC_BASE: f32 = 0.6; //0.9;
 #[cfg(feature = "nosimd")]
 const K_FAC: f32 = K_FAC_BASE * 2.0 * 0.2;
 #[cfg(not(feature = "nosimd"))]
 const K_FAC: f32 = K_FAC_BASE * 2.0 * 0.2 * (1.0 / (1.0 - BETA));
 const BETA: f32 = 0.3; //0.3;
-const DT: f32 = 0.006; //0.008; // TODO: define max speed/max dt from cell size.
+const DT: f32 = 0.01; //0.006; //0.008; // TODO: define max speed/max dt from cell size.
 const NUM_POINTS_U: usize = NUM_POINTS as usize;
 const CELLS_PLUS_1_U: usize = CELLS as usize + 1;
-pub const NUM_POINTS: u32 = 32768; //16384; //8192; //1024; //16384; //8192; //2048; //16384;
+pub const NUM_POINTS: u32 = 65408; //49152;//32768; //16384; //8192; //1024; //16384; //8192; //2048; //16384;
 const NUM_KINDS: usize = 8;
 const NUM_KINDS2: usize = NUM_KINDS * NUM_KINDS;
 
@@ -217,13 +217,16 @@ fn reflect_sim_y(f: f32) -> f32 {
 }
 
 #[inline(always)]
-#[no_panic]
+//#[no_panic]
 fn compute_cell(x: f32, y: f32) -> Cid {
     let x = inv_scale_simulation_x(x);
     let y = inv_scale_simulation_y(y);
     // x in 0_f32..1_f32
     // y in 0_f32..1_f32
 
+    // OOB if outside this range...
+    debug_assert!((0.0..=1.0).contains(&x), "{x}");
+    debug_assert!((0.0..=1.0).contains(&y), "{y}");
     let cell_x = ((x * CELLS_X as f32) as IndexType).min(CELLS_X as IndexType - 1);
     let cell_y = ((y * CELLS_Y as f32) as IndexType).min(CELLS_Y as IndexType - 1);
     let cell = cell_x + cell_y * CELLS_X as IndexType;
@@ -321,12 +324,12 @@ impl SimulationInputEuler {
         let v_range = -0.1..0.1; //-1.0..1.0;
 
         Self {
+            relation_table: Box::new(from_fn(|_| from_fn(|_| K_FAC * rng.f32(-1.0..1.0)))),
+            k: iter_alloc(|| rng.u8(NUM_KINDS as u8)).into(),
             x: iter_alloc(|| rng.f32(xy_range.clone())).into(),
             y: iter_alloc(|| rng.f32(xy_range.clone())).into(),
             vx: iter_alloc(|| rng.f32(v_range.clone())).into(),
             vy: iter_alloc(|| rng.f32(v_range.clone())).into(),
-            k: iter_alloc(|| rng.u8(NUM_KINDS as u8)).into(),
-            relation_table: Box::new(from_fn(|_| from_fn(|_| K_FAC * rng.f32(-1.0..1.0)))),
         }
     }
     fn verlet(self) -> SimulationInputVerlet {
@@ -1083,7 +1086,12 @@ macro_rules! make_state {
                 }
                 let state = InnerState::new();
                 let state: &'static mut [PageAligned; ALLOC_SIZE] = Box::leak(state.0);
-                from_buffer(state)
+                let this = from_buffer(state);
+                this.validate();
+                this
+            }
+            fn validate(&self) {
+                $(assert_eq!(self.$field_name.as_ptr().align_offset(ALIGN), 0);)*
             }
             fn print_alloc_info(&self) {
                 eprintln!("State {{");
@@ -1097,9 +1105,10 @@ macro_rules! make_state {
                 drop( unsafe { Box::from_raw(self.owned) } );
             }
         }
+        const PAGESIZE: usize = 4096;
         const ALIGN: usize = 128;
         const ALLOC_SIZE_BYTES: usize = calc_alloc_size();
-        const ALLOC_SIZE: usize = ALLOC_SIZE_BYTES.div_ceil(size_of::<PageAligned>());
+        const ALLOC_SIZE: usize = ALLOC_SIZE_BYTES.div_ceil(size_of::<PageAligned>()) + 4;
         const fn calc_alloc_size() -> usize {
             let mut offset = 0;
             $(offset = (offset + $e * std::mem::size_of::<$t>()).next_multiple_of(ALIGN);)*
@@ -1109,12 +1118,12 @@ macro_rules! make_state {
         unsafe impl bytemuck::Pod for PageAligned {}
         #[derive(Copy, Clone)]
         #[repr(align(4096), C)]
-        struct PageAligned([u8; 4096]);
+        struct PageAligned([u8; PAGESIZE]);
         struct InnerState (Box<[PageAligned; ALLOC_SIZE]>);
         impl InnerState {
             //#[no_panic]
             fn new() -> Self {
-                let Ok(v) = vec![PageAligned([0;4096]); ALLOC_SIZE]
+                let Ok(v) = vec![PageAligned([0;PAGESIZE]); ALLOC_SIZE]
                     .into_boxed_slice()
                     .try_into() else { panic!() };
                 Self( v )
@@ -1139,6 +1148,8 @@ make_state!(CpuSimulationState BorrowedState {
     cell_count: [Pid; CELLS_PLUS_1_U],
     cell_index: [Pid; CELLS_PLUS_1_U],
     relation_table: [f32; NUM_KINDS2],
+    // TODO: bit pack k in f32
+    // TODO: AoSoA packing
 });
 
 /// Entire state of the simulation
@@ -1158,8 +1169,6 @@ make_state!(CpuSimulationState BorrowedState {
 //     cell_count: Cbox<Pid>,
 //     cell_index: Cbox<Pid>,
 //     relation_table: Box<[f32; NUM_KINDS2]>,
-//     // TODO: bit pack k in f32
-//     // TODO: AoSoA packing
 // }
 
 impl CpuSimulationState {
@@ -1311,109 +1320,88 @@ impl CpuSimulationState {
     pub fn update(&mut self) {
         const BLOCK_SIZE: u16 = 4;
 
-        //{{ for cx in 0..CELLS_X {for cy in 0..CELLS_Y {
+        for cx in 0..CELLS_X {
+            for cy in 0..CELLS_Y {
+                // 340, 243
+                // 347, 238
 
-        // 340, 243
-        // 347, 238
+                //for z in 0..(CELLS_X as u32 * CELLS_Y as u32) {
+                //let (cx, cy) = Self::z_to_xy(z);
+                //let (cx, cy) = (cx as u16, cy as u16);
+                // for ccx in (0..CELLS_X).step_by(BLOCK_SIZE as usize) {
+                //     for ccy in (0..CELLS_Y).step_by(BLOCK_SIZE as usize) {
+                //         for cy in ccy..(CELLS_Y.min(ccy + BLOCK_SIZE)) {
+                //             for cx in ccx..(CELLS_X.min(ccx + BLOCK_SIZE)) {
+                //for i in (0..NUM_POINTS_U).map(Into::into) {
+                let cell: Cid = Cid((cx + cy * CELLS_X) as IndexType);
+                //self.fill_surround_buffer(cy, cx);
 
-        for z in 0..(CELLS_X as u32 * CELLS_Y as u32) {
-            let (cx, cy) = Self::z_to_xy(z);
-            let (cx, cy) = (cx as u16, cy as u16);
-            // for ccx in (0..CELLS_X).step_by(BLOCK_SIZE as usize) {
-            //     for ccy in (0..CELLS_Y).step_by(BLOCK_SIZE as usize) {
-            //         for cy in ccy..(CELLS_Y.min(ccy + BLOCK_SIZE)) {
-            //             for cx in ccx..(CELLS_X.min(ccx + BLOCK_SIZE)) {
-            //for i in (0..NUM_POINTS_U).map(Into::into) {
-            let cell: Cid = Cid((cx + cy * CELLS_X) as IndexType);
-            //self.fill_surround_buffer(cy, cx);
+                let ranges = self.generate_ranges(cy, cx);
 
-            let ranges = self.generate_ranges(cy, cx);
-
-            for i_self in (usize::from(self.cell_index[cell])
-                ..usize::from(self.cell_index[cell + 1.into()]))
-                .map(Into::into)
-            {
-                let x0 = self.x0[i_self];
-                let y0 = self.y0[i_self];
-                let x1 = self.x1[i_self];
-                let y1 = self.y1[i_self];
-                let k = self.k[i_self];
-                let mut acc_x = 0.0;
-                let mut acc_y = 0.0;
-                debug_assert_float!(acc_x);
-                debug_assert_float!(acc_y);
-
-                // self.k
-                // self.x1
-                // self.y1
-                //#[rustfmt::skip]
-                /*unsafe {
-                    use core::arch::x86_64::*;
-                    for range in &ranges {
-                        _mm_prefetch(self.k.0.get_unchecked(range.start as usize) as *const u8 as *const i8, _MM_HINT_T0);
-                        _mm_prefetch(self.x1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
-                        _mm_prefetch(self.y1.0.get_unchecked(range.start as usize) as *const f32 as *const i8, _MM_HINT_T0);
-                    }
-                };*/
-
-                #[cfg(not(feature = "nosimd"))]
-                unsafe {
-                    self.iterate_ranges(ranges.clone(), x1, y1, k, &mut acc_x, &mut acc_y);
-                }
-
-                // about 52 % of execution time is spent here
-                #[cfg(feature = "nosimd")]
+                for i_self in (usize::from(self.cell_index[cell])
+                    ..usize::from(self.cell_index[cell + 1.into()]))
+                    .map(Into::into)
                 {
-                    acc_x = 0.0;
-                    acc_y = 0.0;
-                    let local_k_arr: [f32; NUM_KINDS] =
-                        *unsafe { self.relation_table.get_unchecked(k as usize) };
-                    for ((&x_other, &y_other), &k_other) in self
-                        .surround_buffer_x
-                        .slice()
-                        .iter()
-                        .zip(self.surround_buffer_y.slice().iter())
-                        .zip(self.surround_buffer_k.slice().iter())
-                    {
-                        // https://www.desmos.com/calculator/yos22615bv
+                    let x0 = self.x0[i_self];
+                    let y0 = self.y0[i_self];
+                    let x1 = self.x1[i_self];
+                    let y1 = self.y1[i_self];
+                    let k = self.k[i_self];
+                    let mut acc_x = 0.0;
+                    let mut acc_y = 0.0;
+                    debug_assert_float!(acc_x);
+                    debug_assert_float!(acc_y);
 
-                        let dx = x1 - x_other;
-                        let dy = y1 - y_other;
-                        let dot = dx * dx + dy * dy;
-                        let r = dot.sqrt();
+                    /*
+                       |---|---|---|
+                       |   |   |   |
+                       |---|---|---|
+                       |   | c |   |
+                       |---|---|---|
+                       |   |   |   | 
+                       |---|---|---|
+                    */
 
-                        let x = r * (1.0 / POINT_MAX_RADIUS);
-                        let k: f32 = *unsafe { local_k_arr.get_unchecked(k_other as usize) };
-                        let c = 4.0 * (1.0 - x / BETA);
-                        //let c = 10.0 * (1.0 / x - 1.0 / (BETA));
-
-                        let f = ((k / (1.0 - BETA)) * (x - BETA).min(1.0 - x).max(0.0)).max(c);
-                        let dir_x = dx / r;
-                        let dir_y = dy / r;
-                        if dot != 0.0 {
-                            acc_x += dir_x * f;
-                            acc_y += dir_y * f;
-                            debug_assert_float!(acc_x);
-                            debug_assert_float!(acc_y);
-                        }
+                    #[cfg(not(feature = "nosimd"))]
+                    unsafe {
+                        self.iterate_ranges(ranges.clone(), x1, y1, k, &mut acc_x, &mut acc_y);
                     }
-                }
-                let (new_x, new_y) = Self::calc_new_position(acc_x, acc_y, x1, x0, y1, y0);
 
-                self.store_temporary_results(i_self, new_x, new_y);
+                    let (new_x, new_y) = Self::calc_new_position(acc_x, acc_y, x1, x0, y1, y0);
+
+                    self.store_temporary_results(i_self, new_x, new_y);
+                }
             }
         }
 
         // The last passes are very serial, but is fast enough
         // that it basically does not matter
 
-        self.prefix_sum();
-
-        self.final_insert();
+        self.prefix_sum_and_insert();
 
         swap(&mut self.x1, &mut self.x0_tmp);
         swap(&mut self.y1, &mut self.y0_tmp);
         swap(&mut self.k, &mut self.k_tmp);
+    }
+
+    fn prefix_sum_and_insert(&mut self) {
+        let mut acc: Pid = 0.into();
+        for i in (0..CELLS_PLUS_1_U).map(Cid::from) {
+            self.cell_index[i] = acc;
+            let count = replace(&mut self.cell_count[i], 0.into());
+            acc += count;
+        }
+
+        for i in (0..NUM_POINTS_U).map(Into::into) {
+            let cell = self.point_cell[i];
+            let index = self.cell_index[cell] + self.point_cell_offset[i];
+
+            self.x0[index] = self.x1[i];
+            self.y0[index] = self.y1[i];
+            self.x0_tmp[index] = self.x1_tmp[i];
+            self.y0_tmp[index] = self.y1_tmp[i];
+            self.k_tmp[index] = self.k[i];
+        }
     }
 
     #[inline(never)]
@@ -1476,7 +1464,7 @@ impl CpuSimulationState {
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn store_temporary_results(&mut self, i_self: Pid, new_x: f32, new_y: f32) {
         self.x1_tmp[i_self] = new_x;
         self.y1_tmp[i_self] = new_y;
@@ -1490,8 +1478,8 @@ impl CpuSimulationState {
         self.cell_count[new_cell] += 1.into();
     }
 
-    #[inline(never)]
-    #[no_panic]
+    #[inline(always)]
+    //#[no_panic]
     unsafe fn iterate_ranges(
         &mut self,
         ranges: [Range<u32>; 3],
